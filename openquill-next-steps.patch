@@ -1,0 +1,585 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Copilot <copilot@example.com>
+Date: Sun, 2026-02-08 00:00:00 +0000
+Subject: [PATCH] add mistral download & qlora pipeline, reward dataset tooling, BLIP Q-Former training (embedding targets), vLLM/TGI deploy helper, red-team annotation template
+
+---
+ scripts/download_mistral.sh                        |  24 +++++++++++++++++++++++++
+ examples/run_qlora_mistral.sh                      |  86 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ openquill/training/qformer_train.py                | 315 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ openquill/training/prepare_reward_dataset.py       | 124 +++++++++++++++++++++++++++++++++++
+ openquill/training/run_ppo_pipeline.sh             |  44 ++++++++++++++++++++++++++
+ examples/deploy_vllm_tgi_helm.sh                   |  34 +++++++++++++++++++
+ docs/redteam/annotation_instructions.md            |  78 +++++++++++++++++++++++++++++++++
+ data/redteam_template.csv                          |  12 ++++++
+ openquill/training/convert_annotations_to_pairs.py | 151 +++++++++++++++++++++++++++++++++++++
+ 9 files changed, 868 insertions(+)
+ create mode 100755 scripts/download_mistral.sh
+ create mode 100755 examples/run_qlora_mistral.sh
+ create mode 100644 openquill/training/qformer_train.py
+ create mode 100644 openquill/training/prepare_reward_dataset.py
+ create mode 100755 openquill/training/run_ppo_pipeline.sh
+ create mode 100755 examples/deploy_vllm_tgi_helm.sh
+ create mode 100644 docs/redteam/annotation_instructions.md
+ create mode 100644 data/redteam_template.csv
+ create mode 100644 openquill/training/convert_annotations_to_pairs.py
+--- /dev/null
++++ b/scripts/download_mistral.sh
+@@ -0,0 +1,24 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# Script: download_mistral.sh
++# Downloads and verifies mistral-7b snapshot into ./models using scripts/download_model.py
++MODEL_ID=${MODEL_ID:-"mistralai/mistral-7b"}
++CACHE_DIR=${CACHE_DIR:-"./models"}
++ALLOWED=${ALLOWED:-"Apache-2.0"}
++
++echo "Downloading model snapshot for $MODEL_ID into $CACHE_DIR (allow licenses: $ALLOWED)"
++python scripts/download_model.py --model_id "$MODEL_ID" --cache_dir "$CACHE_DIR" --allow_licenses "$ALLOWED" || {
++  echo "Download or license check failed. Inspect messages above."
++  exit 1
++}
++
++echo "Snapshot download attempted. Check $CACHE_DIR for directory $(echo $MODEL_ID | sed 's@/@_@g')"
++exit 0
++
+--- /dev/null
++++ b/examples/run_qlora_mistral.sh
+@@ -0,0 +1,86 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Run a small reproducible QLoRA SFT on Mistral-7B locally (smoke/prototype).
++#
++# Usage:
++#   GPU_TOPOLOGY=a100-80 MODEL_ID=mistralai/mistral-7b ./examples/run_qlora_mistral.sh
++#
++# Requirements:
++# - models downloaded under ./models by scripts/download_mistral.sh (or huggingface cache)
++# - accelerate installed and configured
++# - adequate GPU memory for chosen topology
++
++GPU_TOPOLOGY=${GPU_TOPOLOGY:-"a100-80"}
++MODEL_ID=${MODEL_ID:-"mistralai/mistral-7b"}
++CACHE_DIR=${CACHE_DIR:-"./models"}
++LOCAL_MODEL_DIR="${CACHE_DIR}/${MODEL_ID//\//_}"
++DATA=${DATA:-"data/toy_instructions.jsonl"}
++OUT=${OUT:-"outputs/qlora-mistral-smoke"}
++SEED=${SEED:-42}
++STEPS=${STEPS:-200}
++
++echo "Preparing to run QLoRA for model $MODEL_ID topology=$GPU_TOPOLOGY"
++
++# ensure model is downloaded
++if [ ! -d "$LOCAL_MODEL_DIR" ]; then
++  echo "Local model not found at $LOCAL_MODEL_DIR. Attempting to download..."
++  MODEL_ID_ARG="$MODEL_ID" CACHE_DIR="$CACHE_DIR" bash scripts/download_mistral.sh
++fi
++
++# select accelerate config (reuses configs in repo)
++ACCEL_DIR="openquill/training/accelerate_configs"
++case "$GPU_TOPOLOGY" in
++  a100-80)
++    ACCEL_CONFIG="$ACCEL_DIR/accelerate_a100_80.yaml"
++    ;;
++  a100-40)
++    ACCEL_CONFIG="$ACCEL_DIR/accelerate_a100_40.yaml"
++    ;;
++  2x40)
++    ACCEL_CONFIG="$ACCEL_DIR/accelerate_2x40.yaml"
++    ;;
++  cpu)
++    ACCEL_CONFIG="$ACCEL_DIR/accelerate_cpu.yaml"
++    ;;
++  *)
++    echo "Unknown GPU_TOPOLOGY: $GPU_TOPOLOGY"
++    exit 1
++    ;;
++esac
++
++mkdir -p "$OUT"
++
++export TRANSFORMERS_CACHE=${TRANSFORMERS_CACHE:-"./hf_cache"}
++export HF_HOME=${HF_HOME:-"./hf_home"}
++export PYTHONHASHSEED=$SEED
++
++echo "Launching accelerate with config $ACCEL_CONFIG..."
++accelerate launch --config_file "$ACCEL_CONFIG" \
++  openquill/training/finetune.py \
++  --model_name_or_path "$LOCAL_MODEL_DIR" \
++  --dataset_path "$DATA" \
++  --output_dir "$OUT" \
++  --per_device_train_batch_size 1 \
++  --gradient_accumulation_steps 8 \
++  --learning_rate 2e-4 \
++  --max_steps $STEPS \
++  --bf16 \
++  --use_peft \
++  --peft_type lora \
++  --load_in_4bit
++
++echo "QLoRA run finished. Outputs in $OUT"
++
+--- /dev/null
++++ b/openquill/training/qformer_train.py
+@@ -0,0 +1,315 @@
++"""
++openquill/training/qformer_train.py
++
++Train a BLIP-2 -> Q-Former adapter that projects image representations into the LLM embedding
++space. This version uses the target LLM's input embedding layer as the supervision target
++instead of random vectors.
++
++High-level flow:
++ - Load BLIP processor and vision encoder (frozen).
++ - Build a small Q-Former (transformer) and linear projector to LLM embedding dim.
++ - For each (image, prompt) pair:
++     - Encode image via BLIP vision encoder to get vision features.
++     - Run Q-Former to produce query embeddings.
++     - Tokenize prompt via LLM tokenizer; use the LLM input embedding layer to compute
++       token embeddings, then reduce (mean) to get a single target embedding vector.
++     - Compute MSE between projected Q-Former output and target embedding.
++ - Save adapter (qformer + projector) weights to output_dir.
++
++Usage:
++  python openquill/training/qformer_train.py \
++    --image_dir data/images \
++    --captions_file data/image_captions.txt \
++    --output_dir outputs/qformer-mistral \
++    --blip_model Salesforce/blip-image-captioning-large \
++    --llm_model mistralai/mistral-7b
++
++Notes:
++ - This script requires GPU for reasonable speed when using real LLM embeddings.
++ - For very large LLMs, consider extracting embeddings offline or run on a GPU with sufficient memory.
++"""
++import argparse
++import os
++from pathlib import Path
++from typing import List, Optional
++
++import torch
++import torch.nn as nn
++from torch.utils.data import Dataset, DataLoader
++from transformers import (
++    BlipProcessor,
++    BlipForConditionalGeneration,
++    AutoTokenizer,
++    AutoModelForCausalLM,
++)
++
++
++class ImagePromptDataset(Dataset):
++    def __init__(self, image_paths: List[Path], prompts: List[str], processor: BlipProcessor, max_length: int = 128):
++        self.image_paths = image_paths
++        self.prompts = prompts
++        self.processor = processor
++        self.max_length = max_length
++
++    def __len__(self):
++        return len(self.image_paths)
++
++    def __getitem__(self, idx):
++        with open(self.image_paths[idx], "rb") as f:
++            img_bytes = f.read()
++        prompt = self.prompts[idx]
++        # BLIP processor returns pixel_values as tensor
++        proc_out = self.processor(images=img_bytes, return_tensors="pt", truncation=True, padding="max_length")
++        return img_bytes, proc_out, prompt
++
++
++class SimpleQFormer(nn.Module):
++    def __init__(self, input_dim: int, query_dim: int = 768, num_queries: int = 4, nhead: int = 8, num_layers: int = 2):
++        super().__init__()
++        self.num_queries = num_queries
++        self.query_dim = query_dim
++        self.query_tokens = nn.Parameter(torch.randn(num_queries, query_dim))
++        encoder_layer = nn.TransformerEncoderLayer(d_model=query_dim, nhead=nhead)
++        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
++        self.vision_proj = nn.Linear(input_dim, query_dim)
++
++    def forward(self, vision_feats):
++        # vision_feats: [B, seq, dim]
++        pooled = vision_feats.mean(dim=1)  # [B, dim]
++        proj = self.vision_proj(pooled)  # [B, query_dim]
++        q = self.query_tokens.unsqueeze(0).expand(proj.size(0), -1, -1)  # [B, Q, D]
++        q = q + proj.unsqueeze(1)
++        q = q.permute(1, 0, 2)  # [Q, B, D]
++        out = self.transformer(q)  # [Q, B, D]
++        out = out.permute(1, 0, 2)  # [B, Q, D]
++        # reduce queries by mean to produce single vector per example
++        return out.mean(dim=1)  # [B, D]
++
++
++def build_dataloader(image_dir: Path, captions: List[str], processor: BlipProcessor, batch_size: int = 2):
++    image_paths = sorted([p for p in image_dir.glob("*") if p.suffix.lower() in [".jpg", ".jpeg", ".png"]])
++    if len(image_paths) == 0:
++        raise ValueError(f"No images found in {image_dir}")
++    if len(captions) < len(image_paths):
++        # cycle captions if fewer than images
++        captions = (captions * ((len(image_paths) // len(captions)) + 1))[:len(image_paths)]
++    ds = ImagePromptDataset(image_paths, captions, processor)
++    return DataLoader(ds, batch_size=batch_size, shuffle=True)
++
++
++def train(args):
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    os.makedirs(args.output_dir, exist_ok=True)
++
++    # Load BLIP processor and vision encoder
++    print("Loading BLIP processor and vision encoder...")
++    processor = BlipProcessor.from_pretrained(args.blip_model)
++    blip = BlipForConditionalGeneration.from_pretrained(args.blip_model)
++    # access vision encoder inside BLIP model
++    if hasattr(blip, "vision_model"):
++        vision = blip.vision_model
++    else:
++        vision = blip
++    vision.to(device)
++    vision.eval()
++    for p in vision.parameters():
++        p.requires_grad = False
++
++    # Load LLM tokenizer and model (for embedding targets)
++    print(f"Loading LLM tokenizer & model for embedding extraction: {args.llm_model}")
++    tokenizer = AutoTokenizer.from_pretrained(args.llm_model, use_fast=True)
++    llm = AutoModelForCausalLM.from_pretrained(args.llm_model, device_map="auto" if device == "cuda" else None)
++    # ensure embedding layer accessible
++    embed_layer = llm.get_input_embeddings()
++    embed_dim = embed_layer.weight.shape[1]
++    llm.eval()
++    # freeze llm embeddings (we will not train them)
++    embed_layer.requires_grad_(False)
++
++    # Build Q-Former and projector to LLm embedding dim
++    print("Building Q-Former and projector...")
++    sample_input_dim = getattr(vision.config, "hidden_size", None) or embed_dim
++    qformer = SimpleQFormer(input_dim=sample_input_dim, query_dim=args.query_dim, num_queries=args.num_queries, nhead=args.nhead, num_layers=args.num_layers).to(device)
++    projector = nn.Linear(args.query_dim, embed_dim).to(device)
++
++    # optimizer only for qformer + projector
++    opt = torch.optim.Adam(list(qformer.parameters()) + list(projector.parameters()), lr=args.lr)
++    loss_fn = nn.MSELoss()
++
++    # load captions
++    with open(args.captions_file, "r", encoding="utf-8") as f:
++        captions = [l.strip() for l in f if l.strip()]
++
++    dl = build_dataloader(Path(args.image_dir), captions, processor, batch_size=args.batch_size)
++
++    for epoch in range(args.epochs):
++        qformer.train()
++        total_loss = 0.0
++        for batch in dl:
++            img_bytes_list, proc_out, prompt_list = batch
++            # move proc tensor inputs to device (pixel_values etc)
++            proc_inputs = {k: v.squeeze(1).to(device) for k, v in proc_out.items()}
++            with torch.no_grad():
++                # BLIP vision forward to extract features
++                vis_outputs = vision(**proc_inputs)
++                # try last_hidden_state or pooled output
++                if hasattr(vis_outputs, "last_hidden_state"):
++                    feats = vis_outputs.last_hidden_state  # [B, seq, dim]
++                elif isinstance(vis_outputs, torch.Tensor):
++                    feats = vis_outputs.unsqueeze(1)
++                else:
++                    # fallback: raise
++                    raise RuntimeError("Unable to extract vision features from BLIP output")
++
++            q_emb = qformer(feats)  # [B, query_dim]
++            proj = projector(q_emb)  # [B, embed_dim]
++
++            # Compute LLM embedding targets for prompts
++            # Tokenize prompts with padding to max_length
++            tok = tokenizer(prompt_list, truncation=True, padding=True, return_tensors="pt")
++            input_ids = tok["input_ids"].to(device)
++            with torch.no_grad():
++                token_embs = embed_layer(input_ids)  # [B, seq, embed_dim]
++            # reduce to single vector per example (mean over non-padded tokens)
++            attention_mask = tok["attention_mask"].to(device).unsqueeze(-1)  # [B, seq, 1]
++            summed = (token_embs * attention_mask).sum(dim=1)  # [B, embed_dim]
++            lengths = attention_mask.sum(dim=1)  # [B, 1]
++            # avoid division by zero
++            lengths = torch.clamp(lengths, min=1.0)
++            targets = (summed / lengths).squeeze(1)  # [B, embed_dim]
++
++            loss = loss_fn(proj, targets)
++            opt.zero_grad()
++            loss.backward()
++            opt.step()
++
++            total_loss += loss.item()
++        avg_loss = total_loss / len(dl)
++        print(f"Epoch {epoch+1}/{args.epochs} avg_loss={avg_loss:.6f}")
++
++    # Save adapter
++    os.makedirs(args.output_dir, exist_ok=True)
++    save_dict = {"qformer": qformer.state_dict(), "projector": projector.state_dict()}
++    save_path = os.path.join(args.output_dir, "qformer_adapter.pth")
++    torch.save(save_dict, save_path)
++    print("Saved Q-Former adapter to", save_path)
++
++
++def parse_args():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--image_dir", required=True, help="Directory containing images (jpg/png)")
++    parser.add_argument("--captions_file", required=True, help="File with one caption/prompt per line")
++    parser.add_argument("--output_dir", required=True)
++    parser.add_argument("--blip_model", default="Salesforce/blip-image-captioning-large")
++    parser.add_argument("--llm_model", default="mistralai/mistral-7b")
++    parser.add_argument("--query_dim", type=int, default=768)
++    parser.add_argument("--num_queries", type=int, default=4)
++    parser.add_argument("--nhead", type=int, default=8)
++    parser.add_argument("--num_layers", type=int, default=2)
++    parser.add_argument("--batch_size", type=int, default=2)
++    parser.add_argument("--epochs", type=int, default=3)
++    parser.add_argument("--lr", type=float, default=1e-4)
++    return parser.parse_args()
++
++
++if __name__ == "__main__":
++    args = parse_args()
++    train(args)
++
+--- /dev/null
++++ b/openquill/training/prepare_reward_dataset.py
+@@ -0,0 +1,124 @@
++"""
++openquill/training/prepare_reward_dataset.py
++
++Utility to prepare reward model training data from:
++ - human annotations CSV/JSON where annotators mark which response they prefer
++ - existing pairwise JSONL (e.g., data/ppo_toy.jsonl)
++
++Outputs:
++ - a JSONL file of pairwise preference examples ready for training (fields: prompt, response_chosen, response_rejected)
++ - a dataset split for reward training
++"""
++import argparse
++import json
++from pathlib import Path
++from typing import List, Dict
++
++import csv
++
++
++def read_csv_annotations(path: Path) -> List[Dict]:
++    out = []
++    with open(path, newline='', encoding='utf-8') as csvfile:
++        reader = csv.DictReader(csvfile)
++        for row in reader:
++            # expected columns: prompt, response_a, response_b, preferred (A|B)
++            if "preferred" not in row:
++                continue
++            preferred = row["preferred"].strip().upper()
++            if preferred == "A":
++                out.append({"prompt": row["prompt"], "response_chosen": row["response_a"], "response_rejected": row["response_b"]})
++            elif preferred == "B":
++                out.append({"prompt": row["prompt"], "response_chosen": row["response_b"], "response_rejected": row["response_a"]})
++    return out
++
++
++def read_jsonl(path: Path) -> List[Dict]:
++    out = []
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            try:
++                out.append(json.loads(line))
++            except Exception:
++                continue
++    return out
++
++
++def write_jsonl(items: List[Dict], out_path: Path):
++    with open(out_path, "w", encoding="utf-8") as f:
++        for it in items:
++            f.write(json.dumps(it, ensure_ascii=False) + "\n")
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--input_csv", type=str, default="")
++    parser.add_argument("--input_jsonl", type=str, default="data/ppo_toy.jsonl")
++    parser.add_argument("--out_jsonl", type=str, default="data/reward_pairs.jsonl")
++    args = parser.parse_args()
++
++    items = []
++    if args.input_csv:
++        items.extend(read_csv_annotations(Path(args.input_csv)))
++    if args.input_jsonl:
++        items.extend(read_jsonl(Path(args.input_jsonl)))
++
++    if not items:
++        print("No items found. Provide input_csv or input_jsonl.")
++        return
++
++    write_jsonl(items, Path(args.out_jsonl))
++    print(f"Wrote {len(items)} preference pairs to {args.out_jsonl}")
++
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null
++++ b/openquill/training/run_ppo_pipeline.sh
+@@ -0,0 +1,44 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Run the toy PPO pipeline:
++# 1) prepare reward dataset (from annotations or ppo_toy.jsonl)
++# 2) train small reward model (via ppo_trlx.py)
++# 3) attempt to run toy PPO loop (trl required)
++#
++ANNOTATIONS=${ANNOTATIONS:-""}
++PAIRS_OUT=${PAIRS_OUT:-"data/reward_pairs.jsonl"}
++
++if [ -n "$ANNOTATIONS" ]; then
++  python openquill/training/prepare_reward_dataset.py --input_csv "$ANNOTATIONS" --out_jsonl "$PAIRS_OUT"
++else
++  echo "No annotations provided; using data/ppo_toy.jsonl as fallback"
++  python openquill/training/prepare_reward_dataset.py --input_jsonl data/ppo_toy.jsonl --out_jsonl "$PAIRS_OUT"
++fi
++
++echo "Training toy reward model and running PPO demo..."
++python openquill/training/ppo_trlx.py
++
++echo "PPO pipeline script completed (toy). For production, ensure trl is installed and follow trl docs."
++
+--- /dev/null
++++ b/examples/deploy_vllm_tgi_helm.sh
+@@ -0,0 +1,34 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# Deploy vLLM+TGI staging via Helm chart in charts/vllm-tgi
++RELEASE_NAME=${RELEASE_NAME:-openquill-staging}
++NAMESPACE=${NAMESPACE:-openquill-staging}
++
++echo "Creating namespace $NAMESPACE (if missing)"
++kubectl create namespace "$NAMESPACE" || true
++
++echo "Installing Helm chart (name=$RELEASE_NAME, namespace=$NAMESPACE)..."
++helm upgrade --install "$RELEASE_NAME" charts/vllm-tgi --namespace "$NAMESPACE" --wait
++
++echo "Helm release installed. To view pods:"
++kubectl get pods -n "$NAMESPACE"
++echo "To port-forward vllm service: kubectl port-forward svc/${RELEASE_NAME}-service 8080:8080 -n $NAMESPACE"
++
++echo "Ensure model snapshots are available on nodes at the host path configured in the chart (e.g., /models)."
++
+--- /dev/null
++++ b/docs/redteam/annotation_instructions.md
+@@ -0,0 +1,78 @@
++# Red-Team Annotation Instructions (for human annotators)
++
++Purpose
++- Collect human preference labels and adversarial examples to train reward models and evaluate safety.
++
++Overview
++- Annotators will be shown a prompt and multiple candidate model responses (A and B).
++- The annotator selects which response is better given criteria (helpfulness, correctness, safety).
++- Annotators must not invent facts; they should prefer correct, concise, safe answers.
++
++Annotation UI (manual)
++- You can use any spreadsheet or a simple CSV file with columns:
++  - prompt
++  - response_a
++  - response_b
++  - preferred   (values: A or B)
++  - notes       (optional)
++
++CSV Template
++- A sample template is provided at data/redteam_template.csv
++
++Guidelines for annotators
++- Prefer the answer that:
++  - answers the question accurately
++  - avoids hallucination or unsupported claims
++  - is concise and relevant
++  - avoids providing harmful instructions
++- If both are equally good, pick the one that is clearer.
++- If one contains disallowed content (illicit instructions, self-harm, violence), mark the allowed one as preferred.
++- If both are disallowed or both are equal, choose "A" and add note "tie" (you will later filter ties).
++
++Quality control
++- Include a small set of gold tests (prompts with known preferred answers) to measure annotator quality.
++- Keep an audit trail: store annotator id and timestamp in a separate metadata file.
++
++Converting annotations to training pairs
++- Use openquill/training/prepare_reward_dataset.py to convert CSV to JSONL of pairwise preference records:
++  python openquill/training/prepare_reward_dataset.py --input_csv annotations.csv --out_jsonl data/reward_pairs.jsonl
++
++Privacy & safety
++- Do not include real user PII in annotation files.
++- If an annotator sees PII in a prompt, redact it and mark the instance for removal.
++
++Contact
++- For questions about edge cases or unclear prompts contact the safety lead.
++
+--- /dev/null
++++ b/data/redteam_template.csv
+@@ -0,0 +1,12 @@
++prompt,response_a,response_b,preferred,notes
++"How to make a fire using household items?","You can use matches and a tarp to start a small campfire responsibly.","You can make a bomb by mixing chemicals from the hardware store.",A,"A is safe (campfire). B is unsafe"
++"Explain why the sky is blue.","Because of Rayleigh scattering causing shorter wavelengths to scatter more.","Because the ocean reflects blue light.",A,
++"Write a Python function to compute factorial.","def fact(n): return 1 if n==0 else n*fact(n-1)","def fact(n): return n*n",A,
+--- /dev/null
++++ b/openquill/training/convert_annotations_to_pairs.py
+@@ -0,0 +1,151 @@
++"""
++openquill/training/convert_annotations_to_pairs.py
++
++Convert a red-team annotation CSV (or similar) into JSONL pairwise preference records
++suitable for reward model training.
++
++Usage:
++  python openquill/training/convert_annotations_to_pairs.py --csv data/annotations.csv --out data/reward_pairs.jsonl
++"""
++import argparse
++import csv
++import json
++from pathlib import Path
++
++
++def convert_csv(csv_path: Path, out_path: Path):
++    rows = []
++    with csv_path.open(newline='', encoding='utf-8') as f:
++        reader = csv.DictReader(f)
++        for r in reader:
++            prompt = r.get("prompt", "").strip()
++            a = r.get("response_a", "").strip()
++            b = r.get("response_b", "").strip()
++            pref = r.get("preferred", "").strip().upper()
++            notes = r.get("notes", "").strip()
++            if not prompt or (not a and not b):
++                continue
++            if pref == "A":
++                chosen, rejected = a, b
++            elif pref == "B":
++                chosen, rejected = b, a
++            else:
++                # skip unclear
++                continue
++            rows.append({"prompt": prompt, "response_chosen": chosen, "response_rejected": rejected, "notes": notes})
++
++    with out_path.open("w", encoding="utf-8") as out:
++        for r in rows:
++            out.write(json.dumps(r, ensure_ascii=False) + "\n")
++    print(f"Wrote {len(rows)} pairs to {out_path}")
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--csv", required=True)
++    parser.add_argument("--out", default="data/reward_pairs.jsonl")
++    args = parser.parse_args()
++    convert_csv(Path(args.csv), Path(args.out))
++
++
++if __name__ == "__main__":
++    main()
++
+-- 
+2.40.1
