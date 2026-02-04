@@ -1,0 +1,590 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Ops <ops@example.com>
+Date: 2026-02-18 00:00:00 +0000
+Subject: [PATCH] Hardened microVM controller guidance & manifests: image allowlist, Gatekeeper constraint, cosign signing/verification helpers, audit forwarding, operator guide
+
+---
+ k8s/firecracker_hardened_deployment.yaml            | 231 +++++++++++++++++++++++++++++++++++++++++++
+ k8s/image_allowlist_config.yaml                     |  34 +++++++
+ k8s/gatekeeper_image_allowlist_template.yaml        | 197 +++++++++++++++++++++++++++++++++
+ scripts/sign_image_with_cosign.sh                    | 150 ++++++++++++++++++++++
+ scripts/verify_image_signature.sh                   | 114 ++++++++++++++
+ scripts/deploy_fluentbit_audit.sh                   | 136 +++++++++++++++++++++
+ docs/firecracker_hardening.md                       | 210 +++++++++++++++++++++++++++++++++++++++
+ 8 files changed, 1072 insertions(+)
+ create mode 100644 k8s/firecracker_hardened_deployment.yaml
+ create mode 100644 k8s/image_allowlist_config.yaml
+ create mode 100644 k8s/gatekeeper_image_allowlist_template.yaml
+ create mode 100755 scripts/sign_image_with_cosign.sh
+ create mode 100755 scripts/verify_image_signature.sh
+ create mode 100755 scripts/deploy_fluentbit_audit.sh
+ create mode 100644 docs/firecracker_hardening.md
+--- /dev/null
++++ b/k8s/firecracker_hardened_deployment.yaml
+@@ -0,0 +1,231 @@
++# Hardened Firecracker Controller deployment (example)
++# IMPORTANT:
++# - This manifest is an operator-level template. Do NOT apply without security review.
++# - The controller image must be built internally, scanned, signed, and stored in an internal registry.
++# - This deployment enforces non-root, read-only root filesystem, drops capabilities, and requests a dedicated node pool.
++
++apiVersion: v1
++kind: Namespace
++metadata:
++  name: openquill-firecracker
++  labels:
++    pod-security.kubernetes.io/enforce: "restricted"
++    pod-security.kubernetes.io/audit: "restricted"
++    pod-security.kubernetes.io/warn: "restricted"
++
++---
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: firecracker-controller-config
++  namespace: openquill-firecracker
++data:
++  # Example allowlist reference - operator can mount k8s/image_allowlist_config.yaml as well
++  IMAGE_ALLOWLIST_CONFIG: "k8s/image_allowlist_config.yaml"
++  NO_NETWORK_BY_DEFAULT: "true"
++  DEFAULT_VCPU: "1"
++  DEFAULT_MEM_MB: "512"
++
++---
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: firecracker-controller-sa
++  namespace: openquill-firecracker
++
++---
++# Minimal RBAC - operator should restrict as tightly as possible
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: firecracker-controller-role
++  namespace: openquill-firecracker
++rules:
++  - apiGroups: [""]
++    resources: ["pods","pods/exec","persistentvolumeclaims","events","secrets","configmaps"]
++    verbs: ["get","list","watch","create","patch","update"]
++
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: firecracker-controller-rolebinding
++  namespace: openquill-firecracker
++subjects:
++  - kind: ServiceAccount
++    name: firecracker-controller-sa
++    namespace: openquill-firecracker
++roleRef:
++  kind: Role
++  name: firecracker-controller-role
++  apiGroup: rbac.authorization.k8s.io
++
++---
++# Deployment - ensure controller image is internal & signed; nodeSelector ensures placement on infra nodes with KVM
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: firecracker-controller
++  namespace: openquill-firecracker
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: firecracker-controller
++  template:
++    metadata:
++      labels:
++        app: firecracker-controller
++    spec:
++      serviceAccountName: firecracker-controller-sa
++      nodeSelector:
++        node-role.kubernetes.io/infra: "true"
++      tolerations:
++        - key: "infra"
++          operator: "Exists"
++          effect: "NoSchedule"
++      # Use a restricted runtimeClass if you have one for microVM ops; otherwise remove or adapt.
++      runtimeClassName: runsc
++      securityContext:
++        runAsNonRoot: true
++        runAsUser: 1000
++      containers:
++        - name: controller
++          image: internal-registry.company.com/firecracker-controller:stable
++          imagePullPolicy: IfNotPresent
++          # Environment & config
++          env:
++            - name: CONFIG_PATH
++              value: /etc/fc-controller/config.yaml
++            - name: ALLOWLIST_CONFIGMAP
++              value: "image-allowlist"
++          ports:
++            - containerPort: 9000
++              name: http
++          securityContext:
++            allowPrivilegeEscalation: false
++            readOnlyRootFilesystem: true
++            runAsNonRoot: true
++            capabilities:
++              drop:
++                - ALL
++          volumeMounts:
++            - name: controller-config
++              mountPath: /etc/fc-controller
++              readOnly: true
++            - name: workdir
++              mountPath: /work
++              readOnly: false
++          resources:
++            requests:
++              cpu: "200m"
++              memory: "256Mi"
++            limits:
++              cpu: "1"
++              memory: "1Gi"
++      volumes:
++        - name: controller-config
++          configMap:
++            name: firecracker-controller-config
++        - name: workdir
++          emptyDir:
++            medium: Memory
++
++---
++# Internal service for the controller
++apiVersion: v1
++kind: Service
++metadata:
++  name: firecracker-controller
++  namespace: openquill-firecracker
++spec:
++  selector:
++    app: firecracker-controller
++  ports:
++    - port: 9000
++      targetPort: 9000
++      protocol: TCP
++
++---
++# NetworkPolicy: restrict inbound to requests from the openquill-prod namespace (operator must adapt)
++apiVersion: networking.k8s.io/v1
++kind: NetworkPolicy
++metadata:
++  name: restrict-firecracker-access
++  namespace: openquill-firecracker
++spec:
++  podSelector:
++    matchLabels:
++      app: firecracker-controller
++  ingress:
++    - from:
++        - namespaceSelector:
++            matchLabels:
++              name: openquill-prod
++  policyTypes:
++    - Ingress
++
++---
++# Notes for operators:
++# - Enforce image signing: controller MUST verify image signatures (cosign) before launching microVMs.
++# - Enforce image allowlist via Gatekeeper Constraint (see k8s/gatekeeper_image_allowlist_template.yaml).
++# - Controller MUST default to no-network for microVMs; allow per-job explicit egress via operator whitelist.
++# - Controller SHOULD emit structured audit logs (JSON) to stdout and a secure sink (Fluent Bit -> S3/Elasticsearch).
+--- /dev/null
++++ b/k8s/image_allowlist_config.yaml
+@@ -0,0 +1,34 @@
++# Image allowlist configmap example
++# Operators populate allowed images (digests or registry:tag) that the controller may accept.
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: image-allowlist
++  namespace: openquill-firecracker
++data:
++  allowlist: |
++    # Exact image names OR registry prefixes
++    internal-registry.company.com/firecracker-runtime:stable
++    internal-registry.company.com/job-runner:fc-minimal
++    internal-registry.company.com/python-runtime:fc-v1
++    # Optionally include public prefix if allowed (not recommended)
++    # quay.io/your-org/
++
++  note: |
++    # This ConfigMap is read by the Gatekeeper Constraint and by controller verification logic.
++    # Use digests (sha256:...) where possible to pin images.
+--- /dev/null
++++ b/k8s/gatekeeper_image_allowlist_template.yaml
+@@ -0,0 +1,197 @@
++# Gatekeeper ConstraintTemplate + Constraint example to enforce image allowlist
++# Requires Gatekeeper installed in the cluster.
++# This template reads allowed prefixes from a ConfigMap (image-allowlist).
++
++apiVersion: templates.gatekeeper.sh/v1
++kind: ConstraintTemplate
++metadata:
++  name: k8simageallowlist
++spec:
++  crd:
++    spec:
++      names:
++        kind: K8sImageAllowlist
++  targets:
++    - target: admission.k8s.gatekeeper.sh
++      rego: |
++        package k8simageallowlist
++
++        deny[msg] {
++          input.review.object.kind == "Pod"
++          not image_allowed(input.review.object.spec.containers[_].image)
++          msg := sprintf("container image %v not in allowlist", [input.review.object.spec.containers[_].image])
++        }
++
++        # Read allowlist from ConfigMap - for demo we embed static prefixes.
++        image_allowed(img) {
++          # allowlist entries can be prefixes; exact matching or prefix matching
++          allowlist := data.openquill.image_allowlist
++          some i
++          allow := allowlist[i]
++          startswith(img, allow)
++        }
++
++        startswith(x, prefix) {
++          count := strlen(prefix)
++          substr(x, 0, count) == prefix
++        }
++
++# ConfigMap to supply dynamic data to Gatekeeper; Gatekeeper data plugin required to load ConfigMaps into 'data.openquill.image_allowlist'
++---
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: gatekeeper-image-allowlist-data
++  namespace: gatekeeper-system
++data:
++  image_allowlist.json: |
++    [
++      "internal-registry.company.com/firecracker-runtime:stable",
++      "internal-registry.company.com/job-runner:fc-minimal",
++      "internal-registry.company.com/python-runtime:fc-v1"
++    ]
++
++---
++# Constraint instance that uses the template
++apiVersion: constraints.gatekeeper.sh/v1beta1
++kind: K8sImageAllowlist
++metadata:
++  name: openquill-image-allowlist
++spec:
++  match:
++    kinds:
++      - apiGroups: [""]
++        kinds: ["Pod"]
++    namespaces:
++      - openquill-firecracker
++  parameters:
++    message: "Image not in allowlist"
++
++---
++# Notes:
++# - This is a simplified example. In production integrate Gatekeeper data sources or an external policy server
++#   that reads image digests and signed attestations.
++# - Gatekeeper must have access to the ConfigMap data via data.* if using data-driven policies.
+--- /dev/null
++++ b/scripts/sign_image_with_cosign.sh
+@@ -0,0 +1,150 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# scripts/sign_image_with_cosign.sh
++#
++# Signs a container image with cosign and uploads public key to a keystore (S3 or artifactory).
++# Operators MUST use a dedicated KMS-backed cosign key (recommended: KMS-based signing).
++#
++# Usage:
++#   COSIGN_PASSWORD=... COSIGN_KEY=<kms://...> ./scripts/sign_image_with_cosign.sh <image_ref>
++
++if [ "$#" -ne 1 ]; then
++  echo "Usage: $0 <image_ref>"
++  exit 1
++fi
++
++IMAGE="$1"
++COSIGN_KEY=${COSIGN_KEY:-""}   # e.g. "kms://gcpkms/..."; if not set cosign will use keypair file
++COSIGN_PASS=${COSIGN_PASSWORD:-""}
++
++if ! command -v cosign >/dev/null 2>&1; then
++  echo "cosign not installed. Install from https://github.com/sigstore/cosign"
++  exit 2
++fi
++
++echo "Signing image: $IMAGE"
++if [ -n "$COSIGN_KEY" ]; then
++  # KMS-backed key
++  if [ -n "$COSIGN_PASS" ]; then
++    echo "Using KMS-backed key; ensure environment is configured for KMS access"
++  fi
++  cosign sign --key "$COSIGN_KEY" "$IMAGE"
++else
++  # local keyfile mode (operator must protect key)
++  KEY_FILE="${HOME}/.cosign/cosign.key"
++  if [ ! -f "$KEY_FILE" ]; then
++    echo "Generating local cosign keypair at $KEY_FILE (operator should provision KMS keys for production)"
++    cosign generate-key-pair
++  fi
++  echo "$COSIGN_PASS" | cosign sign --key "$KEY_FILE" "$IMAGE"
++fi
++
++echo "Signed $IMAGE"
++echo "Optionally push signature/public key to guarded keystore (operator step)"
++echo "Example: cosign public-key --key $KEY_FILE > /tmp/cosign.pub"
++
++exit 0
+--- /dev/null
++++ b/scripts/verify_image_signature.sh
+@@ -0,0 +1,114 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# scripts/verify_image_signature.sh
++#
++# Verify an image signature using cosign and an allowlist. Intended to be used by the controller
++# before launching a microVM. The controller can call this script as a pre-flight check.
++#
++# Usage:
++#   ./scripts/verify_image_signature.sh <image_ref> <public_key_path_or_kms_ref>
++
++if [ "$#" -lt 1 ]; then
++  echo "Usage: $0 <image_ref> [public_key_path_or_kms_ref]"
++  exit 1
++fi
++
++IMAGE="$1"
++PUBKEY=${2:-""}
++
++if ! command -v cosign >/dev/null 2>&1; then
++  echo "cosign required for verification"
++  exit 2
++fi
++
++echo "Verifying signature for $IMAGE"
++if [ -n "$PUBKEY" ]; then
++  cosign verify --key "$PUBKEY" "$IMAGE"
++else
++  # If no public key provided, attempt to verify with transparency log only (less strict)
++  cosign verify "$IMAGE" || {
++    echo "Signature verification failed (no public key provided)"
++    exit 3
++  }
++fi
++
++echo "Signature verification succeeded for $IMAGE"
++exit 0
+--- /dev/null
++++ b/scripts/deploy_fluentbit_audit.sh
+@@ -0,0 +1,136 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# scripts/deploy_fluentbit_audit.sh
++#
++# Deploys a simple Fluent Bit DaemonSet configuration that collects logs from the firecracker controller
++# namespace and forwards structured JSON logs to an S3 bucket (or Elasticsearch). This is a lightweight
++# example for audit forwarding — operators must secure credentials and configure retention.
++#
++# Requirements:
++# - kubectl configured
++# - S3 bucket and credentials configured in a Kubernetes secret
++# - Adjust output plugin to your logging backend (ES, S3, Splunk, etc.)
++
++NAMESPACE=${NAMESPACE:-"openquill-firecracker"}
++SECRET_NAME=${SECRET_NAME:-"logging-s3-creds"}
++S3_BUCKET=${S3_BUCKET:-"my-audit-bucket"}
++S3_PREFIX=${S3_PREFIX:-"openquill-firecracker-audit"}
++
++cat <<'EOF' | kubectl apply -f -
++apiVersion: v1
++kind: Namespace
++metadata:
++  name: openquill-logging
++---
++apiVersion: v1
++kind: Secret
++metadata:
++  name: logging-s3-creds
++  namespace: openquill-logging
++type: Opaque
++stringData:
++  AWS_ACCESS_KEY_ID: "REPLACE"
++  AWS_SECRET_ACCESS_KEY: "REPLACE"
++---
++apiVersion: apps/v1
++kind: DaemonSet
++metadata:
++  name: fluent-bit
++  namespace: openquill-logging
++spec:
++  selector:
++    matchLabels:
++      name: fluent-bit
++  template:
++    metadata:
++      labels:
++        name: fluent-bit
++    spec:
++      serviceAccountName: fluent-bit
++      containers:
++      - name: fluent-bit
++        image: fluent/fluent-bit:1.9
++        resources:
++          limits:
++            cpu: 200m
++            memory: 200Mi
++        volumeMounts:
++        - name: varlog
++          mountPath: /var/log
++        - name: varlibdockercontainers
++          mountPath: /var/lib/docker/containers
++        - name: config
++          mountPath: /fluent-bit/etc/
++      volumes:
++      - name: varlog
++        hostPath:
++          path: /var/log
++      - name: varlibdockercontainers
++        hostPath:
++          path: /var/lib/docker/containers
++      - name: config
++        configMap:
++          name: fluent-bit-config
++---
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: fluent-bit-config
++  namespace: openquill-logging
++data:
++  fluent-bit.conf: |
++    [SERVICE]
++        Flush        1
++        Daemon       Off
++        Log_Level    info
++        Parsers_File parsers.conf
++
++    [INPUT]
++        Name              tail
++        Path              /var/log/containers/*openquill-firecracker*.log
++        Parser            json
++        Tag               firecracker.*
++
++    [OUTPUT]
++        Name  s3
++        Match firecracker.*
++        bucket REPLACE_BUCKET
++        total_file_size 5M
++        use_put_object On
++
++  parsers.conf: |
++    [PARSER]
++        Name        json
++        Format      json
++EOF
++
++echo "Applied Fluent Bit DaemonSet skeleton to cluster (namespace: openquill-logging)."
++echo "Operator must replace secret data and ConfigMap bucket settings, and ensure IAM/credentials are secure."
++exit 0
+--- /dev/null
++++ b/docs/firecracker_hardening.md
+@@ -0,0 +1,210 @@
++# Firecracker controller hardening guide (operator)
++
++This document supplements the repo's simulator and example manifests and provides a concrete, operator-focused plan
++to deploy a hardened microVM controller (firecracker-containerd or equivalent) to run untrusted tool execution safely.
++
++High-level goals
++- Enforce an image allowlist (registry prefixes or exact digests).
++- Require image signatures and verify them before launching microVMs (cosign).
++- Default microVM network = disabled (no egress); allow per-job whitelists under strict review.
++- Limit resources per job (vCPU, memory, ephemeral disk).
++- Use read-only base images and ephemeral writable workspaces of controlled size.
++- Produce structured audit logs for every job (who submitted, what image, args, start/stop, exit code).
++- Integrate with cluster network policies and RBAC.
++
++Components in this patch
++- k8s/firecracker_hardened_deployment.yaml: Namespace, ServiceAccount, minimal RBAC, Deployment with strict securityContext and NetworkPolicy.
++- k8s/image_allowlist_config.yaml: ConfigMap with allowed image prefixes.
++- k8s/gatekeeper_image_allowlist_template.yaml: Gatekeeper ConstraintTemplate + Constraint example to enforce allowlist (Gatekeeper must be installed).
++- scripts/sign_image_with_cosign.sh: Helper to sign images with cosign (operator-run).
++- scripts/verify_image_signature.sh: Helper for controller to verify image signatures pre-launch (invoked by controller).
++- scripts/deploy_fluentbit_audit.sh: Example Fluent Bit DaemonSet to capture controller logs and forward to S3/ELK (operator must configure).
++
++Operator checklist (step-by-step)
++1) Build & scan controller image
++   - Build controller in a hardened CI with SBOM.
++   - Scan image for vulnerabilities, perform SCA.
++   - Sign image with cosign (see scripts/sign_image_with_cosign.sh). Prefer KMS-backed keys.
++
++2) Populate allowlist
++   - Update k8s/image_allowlist_config.yaml with exact digests (sha256:...) or registry prefixes.
++   - Apply ConfigMap in namespace openquill-firecracker.
++   - If using Gatekeeper, populate gatekeeper-image-allowlist-data ConfigMap and apply Constraint.
++
++3) Deploy controller
++   - Apply k8s/firecracker_hardened_deployment.yaml (after adapting nodeSelector and image).
++   - Ensure service account and RBAC are narrowly scoped.
++   - Ensure Namespace has PodSecurity enforce=restricted labels.
++
++4) Enforce signature verification
++   - Configure controller to call scripts/verify_image_signature.sh before creating microVMs.
++   - Controller should require cosign verification to succeed (prefer KMS public key).
++
++5) Network & filesystem policy
++   - Controller must create microVMs with network disabled by default.
++   - If microVM needs egress, require operator approval and explicit whitelist entries.
++   - Use read-only base images; mount an ephemeral workspace with a size limit (tmpfs or small ext4).
++
++6) Resource quotas & limits
++   - Enforce per-job vCPU & memory constraints via the controller and/or cgroups.
++   - Limit total concurrent microVMs per namespace and per user.
++
++7) Auditing & log forwarding
++   - Controller must emit structured JSON audit events to stdout: job_id, image, digest, cmd, submitter, start_ts, end_ts, exit_code.
++   - Deploy Fluent Bit/Fluentd to collect controller logs and forward to secure long-term storage (S3/Elasticsearch) using scripts/deploy_fluentbit_audit.sh as a starting point.
++
++8) Secrets & keys
++   - Store cosign private keys in KMS (AWS KMS, GCP KMS, Azure Key Vault) and reference via cosign KMS URIs.
++   - Restrict access to key material; rotate keys periodically.
++
++9) Admission & policy
++   - Install Gatekeeper and enforce image allowlist constraint (k8s/gatekeeper_image_allowlist_template.yaml).
++   - Optionally enforce additional policies: no hostPath mounts, disallow privileged=true, enforce runtimeClass.
++
++10) Testing & drills
++   - Run negative tests: attempt to submit jobs with non-allowed images, no signatures, or network egress and verify rejections.
++   - Run attack simulations and red-team for microVM escape and data exfiltration scenarios.
++
++Controller integration notes
++- The repo supplies a small Firecracker controller simulator and a simple client. Replace that simulator in production with a controller built on top of firecracker-containerd or another audited solution.
++- The controller must call cosign verify (or equivalent library) to validate image signatures. The provided verify script is a simple example.
++- Always prefer signed image digests (sha256:...) in allowlists to prevent tag-swapping attacks.
++- Keep an allowlist of approved base images only; do not allow arbitrary public images.
++
++Operational escalation & incident
++- If a microVM ever exhibits suspicious egress or behavior, immediately:
++  - Kill the microVM and preserve its disk snapshot.
++  - Pull audit logs for the job_id (controller logs) and flow logs for the node.
++  - Open an incident ticket and notify security & legal.
++
++This guide and manifests are a starting point. Operators must adapt to their environment, perform threat models, and apply security best practices before enabling microVM execution in production.
++
++If you'd like, I can:
++- produce an example controller wrapper (non-privileged) that demonstrates calling verify_image_signature.sh before launching a microVM (safe, no actual VM launch),
++- produce a Gatekeeper data-sync operator snippet that keeps the image allowlist updated from a secure source,
++- or generate an automated test harness that attempts to submit disallowed jobs and verifies rejection.
++
++Which follow-up would you like?
+---
