@@ -1,0 +1,537 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Copilot <copilot@example.com>
+Date: Wed, 04 Feb 2026 00:00:00 +0000
+Subject: [PATCH] scaffold: add runnable finetune, inference server, FAISS utils, moderation, and requirements
+
+---
+ requirements.txt                             |  15 +++++++++++++++
+ openquill/training/finetune.py               | 316 ++++++++++++++++++++++++++++++++++++++++++++++
+ openquill/training/accelerate_config.yaml    |  12 +++++++++++
+ openquill/inference/server.py                | 238 ++++++++++++++++++++++++++++++++++++++
+ openquill/retrieval/faiss_index.py           | 138 +++++++++++++++++++++++++++++++++
+ openquill/safety/moderation.py               | 108 ++++++++++++++++++++++++++++
+ examples/train_qlora.sh                      |  12 +++++++++++
+ docker/Dockerfile                            |  20 +++++++++++++++++++
+ 8 files changed, 859 insertions(+)
+ create mode 100644 requirements.txt
+ create mode 100644 openquill/training/finetune.py
+ create mode 100644 openquill/training/accelerate_config.yaml
+ create mode 100644 openquill/inference/server.py
+ create mode 100644 openquill/retrieval/faiss_index.py
+ create mode 100644 openquill/safety/moderation.py
+ create mode 100755 examples/train_qlora.sh
+ create mode 100644 docker/Dockerfile
+--- /dev/null
++++ b/requirements.txt
+@@ -0,0 +1,15 @@
++transformers>=4.35.0
++accelerate>=0.20.3
++bitsandbytes>=0.41.1
++peft>=0.4.0
++datasets>=2.12.0
++torch>=2.1.0
++faiss-cpu>=1.7.4.post3
++fastapi>=0.95.0
++uvicorn[standard]>=0.22.0
++pillow>=10.0.0
++requests>=2.31.0
++sentencepiece>=0.1.99
++safetensors>=0.4.0
++# Note: BLIP models are available via transformers (Salesforce/blip-*); no pip package named 'blip' required.
++
+--- /dev/null
++++ b/openquill/training/finetune.py
+@@ -0,0 +1,316 @@
++"""
++QLoRA / PEFT starter finetune script.
++
++Notes:
++- Expects dataset in JSONL or datasets-compatible format.
++- Minimal example: dataset entries with a "text" field (or "instruction" / "response").
++- Uses bitsandbytes 4-bit loading (optional) + PEFT (LoRA).
++- This is a starter; tune hyperparams and dataset parsing to your use-case.
++
++Example:
++python openquill/training/finetune.py \
++  --model_name_or_path mistral-7b \
++  --dataset_path data/instructions.jsonl \
++  --output_dir outputs/qlora-mistral-7b \
++  --per_device_train_batch_size 1 \
++  --gradient_accumulation_steps 32 \
++  --learning_rate 2e-4 \
++  --max_steps 20000 \
++  --bf16 True \
++  --use_peft True \
++  --peft_type lora \
++  --load_in_4bit True
++"""
++import argparse
++import json
++import os
++from pathlib import Path
++from typing import Dict, List
++
++import torch
++from datasets import load_dataset
++from transformers import (
++    AutoModelForCausalLM,
++    AutoTokenizer,
++    BitsAndBytesConfig,
++    TrainingArguments,
++    Trainer,
++    DataCollatorForLanguageModeling,
++)
++
++from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
++
++
++def parse_args():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--model_name_or_path", required=True, type=str)
++    parser.add_argument("--dataset_path", required=True, type=str)
++    parser.add_argument("--output_dir", required=True, type=str)
++    parser.add_argument("--per_device_train_batch_size", default=1, type=int)
++    parser.add_argument("--gradient_accumulation_steps", default=1, type=int)
++    parser.add_argument("--learning_rate", default=2e-4, type=float)
++    parser.add_argument("--max_steps", default=1000, type=int)
++    parser.add_argument("--bf16", action="store_true")
++    parser.add_argument("--use_peft", action="store_true")
++    parser.add_argument("--peft_type", default="lora", choices=["lora"])
++    parser.add_argument("--r", default=8, type=int, help="LoRA rank")
++    parser.add_argument("--lora_alpha", default=32, type=int)
++    parser.add_argument("--lora_dropout", default=0.05, type=float)
++    parser.add_argument("--load_in_4bit", action="store_true")
++    parser.add_argument("--max_seq_length", default=2048, type=int)
++    args = parser.parse_args()
++    return args
++
++
++def prepare_dataset(tokenizer, dataset, text_field="text", max_length=2048):
++    def join_fields(example):
++        # Choose field heuristically
++        if "text" in example:
++            return example["text"]
++        if "instruction" in example and "response" in example:
++            return f"### Instruction:\n{example['instruction']}\n\n### Response:\n{example['response']}"
++        # fallback: stringify whole example
++        return json.dumps(example)
++
++    def tokenize_fn(examples):
++        texts = [join_fields(e) for e in examples]
++        out = tokenizer(
++            texts,
++            truncation=True,
++            max_length=max_length,
++            padding="longest",
++        )
++        return out
++
++    tokenized = dataset.map(
++        tokenize_fn,
++        batched=True,
++        remove_columns=dataset.column_names,
++    )
++    return tokenized
++
++
++def main():
++    args = parse_args()
++    os.makedirs(args.output_dir, exist_ok=True)
++
++    # BitsAndBytesConfig for 4-bit loading
++    bnb_config = None
++    if args.load_in_4bit:
++        bnb_config = BitsAndBytesConfig(
++            load_in_4bit=True,
++            bnb_4bit_compute_dtype=torch.bfloat16 if args.bf16 else torch.float16,
++            bnb_4bit_use_double_quant=True,
++            bnb_4bit_quant_type="nf4",
++        )
++
++    print("Loading tokenizer...")
++    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
++    # Ensure pad token exists for causal
++    if tokenizer.pad_token is None:
++        tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
++
++    print("Loading model...")
++    model = AutoModelForCausalLM.from_pretrained(
++        args.model_name_or_path,
++        device_map="auto",
++        torch_dtype=torch.bfloat16 if args.bf16 else None,
++        quantization_config=bnb_config,
++    )
++
++    if args.load_in_4bit:
++        # Prepare for k-bit training
++        model = prepare_model_for_kbit_training(model)
++
++    if args.use_peft and args.peft_type == "lora":
++        print("Applying LoRA PEFT...")
++        # A generic heuristic: target q_proj/v_proj where present. Adjust for your model.
++        target_modules = None
++        name_lower = args.model_name_or_path.lower()
++        if "mistral" in name_lower or "gptj" in name_lower or "llama" in name_lower:
++            target_modules = ["q_proj", "v_proj"]
++
++        lora_config = LoraConfig(
++            r=args.r,
++            lora_alpha=args.lora_alpha,
++            target_modules=target_modules,
++            lora_dropout=args.lora_dropout,
++            bias="none",
++            task_type="CAUSAL_LM",
++        )
++        model = get_peft_model(model, lora_config)
++
++    # Load dataset (auto-detect JSON/JSONL/text)
++    print("Loading dataset...")
++    if args.dataset_path.endswith(".jsonl") or args.dataset_path.endswith(".json"):
++        ds = load_dataset("json", data_files=args.dataset_path, split="train")
++    else:
++        ds = load_dataset("text", data_files=args.dataset_path, split="train")
++
++    tokenized = prepare_dataset(tokenizer, ds, max_length=args.max_seq_length)
++    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
++
++    training_args = TrainingArguments(
++        output_dir=args.output_dir,
++        per_device_train_batch_size=args.per_device_train_batch_size,
++        gradient_accumulation_steps=args.gradient_accumulation_steps,
++        max_steps=args.max_steps,
++        learning_rate=args.learning_rate,
++        fp16=not args.bf16,
++        bf16=args.bf16,
++        save_total_limit=3,
++        logging_steps=50,
++        save_steps=500,
++        remove_unused_columns=False,
++    )
++
++    trainer = Trainer(
++        model=model,
++        args=training_args,
++        train_dataset=tokenized,
++        data_collator=data_collator,
++    )
++
++    print("Starting training...")
++    trainer.train()
++    print("Saving model...")
++    if args.use_peft:
++        model.save_pretrained(args.output_dir)
++    else:
++        trainer.save_model(args.output_dir)
++    print("Done.")
++
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null
++++ b/openquill/training/accelerate_config.yaml
+@@ -0,0 +1,12 @@
++compute_environment: LOCAL_MACHINE
++deepspeed_config: {}
++distributed_type: MULTI_GPU
++downcast_bf16: "no"
++fp16: "no"
++machine_rank: 0
++main_process_ip: null
++main_process_port: null
++main_training_role: trainer
++num_machines: 1
++num_processes: 1
++
+--- /dev/null
++++ b/openquill/inference/server.py
+@@ -0,0 +1,238 @@
++# openquill/inference/server.py
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++from typing import Optional
++import base64
++import io
++import os
++import logging
++
++from PIL import Image
++import torch
++from transformers import (
++    AutoTokenizer,
++    AutoModelForCausalLM,
++    BitsAndBytesConfig,
++    BlipForConditionalGeneration,
++    BlipProcessor,
++)
++
++from openquill.safety.moderation import is_safe, external_moderation
++
++logger = logging.getLogger("openquill")
++logging.basicConfig(level=logging.INFO)
++
++app = FastAPI(title="OpenQuill Inference Server")
++
++# Configuration via environment variables
++MODEL_NAME = os.environ.get("OQ_MODEL", "mistral-7b")
++LOAD_IN_4BIT = os.environ.get("OQ_LOAD_4BIT", "true").lower() in ("1", "true", "yes")
++DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
++BLIP_CAPTION_MODEL = os.environ.get("OQ_BLIP_MODEL", "Salesforce/blip-image-captioning-large")
++
++# Lazy load objects
++_tokenizer = None
++_model = None
++_blip_processor = None
++_blip_model = None
++
++
++class GenerationRequest(BaseModel):
++    prompt: str
++    max_new_tokens: Optional[int] = 256
++    temperature: Optional[float] = 0.0
++    image_b64: Optional[str] = None
++    use_moderation: Optional[bool] = True
++
++
++def _load_model():
++    global _tokenizer, _model
++    if _model is not None:
++        return
++
++    logger.info(f"Loading tokenizer and model: {MODEL_NAME} (device={DEVICE}, 4bit={LOAD_IN_4BIT})")
++    bnb_config = None
++    if LOAD_IN_4BIT:
++        bnb_config = BitsAndBytesConfig(
++            load_in_4bit=True,
++            bnb_4bit_compute_dtype=torch.bfloat16,
++            bnb_4bit_use_double_quant=True,
++            bnb_4bit_quant_type="nf4",
++        )
++
++    _tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
++    if _tokenizer.pad_token is None:
++        _tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
++    _model = AutoModelForCausalLM.from_pretrained(
++        MODEL_NAME, device_map="auto" if DEVICE == "cuda" else None, quantization_config=bnb_config
++    )
++    # For CPU-only, ensure model on CPU
++    if DEVICE == "cpu":
++        _model.to("cpu")
++
++
++def _load_blip():
++    global _blip_processor, _blip_model
++    if _blip_model is not None:
++        return
++    try:
++        _blip_processor = BlipProcessor.from_pretrained(BLIP_CAPTION_MODEL)
++        _blip_model = BlipForConditionalGeneration.from_pretrained(BLIP_CAPTION_MODEL, device_map="auto" if torch.cuda.is_available() else None)
++    except Exception as e:
++        logger.warning("BLIP model load failed: %s", e)
++        _blip_processor = None
++        _blip_model = None
++
++
++@app.on_event("startup")
++async def startup_event():
++    _load_model()
++    _load_blip()
++
++
++@app.post("/generate")
++async def generate(req: GenerationRequest):
++    # Basic safety check on prompt
++    if req.use_moderation:
++        safe, matches = is_safe(req.prompt)
++        if not safe:
++            raise HTTPException(status_code=400, detail={"reason": "prompt blocked by rule", "matches": matches})
++        # optional external moderation
++        # ext = external_moderation(req.prompt)
++    prompt = req.prompt
++
++    # If an image is provided, run BLIP captioning and prepend caption to prompt
++    if req.image_b64:
++        if _blip_model is None or _blip_processor is None:
++            # try to load on demand
++            _load_blip()
++        if _blip_model and _blip_processor:
++            try:
++                img_bytes = base64.b64decode(req.image_b64)
++                img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
++                inputs = _blip_processor(images=img, return_tensors="pt").to(_blip_model.device)
++                caption_ids = _blip_model.generate(**inputs, max_new_tokens=50)
++                caption = _blip_processor.decode(caption_ids[0], skip_special_tokens=True)
++                prompt = f"[Image caption: {caption}]\n\n{prompt}"
++            except Exception as e:
++                raise HTTPException(status_code=400, detail=f"invalid image data: {e}")
++
++    _load_model()
++    input_ids = _tokenizer(prompt, return_tensors="pt").input_ids.to(_model.device)
++    generation_kwargs = {
++        "max_new_tokens": req.max_new_tokens or 256,
++        "temperature": float(req.temperature or 0.0),
++        "do_sample": float(req.temperature or 0.0) > 0.0,
++    }
++
++    with torch.no_grad():
++        out = _model.generate(input_ids, **generation_kwargs)
++    text = _tokenizer.decode(out[0], skip_special_tokens=True)
++
++    # Safety check on output
++    safe_out, matches = is_safe(text)
++    if not safe_out:
++        return {"generated_text": "", "safety_blocked": True, "matches": matches}
++
++    return {"generated_text": text}
++
+--- /dev/null
++++ b/openquill/retrieval/faiss_index.py
+@@ -0,0 +1,138 @@
++# openquill/retrieval/faiss_index.py
++"""
++FAISS helper utilities (implementations for CPU using faiss-cpu).
++
++Functions:
++- build_index(embeddings, index_type="flat")
++- add_to_index(index, embeddings, ids=None)
++- search_index(index, query_emb, k=8)
++"""
++import numpy as np
++
++try:
++    import faiss
++except Exception as e:
++    faiss = None
++
++
++def build_index(embeddings: np.ndarray, index_type: str = "flat"):
++    """
++    Build and return a FAISS index for the provided embeddings (numpy array shape [N, D]).
++    index_type: "flat" (IndexFlatL2) or "ivf" (IVF with quantizer).
++    """
++    if faiss is None:
++        raise ImportError("faiss is required (install faiss-cpu)")
++
++    n, d = embeddings.shape
++    if index_type == "flat":
++        index = faiss.IndexFlatL2(d)
++        index = faiss.IndexIDMap(index)
++        index.add_with_ids(embeddings.astype("float32"), np.arange(n))
++        return index
++    elif index_type == "ivf":
++        quantizer = faiss.IndexFlatL2(d)
++        nlist = max(1, int(np.sqrt(n)))
++        index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
++        index.train(embeddings.astype("float32"))
++        index.add_with_ids(embeddings.astype("float32"), np.arange(n))
++        return index
++    else:
++        raise ValueError("Unsupported index_type")
++
++
++def add_to_index(index, embeddings: np.ndarray, ids: np.ndarray):
++    if faiss is None:
++        raise ImportError("faiss is required")
++    index.add_with_ids(embeddings.astype("float32"), ids.astype("int64"))
++
++
++def search_index(index, query_emb: np.ndarray, k: int = 8):
++    """
++    Returns (ids, distances) for top-k nearest neighbors.
++    """
++    if faiss is None:
++        raise ImportError("faiss is required")
++    query_emb = query_emb.astype("float32")
++    distances, ids = index.search(query_emb, k)
++    return ids, distances
++
+--- /dev/null
++++ b/openquill/safety/moderation.py
+@@ -0,0 +1,108 @@
++# openquill/safety/moderation.py
++import os
++import re
++from typing import List, Tuple, Dict, Optional
++import requests
++
++# Basic rule-based patterns
++BLOCKED_PATTERNS = [
++    re.compile(r"\b(?:suicide|kill myself|harm myself)\b", re.I),
++    re.compile(r"\b(?:terror|bomb|explosive)\b", re.I),
++    re.compile(r"\b(?:child abuse|sexual exploitation)\b", re.I),
++]
++
++
++def is_safe(text: str) -> Tuple[bool, List[str]]:
++    """
++    Returns (is_safe, matched_patterns)
++    """
++    matches = []
++    for pat in BLOCKED_PATTERNS:
++        if pat.search(text):
++            matches.append(pat.pattern)
++    return (len(matches) == 0, matches)
++
++
++def external_moderation(text: str, provider: Optional[str] = None) -> Dict:
++    """
++    Optional external moderation hook.
++    - If environment variable HF_API_TOKEN is set, uses Hugging Face moderation inference API as an example.
++    - Returns a dict with provider response or {'status': 'not-configured'}.
++    """
++    hf_token = os.environ.get("HF_API_TOKEN")
++    if hf_token:
++        url = "https://api-inference.huggingface.co/moderation"
++        headers = {"Authorization": f"Bearer {hf_token}"}
++        resp = requests.post(url, headers=headers, json={"inputs": text}, timeout=10)
++        if resp.status_code == 200:
++            return {"status": "ok", "provider": "hf_moderation", "result": resp.json()}
++        return {"status": "error", "code": resp.status_code, "text": resp.text}
++    return {"status": "not-configured"}
++
+--- /dev/null
++++ b/examples/train_qlora.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++set -e
++# Updated QLoRA starter script (uses finetune.py)
++MODEL="mistral-7b"
++DATASET="data/instructions.jsonl"
++OUTPUT_DIR="outputs/qlora-${MODEL##*/}"
++mkdir -p "$OUTPUT_DIR"
++
++python openquill/training/finetune.py \
++  --model_name_or_path "$MODEL" \
++  --dataset_path "$DATASET" \
++  --output_dir "$OUTPUT_DIR" \
++  --per_device_train_batch_size 1 \
++  --gradient_accumulation_steps 32 \
++  --learning_rate 2e-4 \
++  --max_steps 20000 \
++  --bf16 \
++  --use_peft \
++  --peft_type lora \
++  --load_in_4bit
++
++echo "QLoRA job completed (example)."
++
+--- /dev/null
++++ b/docker/Dockerfile
+@@ -0,0 +1,20 @@
++FROM python:3.11-slim
++ENV PYTHONDONTWRITEBYTECODE=1
++ENV PYTHONUNBUFFERED=1
++WORKDIR /app
++
++# Copy requirements and install
++COPY requirements.txt /tmp/requirements.txt
++RUN apt-get update && apt-get install -y build-essential git curl \
++    && pip install --upgrade pip \
++    && pip install --no-cache-dir -r /tmp/requirements.txt
++
++COPY openquill/ ./openquill/
++EXPOSE 8080
++CMD ["uvicorn", "openquill.inference.server:app", "--host", "0.0.0.0", "--port", "8080"]
++
+-- 
+2.40.1
