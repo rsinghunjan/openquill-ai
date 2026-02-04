@@ -1,0 +1,586 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Ops <ops@example.com>
+Date: 2026-02-25 00:00:00 +0000
+Subject: [PATCH] ops hardening: GPU nodepool guides & helpers, PVC/StorageClass, RBAC templates, TLS secret helper, monitoring install, warmup job, on-call runbook
+
+---
+ k8s/storageclass_pvc.yaml                            | 129 ++++++++++++++++++++++++++++++
+ k8s/rbac_and_serviceaccounts.yaml                    | 138 ++++++++++++++++++++++++++++++++
+ k8s/warmup_job.yaml                                  | 117 +++++++++++++++++++++++++++
+ scripts/label_gpu_nodes.sh                           | 122 +++++++++++++++++++++++++++
+ scripts/create_tls_secret.sh                         | 108 +++++++++++++++++++++++
+ monitoring/install_monitoring.sh                     | 188 ++++++++++++++++++++++++++++++++++++++
+ docs/ops_oncall_runbook.md                           | 325 +++++++++++++++++++++++++++++++++++++++++++++++++
+ k8s/gpu_nodepool_provider_examples.md                | 165 +++++++++++++++++++++++++++++
+ 8 files changed, 1292 insertions(+)
+ create mode 100644 k8s/storageclass_pvc.yaml
+ create mode 100644 k8s/rbac_and_serviceaccounts.yaml
+ create mode 100644 k8s/warmup_job.yaml
+ create mode 100755 scripts/label_gpu_nodes.sh
+ create mode 100755 scripts/create_tls_secret.sh
+ create mode 100755 monitoring/install_monitoring.sh
+ create mode 100644 docs/ops_oncall_runbook.md
+ create mode 100644 k8s/gpu_nodepool_provider_examples.md
+--- /dev/null
++++ b/k8s/storageclass_pvc.yaml
+@@ -0,0 +1,129 @@
++---
++# Example StorageClass for fast model storage (operator must adapt to cloud or on-prem)
++# Replace provisioner with your cloud provider (e.g., gp3/aws-ebs, gce-pd, csi drivers).
++apiVersion: storage.k8s.io/v1
++kind: StorageClass
++metadata:
++  name: openquill-fast-ssd
++provisioner: kubernetes.io/aws-ebs   # EDIT for your infra: e.g., kubernetes.io/gce-pd, ebs.csi.aws.com, csi.azure.com
++parameters:
++  type: gp3
++  fsType: ext4
++reclaimPolicy: Retain
++volumeBindingMode: WaitForFirstConsumer
++
++---
++# PVC template for model storage (1Ti example). Operators should create a PVC per environment and ensure
++# the StorageClass exists and is appropriate for large model blobs.
++apiVersion: v1
++kind: PersistentVolumeClaim
++metadata:
++  name: openquill-model-pvc
++  namespace: openquill-prod
++spec:
++  accessModes:
++    - ReadWriteMany
++  resources:
++    requests:
++      storage: 1Ti
++  storageClassName: openquill-fast-ssd
++
++---
++# PVC for shared data (datasets, embeddings)
++apiVersion: v1
++kind: PersistentVolumeClaim
++metadata:
++  name: openquill-data-pvc
++  namespace: openquill-prod
++spec:
++  accessModes:
++    - ReadWriteMany
++  resources:
++    requests:
++      storage: 500Gi
++  storageClassName: openquill-fast-ssd
++
++# Operator notes:
++# - Use a ReadWriteMany-capable storage backend (NFS, EFS, GCS Fuse, CSI drivers) for multiple readers.
++# - On cloud providers, use regional disks or shared filesystem solutions for high-throughput model loads.
++# - ReclaimPolicy=Retain is recommended to avoid accidental deletion of large model artifacts.
+--- /dev/null
++++ b/k8s/rbac_and_serviceaccounts.yaml
+@@ -0,0 +1,138 @@
++---
++# Namespaced service accounts and RBAC for OpenQuill components
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: openquill-controller-sa
++  namespace: openquill-prod
++
++---
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: openquill-inference-sa
++  namespace: openquill-prod
++
++---
++# Role for model-manager jobs (merge/publish), limited to PVC / secrets / configmaps
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  namespace: openquill-prod
++  name: openquill-model-manager-role
++rules:
++  - apiGroups: [""]
++    resources: ["persistentvolumeclaims", "pods", "pods/exec", "secrets", "configmaps"]
++    verbs: ["get", "list", "create", "update", "patch", "delete"]
++  - apiGroups: ["batch"]
++    resources: ["jobs"]
++    verbs: ["create", "get", "list", "delete"]
++
++---
++# RoleBinding to bind model-manager role to service account
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: openquill-model-manager-binding
++  namespace: openquill-prod
++subjects:
++  - kind: ServiceAccount
++    name: openquill-controller-sa
++    namespace: openquill-prod
++roleRef:
++  kind: Role
++  name: openquill-model-manager-role
++  apiGroup: rbac.authorization.k8s.io
++
++---
++# ClusterRole for inference components that need to read node labels & PV info (read-only)
++apiVersion: rbac.authorization.k8s.io/v1
++kind: ClusterRole
++metadata:
++  name: openquill-inference-clusterrole
++rules:
++  - apiGroups: [""]
++    resources: ["nodes", "persistentvolumes", "persistentvolumeclaims"]
++    verbs: ["get", "list", "watch"]
++
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: ClusterRoleBinding
++metadata:
++  name: openquill-inference-binding
++subjects:
++  - kind: ServiceAccount
++    name: openquill-inference-sa
++    namespace: openquill-prod
++roleRef:
++  kind: ClusterRole
++  name: openquill-inference-clusterrole
++  apiGroup: rbac.authorization.k8s.io
++
++# Operator notes:
++# - Tighten these roles to least privilege in your environment.
++# - Consider using OPA/Gatekeeper and Pod Security Admission to enforce policies.
+--- /dev/null
++++ b/k8s/warmup_job.yaml
+@@ -0,0 +1,117 @@
++---
++# Warmup Job: load model into vLLM/TGI pods or call warmup endpoints after deploy
++# This Job runs a small set of warmup requests to ensure models are loaded and caches populated.
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: openquill-warmup
++  namespace: openquill-prod
++spec:
++  backoffLimit: 1
++  template:
++    spec:
++      serviceAccountName: openquill-controller-sa
++      containers:
++        - name: warmup
++          image: python:3.10-slim
++          command: ["/bin/sh", "-c"]
++          args:
++            - |
++              set -euo pipefail
++              pip install requests
++              # Warmup endpoints: adjust to your service hostnames and endpoints
++              ENDPOINTS="${ENDPOINTS:-http://vllm-service.openquill-prod.svc.cluster.local:80/v1/models/mistralai/mistral-7b:predict}"
++              PROMPT_FILE="/data/warmup_prompts.txt"
++              if [ -f "$PROMPT_FILE" ]; then
++                while read -r p; do
++                  echo "Warming up with prompt: ${p:0:80}..."
++                  python - <<PY
++import requests, os, json
++ep=os.environ.get("ENDPOINTS")
++payload={"prompt": p, "max_new_tokens":64}
++resp=requests.post(ep,json=payload,timeout=30)
++print("status",resp.status_code)
++PY
++                done < "$PROMPT_FILE"
++              else
++                echo "No warmup prompts present at /data/warmup_prompts.txt; sending a short default request"
++                python - <<PY
++import requests, os, json
++ep=os.environ.get("ENDPOINTS")
++payload={"prompt":"Warmup: say hello","max_new_tokens":8}
++resp=requests.post(ep,json=payload,timeout=30)
++print("status",resp.status_code)
++PY
++              fi
++          env:
++            - name: ENDPOINTS
++              value: "http://vllm-service.openquill-prod.svc.cluster.local:80/v1/models/mistralai/mistral-7b:predict"
++          volumeMounts:
++            - name: data
++              mountPath: /data
++      volumes:
++        - name: data
++          configMap:
++            name: openquill-warmup-prompts
++      restartPolicy: Never
++
++---
++# ConfigMap for warmup prompts: operators can populate dozens of prompts to cover common paths
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: openquill-warmup-prompts
++  namespace: openquill-prod
++data:
++  warmup_prompts.txt: |
++    Summarize: OpenQuill is a platform for building and serving LLMs.
++    Write a short Python function to compute factorial.
++    What is the capital of France?
++
++# Operator notes:
++# - Run this Job after scaling vLLM/TGI replicas to pre-load models and reduce cold-start latency.
++# - Schedule as a post-deploy Job in your CI/CD.
+--- /dev/null
++++ b/scripts/label_gpu_nodes.sh
+@@ -0,0 +1,122 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# scripts/label_gpu_nodes.sh
++#
++# Help operators label nodes that have GPUs and optionally taint them so only GPU workloads run there.
++#
++# Usage:
++#   ./scripts/label_gpu_nodes.sh --label gpu=true --taint nvidia.com/gpu=present:NoSchedule
++
++LABEL=${LABEL:-"gpu=true"}
++TAINT=${TAINT:-""}
++DRY_RUN=${DRY_RUN:-"false"}
++KUBECTL=${KUBECTL:-$(which kubectl || echo kubectl)}
++
++function usage() {
++  echo "Usage: $0 --label key=value [--taint key=value:Effect] [--dry-run]"
++  exit 1
++}
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --label) LABEL="$2"; shift 2;;
++    --taint) TAINT="$2"; shift 2;;
++    --dry-run) DRY_RUN="true"; shift;;
++    *) usage;;
++  esac
++done
++
++echo "Discovering nodes with GPU allocatable resource..."
++NODES_WITH_GPU=$($KUBECTL get nodes -o json | jq -r '.items[] | select(.status.allocatable["nvidia.com/gpu"]!=null) | .metadata.name')
++
++if [ -z "$NODES_WITH_GPU" ]; then
++  echo "No nodes with allocatable nvidia.com/gpu found. You must provision GPU nodes first."
++  exit 2
++fi
++
++echo "Found nodes:"
++echo "$NODES_WITH_GPU"
++
++for n in $NODES_WITH_GPU; do
++  echo "Labeling node $n with $LABEL"
++  if [ "$DRY_RUN" = "true" ]; then
++    echo "DRY RUN: kubectl label node $n $LABEL --overwrite"
++  else
++    kubectl label node "$n" "$LABEL" --overwrite
++  fi
++  if [ -n "$TAINT" ]; then
++    echo "Applying taint $TAINT to node $n"
++    if [ "$DRY_RUN" = "true" ]; then
++      echo "DRY RUN: kubectl taint nodes $n $TAINT --overwrite"
++    else
++      kubectl taint nodes "$n" "$TAINT" --overwrite || true
++    fi
++  fi
++done
++
++echo "Node labeling complete. Verify with: kubectl get nodes --show-labels"
++exit 0
+--- /dev/null
++++ b/scripts/create_tls_secret.sh
+@@ -0,0 +1,108 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# scripts/create_tls_secret.sh
++#
++# Create a TLS secret in Kubernetes from certificate and key files. Useful for ingress TLS for model endpoints.
++#
++# Usage:
++#   ./scripts/create_tls_secret.sh --namespace openquill-prod --secret-name openquill-tls --cert /path/tls.crt --key /path/tls.key
++
++NAMESPACE=${NAMESPACE:-"openquill-prod"}
++SECRET_NAME=${SECRET_NAME:-"openquill-tls"}
++CERT=${CERT:-""}
++KEY=${KEY:-""}
++
++function usage() {
++  echo "Usage: $0 --namespace <ns> --secret-name <name> --cert <crt> --key <key>"
++  exit 1
++}
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --namespace) NAMESPACE="$2"; shift 2;;
++    --secret-name) SECRET_NAME="$2"; shift 2;;
++    --cert) CERT="$2"; shift 2;;
++    --key) KEY="$2"; shift 2;;
++    *) usage;;
++  esac
++done
++
++if [ -z "$CERT" ] || [ -z "$KEY" ]; then
++  echo "cert and key are required"
++  usage
++fi
++
++if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
++  echo "cert or key file not found"
++  exit 2
++fi
++
++kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
++kubectl create secret tls "$SECRET_NAME" -n "$NAMESPACE" --cert="$CERT" --key="$KEY" --dry-run=client -o yaml | kubectl apply -f -
++echo "Created TLS secret $SECRET_NAME in namespace $NAMESPACE"
++echo "Verify: kubectl get secret $SECRET_NAME -n $NAMESPACE -o yaml"
++exit 0
+--- /dev/null
++++ b/monitoring/install_monitoring.sh
+@@ -0,0 +1,188 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# monitoring/install_monitoring.sh
++#
++# Install Prometheus + Grafana + OTEL collector via Helm with recommended values for OpenQuill.
++# Operator must review and provide persistent storage, admin credentials and alerting endpoints (PagerDuty/Slack).
++#
++# Requirements:
++# - helm v3
++# - kubectl configured
++# - kube-prometheus-stack (Prometheus Operator) chart available
++# - grafana chart or use kube-prometheus-stack bundled grafana
++#
++NAMESPACE=${NAMESPACE:-"openquill-monitoring"}
++PROM_RELEASE=${PROM_RELEASE:-"openquill-prom"}
++GRAFANA_ADMIN_USER=${GRAFANA_ADMIN_USER:-"admin"}
++GRAFANA_ADMIN_PASS=${GRAFANA_ADMIN_PASS:-"change-me-please"}
++
++echo "Creating namespace $NAMESPACE"
++kubectl create namespace "$NAMESPACE" || true
++
++echo "Installing kube-prometheus-stack (Prometheus + Alertmanager + Grafana)"
++helm repo add prometheus-community https://prometheus-community.github.io/helm-charts || true
++helm repo update
++
++helm upgrade --install "$PROM_RELEASE" prometheus-community/kube-prometheus-stack -n "$NAMESPACE" \
++  --set grafana.enabled=true \
++  --set grafana.adminUser="$GRAFANA_ADMIN_USER" \
++  --set grafana.adminPassword="$GRAFANA_ADMIN_PASS" \
++  --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
++  --wait
++
++echo "Prometheus & Grafana installed. Retrieve Grafana credentials:"
++echo "  User: $GRAFANA_ADMIN_USER"
++echo "  Password: $GRAFANA_ADMIN_PASS"
++echo "To port-forward Grafana locally:"
++echo "  kubectl --namespace $NAMESPACE port-forward svc/$PROM_RELEASE-grafana 3000:80"
++
++echo "Installing OpenTelemetry Collector (optional) in namespace $NAMESPACE"
++helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts || true
++helm repo update
++helm upgrade --install otel-collector open-telemetry/opentelemetry-collector -n "$NAMESPACE" --wait \
++  --set config.exporters.prometheus.endpoint="0.0.0.0:8889" \
++  --set config.service.pipelines.metrics.enabled=true \
++  --set config.service.pipelines.traces.enabled=true
++
++echo "Configure Alertmanager routes and receivers in Grafana/Prometheus for on-call paging (PagerDuty/Slack)."
++echo "Example: create a Secret with pagerduty key and apply Alertmanager config via a KubernetesSecret managed by the prometheus-operator."
++
++cat <<'EOF'
++Operator next steps:
++ - Import suggested dashboards (LLM latency, safety flags, HIL queue metrics).
++ - Create Alertmanager config with receivers for on-call.
++ - Secure Grafana behind SSO (OIDC) or reverse-proxy and rotate admin password.
++ - Configure retention and long-term storage for Prometheus (thanos/remote_write).
++EOF
++
++echo "Monitoring install complete."
++exit 0
+--- /dev/null
++++ b/docs/ops_oncall_runbook.md
+@@ -0,0 +1,325 @@
++# OpenQuill Ops & On‑Call Runbook
++
++Purpose
++- This runbook documents operational procedures for production OpenQuill: provisioning GPU node pools, PVCs, RBAC/TLS, monitoring, warmup jobs, and on-call actions for incidents.
++
++Audience
++- Platform/infra engineers, SRE, on-call responders
++
++1) Provision GPU node pools
++- Use cloud provider native APIs (GKE/AKS/EKS) or cluster autoscaler to create a GPU node pool.
++- Prefer using a separate pool with taints and labels (e.g., node-role=infra, gpu=true).
++- After nodes are created, label & taint them:
++  ./scripts/label_gpu_nodes.sh --label "gpu=true" --taint "nvidia.com/gpu=present:NoSchedule"
++- Verify: kubectl get nodes -L gpu
++
++2) PVC & Storage
++- Create StorageClass and PVCs for model artifacts:
++  kubectl apply -f k8s/storageclass_pvc.yaml
++- Ensure the StorageClass maps to fast storage (NVMe backed) and supports ReadWriteMany if multiple readers needed.
++- Ensure backup/retention policy for PVs (models are large).
++
++3) RBAC & ServiceAccounts
++- Apply RBAC templates:
++  kubectl apply -f k8s/rbac_and_serviceaccounts.yaml
++- Use minimal privileges for each service account; audit via kube-audit.
++
++4) TLS for endpoints
++- Create TLS certs (ACME/Let's Encrypt for public endpoints or internal CA).
++- Create Kubernetes TLS secret:
++  ./scripts/create_tls_secret.sh --namespace openquill-prod --secret-name openquill-tls --cert /path/tls.crt --key /path/tls.key
++- Configure Ingress/ALB to use the TLS secret.
++
++5) Monitoring & alerting
++- Install Prometheus + Grafana + OTEL:
++  ./monitoring/install_monitoring.sh
++- Import prebuilt dashboards and create SLO-based alerts (use monitoring/prometheus_alerts.yaml + Alertmanager).
++- Ensure Alertmanager routes to on-call (PagerDuty/Slack) and add runbook links to alerts.
++
++6) Warmup jobs and SLOs
++- After model deploy, run warmup Job:
++  kubectl apply -f k8s/warmup_job.yaml
++- Schedule warmup as part of post-deploy job in CI/CD.
++- Define SLOs: p95 latency targets per tier (quantized 7B, GPU 7–13B, fallback 30–40B).
++
++7) On-call responsibilities
++- Primary: triage alerts (latency, safety spikes, HIL queue growth), escalate to ML/Safety and DevOps.
++- For high-severity safety spike:
++  - page safety lead and legal
++  - run red-team quick-run and gather recent HIL items
++  - consider rolling back to previous model image
++- For infra issues (low GPUs, PVC full):
++  - check node health: kubectl get nodes, describe failing pods
++  - scale node pool or evict non-critical workloads
++  - follow ops_provision_checklist.sh
++
++8) Incident playbooks (short)
++- Safety regression:
++  1. Pause public traffic (route to maintenance or rate-limit)
++  2. Pause PPO promotions and annotation pipelines
++  3. Export HIL queue and red-team outputs for safety lead
++  4. Roll back to last known-good checkpoint
++
++- Resource exhaustion:
++  1. Identify top consumers (kubectl top pods; Prometheus)
++  2. Scale cluster / add GPU nodes
++  3. Reprioritize / throttle low-priority workloads
++
++9) Runbook maintenance
++- Update this document with any changes to: node labels, StorageClass names, secret names, alert thresholds, on-call roster, and contact emails.
++- Store a copy in an accessible, versioned documentation system and link it from alerts.
++
++10) Emergency contacts & escalation
++- Ops/Infra: infra@example.com
++- ML Lead: ml@example.com
++- Safety Lead: safety@example.com
++- Legal: legal@example.com
++ - PagerDuty: +1-800-555-OPS (example)
++
++Appendix: quick commands
++- Check GPU nodes:
++  kubectl get nodes -L gpu
++- Check PVC usage:
++  kubectl get pvc -n openquill-prod
++- Trigger warmup job:
++  kubectl create job --from=cronjob/openquill-warmup openquill-warmup-$(date +%s) -n openquill-prod
++
++End of runbook.
+--- /dev/null
++++ b/k8s/gpu_nodepool_provider_examples.md
+@@ -0,0 +1,165 @@
++# GPU nodepool provider examples
++
++This file provides operator examples for provisioning GPU node pools across common cloud providers.
++These are examples and should be adapted to your organization (IAM, quotas, regions, node types).
++
++GKE (Google Kubernetes Engine)
++-----------------------------
++Example gcloud command to create a node pool with A100 GPUs (GKE Autopilot or GKE standard):
++
++gcloud container node-pools create openquill-gpu-pool \
++  --cluster my-cluster \
++  --machine-type a2-highgpu-1g \
++  --accelerator type=nvidia-tesla-a100,count=1 \
++  --num-nodes 1 \
++  --region us-central1 \
++  --node-labels=role=openquill,gpu=true \
++  --node-taints=nvidia.com/gpu=present:NoSchedule
++
++Notes:
++- Adjust machine-type / accelerator to the GPUs you need (A100/H100/A40).
++- Ensure the NVIDIA device plugin DaemonSet is installed in the cluster for GPU scheduling.
++- After nodes ready, label & taint further if needed using scripts/label_gpu_nodes.sh.
++
++EKS (AWS Elastic Kubernetes Service)
++-----------------------------------
++Using eksctl:
++
++eksctl create nodegroup \
++  --cluster=my-cluster \
++  --name=openquill-gpu-ng \
++  --node-type=p4d.24xlarge \
++  --nodes=1 \
++  --nodes-min=1 \
++  --nodes-max=5 \
++  --node-labels role=openquill,gpu=true \
++  --node-taints nvidia.com/gpu=present:NoSchedule \
++  --region us-west-2
++
++Notes:
++- Use the appropriate instance type for your GPU needs. Ensure AMI supports NVIDIA drivers.
++- Install the Nvidia device plugin DaemonSet and GPU drivers if not using managed AMIs.
++
++AKS (Azure Kubernetes Service)
++-----------------------------
++az aks nodepool add \
++  --resource-group my-rg \
++  --cluster-name my-aks-cluster \
++  --name openquillgpu \
++  --node-vm-size Standard_ND96asr_v4 \
++  --node-count 1 \
++  --node-taints nvidia.com/gpu=present:NoSchedule \
++  --labels role=openquill,gpu=true
++
++On-prem / kubeadm or private clouds
++----------------------------------
++- Provision VMs with GPUs and join them to the cluster.
++- Label and taint nodes:
++  kubectl label node <node-name> gpu=true
++  kubectl taint nodes <node-name> nvidia.com/gpu=present:NoSchedule
++- Install device plugin and drivers via DaemonSet / operator.
++
++Post-provision steps (common)
++----------------------------
++1) Install NVIDIA device plugin:
++   kubectl apply -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/main/nvidia-device-plugin.yml
++
++2) Verify GPU allocatable:
++   kubectl get nodes -o custom-columns=NAME:.metadata.name,GPU:.status.allocatable.nvidia\.com/gpu
++
++3) Label & taint nodes if not set during provisioning:
++   ./scripts/label_gpu_nodes.sh --label "gpu=true" --taint "nvidia.com/gpu=present:NoSchedule"
++
++4) Create StorageClass & PVCs (see k8s/storageclass_pvc.yaml)
++
++5) Update Helm chart values for charts/vllm-tgi/values-prod.yaml to set nodeSelector/tolerations:
++   nodeSelector:
++     gpu: "true"
++   tolerations:
++     - key: "nvidia.com/gpu"
++       operator: "Exists"
++       effect: "NoSchedule"
++
++Security & cost notes
++----------------------
++- Use separate node pools for GPU workloads to control cost and scheduling.
++- Apply spot/preemptible instances cautiously — model loading can take time; use warmup jobs and eviction policies.
++- Restrict which namespaces/service accounts can schedule onto GPU nodes via RBAC and admission controllers.
++
++This document is a starting point — adapt commands and types to your account quotas and region availability.
++
+--- 
+2.40.1
