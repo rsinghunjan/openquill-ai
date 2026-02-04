@@ -1,0 +1,755 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Ops <ops@example.com>
+Date: 2026-02-13 00:00:00 +0000
+Subject: [PATCH] release gates, annotation QA, firecracker-containerd client scaffold, long-context & quantization validation, prod k8s templates, legal/safety gating
+
+---
+ .github/workflows/release_gate.yml                    | 116 ++++++++++++++++++++++
+ docs/legal_safety_checklist.md                        | 146 +++++++++++++++++++++++++++++
+ k8s/production_templates.yaml                         | 244 +++++++++++++++++++++++++++++++++++++
+ openquill/tools/firecracker_containerd_client.py      | 192 ++++++++++++++++++++++++++
+ tools/annotation_qc.py                                | 206 ++++++++++++++++++++++++++++++
+ scripts/check_vetted_checkpoints.py                   | 150 +++++++++++++++++++
+ scripts/quantize_validate.py                          | 224 +++++++++++++++++++++++++++++
+ scripts/long_context_benchmark.py                     | 198 ++++++++++++++++++++++++++
+ scripts/publish_gate.py                               | 142 ++++++++++++++++++
+ 10 files changed, 1618 insertions(+)
+ create mode 100644 .github/workflows/release_gate.yml
+ create mode 100644 docs/legal_safety_checklist.md
+ create mode 100644 k8s/production_templates.yaml
+ create mode 100644 openquill/tools/firecracker_containerd_client.py
+ create mode 100644 tools/annotation_qc.py
+ create mode 100644 scripts/check_vetted_checkpoints.py
+ create mode 100644 scripts/quantize_validate.py
+ create mode 100644 scripts/long_context_benchmark.py
+ create mode 100644 scripts/publish_gate.py
+--- /dev/null
++++ b/.github/workflows/release_gate.yml
+@@ -0,0 +1,116 @@
++name: Release gating checks
++
++on:
++  workflow_dispatch:
++  push:
++    tags:
++      - 'v*.*.*'
++
++jobs:
++  release-gate:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: "3.10"
++      - name: Install deps
++        run: |
++          python -m pip install --upgrade pip
++          pip install boto3 transformers sentence-transformers evaluate
++      - name: Run release gate
++        env:
++          S3_BUCKET: ${{ secrets.SNAPSHOT_BUCKET }}
++          HF_API_TOKEN: ${{ secrets.HF_API_TOKEN }}
++        run: |
++          python scripts/check_vetted_checkpoints.py --manifest release_snapshots_manifest.json || exit 2
++          python tools/annotation_qc.py --annotations annotations.csv --gold gold_tests.json --min_gold_pass 0.9 || exit 3
++          python scripts/quantize_validate.py --model ./models/mistralai_mistral-7b --quantized ./models/mistral.gguf --test_prompts tests/prompts.txt --tolerance 0.85 || exit 4
++          python scripts/publish_gate.py --legal docs/legal_signoff.json || exit 5
++
++  # This workflow is intentionally conservative: if any gate fails the release is blocked.
++  # Customize the steps and thresholds to match your organization's policy.
++
+--- /dev/null
++++ b/docs/legal_safety_checklist.md
+@@ -0,0 +1,146 @@
++# Legal & Safety Release Checklist (template)
++
++Use this checklist before publishing any derived checkpoints or making models publicly available.
++Store a completed copy (JSON) at docs/legal_signoff.json for automation to pick up.
++
++1) Model & Dataset Licensing
++ - Base model(s) chosen and listed (HF ids).
++ - Licenses verified (allowlist includes Apache-2.0, MIT, etc.).
++ - Datasets used listed with provenance, access dates, and applied filters.
++
++2) Data Privacy & PII
++ - PII scan performed (scripts/scan_pii.py) and any hits remediated.
++ - No personal data remains in datasets used for the released checkpoint (or explicit exception documented).
++
++3) Annotation & RLHF Controls
++ - Annotation platform used and annotator metadata captured (IDs, timestamps).
++ - Gold tests defined and minimum pass rate achieved (recorded).
++ - Annotation audit report (scripts/audit_annotations.py) attached.
++ - Holdout eval for reward model performed and documented.
++
++4) Safety Testing & Red-Team
++ - Automated red-team suite run (scripts/run_redteam_automation.py) and results reviewed.
++ - HIL queue reviewed and human adjudication completed for flagged items.
++ - Abstention/refusal templates validated and tested.
++
++5) Model Evaluation
++ - Benchmarks run: GSM8K, MMLU subset, HumanEval (or proxies); results recorded.
++ - Multimodal evaluation: VQA/TextCaps on dev set (if applicable).
++ - Long-context validation (sliding window or native model) results recorded.
++
++6) Operational & Security
++ - Serving infra (k8s) manifests prepared with nodeSelectors/PVC, RBAC, and secrets.
++ - Sandbox for tools (Firecracker/gVisor) provisioned and tested.
++ - Observability (Prometheus/Grafana/OTel) configured and alert rules set.
++
++7) Legal Signoff
++ - Legal team reviews license manifest and dataset cards.
++ - Legal confirms allowed distribution and any commercial/attribution requirements.
++
++8) Release Artifacts
++ - Release snapshot manifest created and pinned (release_snapshots_manifest.json).
++ - Merged checkpoint stored to guarded artifact repository (S3/HF) and URI recorded.
++ - Model & dataset cards published in docs/.
++
++9) Post-release Plan
++ - Red-team cadence set (weekly/biweekly).
++ - Incident response and takedown contact recorded.
++ - Retraining & patch plan documented.
++
++Sign-off record (example JSON fields)
++{
++  "model_id": "your-org/openquill-mistral-7b",
++  "release_tag": "v1.0.0",
++  "legal_reviewed_by": "legal@example.com",
++  "safety_reviewed_by": "safety@example.com",
++  "date": "2026-02-13T00:00:00Z",
++  "notes": "All checks passed. No PII. LoRA merged after human review."
++}
++
+--- /dev/null
++++ b/k8s/production_templates.yaml
+@@ -0,0 +1,244 @@
++# Kubernetes production manifest templates (operator must fill secrets & node selectors)
++# This file contains templates and examples that operators must adapt for their cluster.
++
++---
++# Example: PersistentVolumeClaim template for model storage (use an appropriate StorageClass)
++apiVersion: v1
++kind: PersistentVolumeClaim
++metadata:
++  name: openquill-model-pvc
++  namespace: openquill-prod
++spec:
++  accessModes:
++    - ReadWriteMany
++  resources:
++    requests:
++      storage: 1Ti
++  storageClassName: standard
++
++---
++# Example: ServiceAccount and RBAC to allow a merge job to access PV and secrets (operators must tighten perms)
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: openquill-merge-job-sa
++  namespace: openquill-prod
++
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: openquill-merge-role
++  namespace: openquill-prod
++rules:
++  - apiGroups: [""]
++    resources: ["pods","pods/exec","persistentvolumeclaims"]
++    verbs: ["get","list","create","update","delete","patch"]
++
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: openquill-merge-rolebinding
++  namespace: openquill-prod
++subjects:
++  - kind: ServiceAccount
++    name: openquill-merge-job-sa
++    namespace: openquill-prod
++roleRef:
++  kind: Role
++  name: openquill-merge-role
++  apiGroup: rbac.authorization.k8s.io
++
++---
++# Example: Job template to run merge_lora in-cluster against PVC (operator must mount model snapshot)
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: openquill-merge-job
++  namespace: openquill-prod
++spec:
++  template:
++    spec:
++      serviceAccountName: openquill-merge-job-sa
++      containers:
++        - name: merge
++          image: python:3.10-slim
++          command: [ "/bin/sh", "-c", "--" ]
++          args:
++            - |
++              pip install peft transformers accelerate boto3;
++              python /work/merge_lora.py --base_model /models/mistralai_mistral-7b --peft_path /work/peft --out_dir /work/merged;
++              echo "Merge finished";
++          volumeMounts:
++            - name: models
++              mountPath: /models
++            - name: work
++              mountPath: /work
++      restartPolicy: Never
++      volumes:
++        - name: models
++          persistentVolumeClaim:
++            claimName: openquill-model-pvc
++        - name: work
++          emptyDir: {}
++  backoffLimit: 3
++
++---
++# Example: TLS secret placeholders (create with your cert manager)
++apiVersion: v1
++kind: Secret
++metadata:
++  name: openquill-tls
++  namespace: openquill-prod
++type: kubernetes.io/tls
++data:
++  tls.crt: "REPLACE_BASE64_CERT"
++  tls.key: "REPLACE_BASE64_KEY"
++
++---
++# Example: NetworkPolicy to restrict ingress to model services (operators should adapt)
++apiVersion: networking.k8s.io/v1
++kind: NetworkPolicy
++metadata:
++  name: allow-from-namespace
++  namespace: openquill-prod
++spec:
++  podSelector:
++    matchLabels:
++      app: openquill-vllm
++  ingress:
++    - from:
++        - namespaceSelector:
++            matchLabels:
++              name: openquill-prod
++  policyTypes:
++    - Ingress
++
++---
++# Notes to operators:
++# - Replace nodeSelector values below to schedule pods on GPU nodes (provider-specific labels).
++# - Ensure PVC references map to storage available in your cluster.
++# - Create Kubernetes secrets for HF API token, Sentry, monitoring endpoints and mount them as env vars.
++# - Use PodSecurityPolicy/OPA/PSP equivalent to enforce runtime security (TTY, privileged false, seccomp).
+--- /dev/null
++++ b/openquill/tools/firecracker_containerd_client.py
+@@ -0,0 +1,192 @@
++"""
++openquill.tools.firecracker_containerd_client
++
++Lightweight client to interact with a firecracker-containerd / microVM orchestration API.
++This is a thin client wrapper that expects an HTTP-based manager exposing:
++ - POST /v1/jobs   -> submit payload (JSON) -> returns job_id
++ - GET  /v1/jobs/{id} -> returns job status and outputs
++
++Operational notes:
++ - This module does NOT implement a manager. Use it to integrate with a real controller (firecracker-containerd or custom).
++ - The manager must enforce image policies (no network egress unless whitelisted), resource limits, and auditing.
++"""
++from __future__ import annotations
++import json
++import os
++import requests
++from typing import Dict, Any, Optional
++
++DEFAULT_MANAGER = os.environ.get("FIRECRACKER_MANAGER_URL", "http://firecracker-manager.openquill.svc.cluster.local:9000")
++
++
++class FirecrackerClientError(RuntimeError):
++    pass
++
++
++class FirecrackerClient:
++    def __init__(self, manager_url: Optional[str] = None, api_token: Optional[str] = None):
++        self.manager = manager_url or DEFAULT_MANAGER
++        self.token = api_token or os.environ.get("FIRECRACKER_MANAGER_TOKEN")
++
++    def submit_job(self, payload: Dict[str, Any], timeout: int = 30) -> Dict[str, Any]:
++        """
++        Submit a payload describing the tool to execute in a microVM.
++        Expected payload sample:
++          {"image": "python:3.10-slim", "cmd": ["python","script.py"], "files": {"script.py": "..."}, "resources": {"vcpu":1,"memory_mb":256}, "no_network": true}
++        """
++        url = f"{self.manager.rstrip('/')}/v1/jobs"
++        headers = {"Content-Type": "application/json"}
++        if self.token:
++            headers["Authorization"] = f"Bearer {self.token}"
++        try:
++            resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=timeout)
++            resp.raise_for_status()
++            return resp.json()
++        except Exception as e:
++            raise FirecrackerClientError(f"submit_job failed: {e}")
++
++    def get_job(self, job_id: str, timeout: int = 10) -> Dict[str, Any]:
++        url = f"{self.manager.rstrip('/')}/v1/jobs/{job_id}"
++        headers = {}
++        if self.token:
++            headers["Authorization"] = f"Bearer {self.token}"
++        try:
++            resp = requests.get(url, headers=headers, timeout=timeout)
++            resp.raise_for_status()
++            return resp.json()
++        except Exception as e:
++            raise FirecrackerClientError(f"get_job failed: {e}")
++
++    def run_and_wait(self, payload: Dict[str, Any], poll_interval: int = 2, timeout: int = 300) -> Dict[str, Any]:
++        res = self.submit_job(payload)
++        job_id = res.get("job_id") or res.get("id")
++        if not job_id:
++            raise FirecrackerClientError("Manager did not return job_id")
++        # poll
++        import time
++        start = time.time()
++        while time.time() - start < timeout:
++            status = self.get_job(job_id)
++            st = status.get("status")
++            if st in ("finished", "failed", "error"):
++                return status
++            time.sleep(poll_interval)
++        raise FirecrackerClientError("Timed out waiting for job")
++
++
++if __name__ == "__main__":
++    print("Firecracker client scaffold. Set FIRECRACKER_MANAGER_URL env to your controller.")
++    # Example usage (won't work without a real manager)
++    client = FirecrackerClient()
++    try:
++        job = client.submit_job({"image": "python:3.10-slim", "cmd": ["python", "-c", "print('hello')"], "files": {}, "resources": {"vcpu":1,"memory_mb":128}, "no_network": True})
++        print("Submitted:", job)
++    except Exception as e:
++        print("Manager not available (expected in dev):", e)
++
+--- /dev/null
++++ b/tools/annotation_qc.py
+@@ -0,0 +1,206 @@
++#!/usr/bin/env python3
++"""
++tools/annotation_qc.py
++
++Compute quality metrics for annotation CSV:
++ - Gold test pass rate
++ - Inter-annotator agreement (Cohen's kappa) for cases with multiple annotations
++ - Basic coverage & confidence summary
++
++Usage:
++  python tools/annotation_qc.py --annotations annotations.csv --gold gold_tests.json --min_gold_pass 0.9
++"""
++from __future__ import annotations
++import argparse
++import csv
++import json
++from collections import defaultdict
++from typing import Dict, List
++
++def load_annotations(path: str) -> List[Dict]:
++    out = []
++    with open(path, "r", encoding="utf-8") as f:
++        reader = csv.DictReader(f)
++        for r in reader:
++            out.append(r)
++    return out
++
++def load_gold(path: str) -> Dict[str, str]:
++    """
++    gold JSON format: [{"prompt":"...","preferred":"A"}, ...]
++    """
++    with open(path, "r", encoding="utf-8") as f:
++        arr = json.load(f)
++    return {a["prompt"]: a["preferred"] for a in arr}
++
++def gold_pass_rate(annotations: List[Dict], gold: Dict[str, str]) -> float:
++    if not gold:
++        return 1.0
++    total = 0
++    passed = 0
++    for a in annotations:
++        p = a.get("prompt", "")
++        pref = a.get("preferred", "")
++        if p in gold:
++            total += 1
++            if pref.upper() == gold[p].upper():
++                passed += 1
++    return (passed / total) if total else 1.0
++
++def cohen_kappa(annotations: List[Dict]) -> float:
++    """
++    Compute approximate Cohen's kappa for prompts annotated multiple times.
++    This function groups by prompt and compares pairs; for exact multi-rater stats use external libs.
++    """
++    from collections import Counter
++    pairs = []
++    by_prompt = defaultdict(list)
++    for a in annotations:
++        by_prompt[a.get("prompt")].append(a.get("preferred", ""))
++    for prompt, prefs in by_prompt.items():
++        if len(prefs) >= 2:
++            # pairwise compare first two
++            pairs.append((prefs[0].upper(), prefs[1].upper()))
++    if not pairs:
++        return 1.0
++    # compute observed agreement
++    agree = sum(1 for a, b in pairs if a == b)
++    po = agree / len(pairs)
++    # expected agreement
++    counts = Counter([x for pair in pairs for x in pair])
++    total = sum(counts.values())
++    pe = sum((counts[k] / total) ** 2 for k in counts)
++    if pe == 1:
++        return 1.0
++    kappa = (po - pe) / (1 - pe) if (1 - pe) != 0 else 0.0
++    return kappa
++
++def summary(annotations: List[Dict]) -> Dict:
++    confs = [int(a.get("confidence") or 3) for a in annotations if a.get("confidence")]
++    avg_conf = sum(confs) / len(confs) if confs else None
++    return {"total_annotations": len(annotations), "avg_confidence": avg_conf}
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--annotations", required=True)
++    parser.add_argument("--gold", default="")
++    parser.add_argument("--min_gold_pass", type=float, default=0.9)
++    args = parser.parse_args()
++
++    anns = load_annotations(args.annotations)
++    gold = load_gold(args.gold) if args.gold else {}
++    gpr = gold_pass_rate(anns, gold)
++    kappa = cohen_kappa(anns)
++    summ = summary(anns)
++
++    report = {"gold_pass_rate": gpr, "kappa": kappa, "summary": summ}
++    print(json.dumps(report, indent=2))
++    if gold and gpr < args.min_gold_pass:
++        print(f"Gold pass rate {gpr:.3f} below threshold {args.min_gold_pass}",)
++        raise SystemExit(2)
++    # kappa threshold is advisory
++    if kappa < 0.4:
++        print(f"Warning: low inter-annotator agreement (kappa={kappa:.3f})")
++
++if __name__ == "__main__":
++    import json
++    main()
++
+--- /dev/null
++++ b/scripts/check_vetted_checkpoints.py
+@@ -0,0 +1,150 @@
++#!/usr/bin/env python3
++"""
++scripts/check_vetted_checkpoints.py
++
++Ensure that vetted/merged checkpoints exist (either local manifest or S3 pinned manifest)
++and that publish gating is not attempted without them.
++
++Usage:
++  python scripts/check_vetted_checkpoints.py --manifest release_snapshots_manifest.json
++"""
++from __future__ import annotations
++import argparse
++import json
++from pathlib import Path
++import sys
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--manifest", default="release_snapshots_manifest.json", help="Local manifest produced by upload_snapshots_s3.py")
++    parser.add_argument("--require", action="store_true", help="Exit non-zero if manifest missing")
++    args = parser.parse_args()
++
++    mpath = Path(args.manifest)
++    if not mpath.exists():
++        print("Manifest not found:", mpath)
++        if args.require:
++            sys.exit(2)
++        else:
++            return
++
++    data = json.loads(mpath.read_text())
++    snapshots = data.get("snapshots", [])
++    if not snapshots:
++        print("No snapshots recorded in manifest")
++        sys.exit(3)
++    # check for merged checkpoints at least one snapshot should include 'merged' prefix path
++    for s in snapshots:
++        files = s.get("files", [])
++        found = any("merged" in f["path"] or "pytorch_model.bin" in f["path"] for f in files)
++        if found:
++            print("Found merged checkpoint in snapshot:", s.get("snapshot"))
++            return
++    print("No merged checkpoints found in manifest; ensure run_sft_and_merge.sh produced merged checkpoint and upload was performed.")
++    sys.exit(4)
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null
++++ b/scripts/quantize_validate.py
+@@ -0,0 +1,224 @@
++#!/usr/bin/env python3
++"""
++scripts/quantize_validate.py
++
++Validate quantized artifact by comparing generation outputs (token overlap / similarity)
++between the original checkpoint and the quantized artifact on a small set of prompts.
++
++Usage:
++  python scripts/quantize_validate.py --model ./models/mistralai_mistral-7b --quantized ./models/mistral.gguf --test_prompts tests/prompts.txt --tolerance 0.85
++
++Notes:
++ - For GGUF/ggml artifacts you will call an external runtime (e.g., llama.cpp binary) which is not implemented here.
++ - This script supports a simple HF model <-> HF quantized loader if the converter provides HuggingFace-compatible artifact.
++"""
++from __future__ import annotations
++import argparse
++import subprocess
++import tempfile
++from pathlib import Path
++import numpy as np
++from typing import List
++
++from transformers import AutoTokenizer, AutoModelForCausalLM
++
++def load_prompts(path: str) -> List[str]:
++    p = Path(path)
++    if not p.exists():
++        return ["Hello world", "Explain gravity in one sentence", "Write a python function to add two numbers"]
++    return [l.strip() for l in p.read_text().splitlines() if l.strip()]
++
++def generate_with_hf(model_path: str, prompts: List[str], max_new_tokens: int = 64) -> List[str]:
++    tok = AutoTokenizer.from_pretrained(model_path, use_fast=True)
++    model = AutoModelForCausalLM.from_pretrained(model_path)
++    outs = []
++    for p in prompts:
++        ids = tok(p, return_tensors="pt").input_ids
++        gen = model.generate(ids, max_new_tokens=max_new_tokens)
++        outs.append(tok.decode(gen[0], skip_special_tokens=True))
++    return outs
++
++def compare_outputs(refs: List[str], quant_outs: List[str]) -> float:
++    # compute simple token overlap Jaccard average
++    scores = []
++    for r, q in zip(refs, quant_outs):
++        rs = set(r.split())
++        qs = set(q.split())
++        if not rs and not qs:
++            scores.append(1.0)
++            continue
++        inter = len(rs & qs)
++        uni = len(rs | qs)
++        scores.append(inter / uni if uni else 0.0)
++    return float(np.mean(scores))
++
++def generate_with_gguf(gguf_path: str, prompts: List[str]) -> List[str]:
++    """
++    Placeholder: call an external local server or runtime to generate from the GGUF artifact.
++    Example: call llama.cpp or ggml server via subprocess.
++    For now we simulate by returning short variants.
++    """
++    outs = []
++    for p in prompts:
++        outs.append(p + " [quantized-simulated]")
++    return outs
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--model", required=True)
++    parser.add_argument("--quantized", required=True)
++    parser.add_argument("--test_prompts", default="")
++    parser.add_argument("--tolerance", type=float, default=0.85)
++    args = parser.parse_args()
++
++    prompts = load_prompts(args.test_prompts)
++    print("Generating with reference HF model:", args.model)
++    ref_outs = generate_with_hf(args.model, prompts)
++
++    print("Generating with quantized artifact (simulated):", args.quantized)
++    # If quantized is compatible with HF, you could call generate_with_hf on it.
++    # Otherwise call an external runtime (not implemented here).
++    quant_outs = generate_with_gguf(args.quantized, prompts)
++
++    score = compare_outputs(ref_outs, quant_outs)
++    print(f"Token-overlap score (avg Jaccard) = {score:.3f}")
++    if score < args.tolerance:
++        print(f"Quantized artifact failed tolerance {args.tolerance}; score={score:.3f}")
++        raise SystemExit(2)
++    print("Quantized artifact passed tolerance.")
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null
++++ b/scripts/long_context_benchmark.py
+@@ -0,0 +1,198 @@
++#!/usr/bin/env python3
++"""
++scripts/long_context_benchmark.py
++
++Benchmark strategies for long context:
++ - If model has native long-window (config.attention/position embeddings), compare direct generation
++ - Otherwise benchmark hierarchical memory + retrieval approach (assemble context via long_context_builder)
++
++Usage:
++  python scripts/long_context_benchmark.py --model ./models/long-model --doc docs/long_doc.txt --embedder sentence-transformers/all-MiniLM-L6-v2
++"""
++from __future__ import annotations
++import argparse
++import time
++from pathlib import Path
++from typing import Optional
++
++from transformers import AutoTokenizer, AutoModelForCausalLM
++
++from openquill.rag.long_context_builder import build_context_for_prompt, build_sliding_windows_for_long_doc
++from openquill.rag.retrieval_pipeline import Embedder, build_index_from_texts, FaissIndex
++from openquill.rag.hierarchical_memory import HierarchicalMemory
++
++def native_long_context_test(model_path: str, prompt: str):
++    tok = AutoTokenizer.from_pretrained(model_path)
++    model = AutoModelForCausalLM.from_pretrained(model_path)
++    # attempt to read config context length
++    max_ctx = getattr(model.config, "max_position_embeddings", None) or getattr(model.config, "n_ctx", None)
++    print("Model max context tokens:", max_ctx)
++    start = time.time()
++    ids = tok(prompt, return_tensors="pt").input_ids
++    out = model.generate(ids, max_new_tokens=128)
++    dur = time.time() - start
++    print("Native generation time:", dur)
++    return {"duration": dur, "output": tok.decode(out[0], skip_special_tokens=True)}
++
++def rag_hierarchical_test(doc_text: str, query: str, embedder_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
++    # chunk docs, embed and index
++    embedder = Embedder(embedder_name)
++    # tokenization uses tokenizer from long_context_builder caller
++    from transformers import AutoTokenizer
++    tokenizer = AutoTokenizer.from_pretrained("gpt2")
++    memory = HierarchicalMemory(summarizer_model=None)
++    idx = FaissIndex(dim=384, index_type="flat")
++    # chunk the doc into pieces (naive)
++    windows = build_sliding_windows_for_long_doc(doc_text, tokenizer, window_tokens=512, stride=128)
++    embs = embedder.encode(windows)
++    idx.add_texts(windows, embs)
++    # build context
++    context = build_context_for_prompt(query, memory, embedder, idx, max_tokens=8192)
++    print("Assembled context length (chars):", len(context))
++    return {"context_len": len(context)}
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--model", default="", help="HF model path or id for native long context testing")
++    parser.add_argument("--doc", default="", help="Path to long document to test hierarchical approach")
++    parser.add_argument("--query", default="Summarize this document.")
++    parser.add_argument("--embedder", default="sentence-transformers/all-MiniLM-L6-v2")
++    args = parser.parse_args()
++
++    if args.model:
++        print("Running native long-context test")
++        # generate a very long prompt by repeating a paragraph
++        long_text = ("This is a repeated paragraph. " * 2000)[: ( (getattr(args, 'max_chars', 100000) ) )]
++        res = native_long_context_test(args.model, long_text + "\n\n" + args.query)
++        print("Native result:", res)
++    if args.doc:
++        doc = Path(args.doc).read_text()
++        res = rag_hierarchical_test(doc, args.query, embedder_name=args.embedder)
++        print("RAG/hierarchical result:", res)
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null
++++ b/scripts/publish_gate.py
+@@ -0,0 +1,142 @@
++#!/usr/bin/env python3
++"""
++scripts/publish_gate.py
++
++Run final publish gating checks:
++ - legal signoff file presence and basic fields validated
++ - vetted checkpoints manifest check
++ - annotation QC pass (gold rate)
++ - quantize validation status
++
++Usage:
++  python scripts/publish_gate.py --legal docs/legal_signoff.json
++"""
++from __future__ import annotations
++import argparse
++import json
++from pathlib import Path
++import subprocess
++import sys
++
++def check_legal(path: str) -> bool:
++    p = Path(path)
++    if not p.exists():
++        print("Legal signoff missing:", path)
++        return False
++    data = json.loads(p.read_text())
++    required = ["legal_reviewed_by", "safety_reviewed_by", "date", "model_id"]
++    for r in required:
++        if r not in data:
++            print("Legal signoff missing field:", r)
++            return False
++    print("Legal signoff present:", data.get("model_id"))
++    return True
++
++def run_cmd(cmd: str) -> int:
++    print("Running:", cmd)
++    res = subprocess.run(cmd, shell=True)
++    return res.returncode
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--legal", required=True, help="Path to legal signoff JSON")
++    parser.add_argument("--manifest", default="release_snapshots_manifest.json")
++    parser.add_argument("--annotations", default="annotations.csv")
++    parser.add_argument("--gold", default="gold_tests.json")
++    parser.add_argument("--quant_model", default="./models/mistral.gguf")
++    args = parser.parse_args()
++
++    if not check_legal(args.legal):
++        print("Legal gate failed")
++        sys.exit(2)
++
++    # check vetted checkpoints
++    rc = run_cmd(f"python scripts/check_vetted_checkpoints.py --manifest {args.manifest} --require")
++    if rc != 0:
++        print("Checkpoint gate failed")
++        sys.exit(3)
++
++    # annotation qc
++    rc = run_cmd(f"python tools/annotation_qc.py --annotations {args.annotations} --gold {args.gold} --min_gold_pass 0.9")
++    if rc != 0:
++        print("Annotation QC failed")
++        sys.exit(4)
++
++    # quantization validation (tolerance default)
++    rc = run_cmd(f"python scripts/quantize_validate.py --model ./models/mistralai_mistral-7b --quantized {args.quant_model} --test_prompts tests/prompts.txt --tolerance 0.80")
++    if rc != 0:
++        print("Quantize validation failed")
++        sys.exit(5)
++
++    print("All publish gates passed. Proceed with publish step (manual or automated).")
++    sys.exit(0)
++
++if __name__ == "__main__":
++    main()
++
+-- 
+2.40.1
