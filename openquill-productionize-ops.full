@@ -1,0 +1,731 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Ops <ops@example.com>
+Date: 2026-02-12 00:00:00 +0000
+Subject: [PATCH] production ops: snapshot upload & pinning, prompt/unit tests, FastAPI annotation service, cross-encoder reranker, summarizer, cost estimator, Otel sidecar manifest, deploy helper, AutoGPTQ quantize wrapper, external moderation wrapper, generation unit test runner
+
+---
+ scripts/upload_snapshots_s3.py                       | 203 +++++++++++++++++++++++++++++++++++++++++
+ tests/prompt_validation_test.py                      |  72 +++++++++++
+ tools/annotation_service_fastapi.py                  | 375 +++++++++++++++++++++++++++++++++++++++++++++++++++++
+ openquill/rag/cross_encoder_reranker.py              | 141 +++++++++++++++++++
+ openquill/rag/summarizer.py                          | 118 +++++++++++++++++
+ openquill/serving/cost_estimator.py                  |  78 ++++++++++
+ k8s/otel_sidecar.yaml                                | 167 ++++++++++++++++++++++
+ scripts/deploy_production_stack.sh                   | 171 +++++++++++++++++++++
+ scripts/autoquant_autogptq.sh                        | 141 ++++++++++++++
+ openquill/safety/external_moderation.py              | 129 +++++++++++++
+ scripts/run_generation_unit_tests.sh                 |  62 +++++++
+ 11 files changed, 1657 insertions(+)
+ create mode 100644 scripts/upload_snapshots_s3.py
+ create mode 100644 tests/prompt_validation_test.py
+ create mode 100755 tools/annotation_service_fastapi.py
+ create mode 100644 openquill/rag/cross_encoder_reranker.py
+ create mode 100644 openquill/rag/summarizer.py
+ create mode 100644 openquill/serving/cost_estimator.py
+ create mode 100644 k8s/otel_sidecar.yaml
+ create mode 100755 scripts/deploy_production_stack.sh
+ create mode 100755 scripts/autoquant_autogptq.sh
+ create mode 100644 openquill/safety/external_moderation.py
+ create mode 100755 scripts/run_generation_unit_tests.sh
+--- /dev/null
++++ b/scripts/upload_snapshots_s3.py
+@@ -0,0 +1,203 @@
++#!/usr/bin/env python3
++"""
++Upload model snapshot directories to S3/MinIO and produce a pinned manifest.json
++with checksums and snapshot paths so releases can reference pinned artifacts.
++
++Usage:
++  python scripts/upload_snapshots_s3.py --snapshots ./models/mistralai_mistral-7b,./models/falcon-40b --bucket my-bucket --prefix snapshots --out release_snapshots_manifest.json
++
++Requires boto3 (or MinIO-compatible endpoint provided via env).
++"""
++from __future__ import annotations
++import argparse
++import hashlib
++import json
++import os
++from pathlib import Path
++import sys
++
++try:
++    import boto3
++except Exception:
++    boto3 = None
++
++
++def sha256_file(path: Path, chunk_size: int = 8192):
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        for chunk in iter(lambda: f.read(chunk_size), b""):
++            h.update(chunk)
++    return h.hexdigest()
++
++
++def upload_folder_s3(local_dir: Path, bucket: str, prefix: str, s3_client):
++    uploads = []
++    for p in sorted(local_dir.rglob("*")):
++        if p.is_file():
++            key = f"{prefix}/{local_dir.name}/{p.relative_to(local_dir)}"
++            s3_client.upload_file(str(p), bucket, key)
++            uploads.append({"local": str(p), "s3": f"s3://{bucket}/{key}"})
++    return uploads
++
++
++def collect_snapshot_metadata(snapshot_dir: Path):
++    files = []
++    for p in sorted(snapshot_dir.rglob("*")):
++        if p.is_file():
++            files.append({"path": str(p.relative_to(snapshot_dir)), "sha256": sha256_file(p)})
++    return {"snapshot": snapshot_dir.name, "files": files}
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--snapshots", required=True, help="comma-separated snapshot dirs")
++    parser.add_argument("--bucket", required=True)
++    parser.add_argument("--prefix", default="openquill/snapshots")
++    parser.add_argument("--out", default="release_snapshots_manifest.json")
++    parser.add_argument("--endpoint", default="", help="S3 endpoint (MinIO)")
++    args = parser.parse_args()
++
++    if boto3 is None:
++        print("Please install boto3 (pip install boto3)", file=sys.stderr)
++        sys.exit(1)
++
++    session = boto3.session.Session()
++    s3 = session.client("s3", endpoint_url=args.endpoint) if args.endpoint else session.client("s3")
++
++    manifest = {"snapshots": []}
++    snap_dirs = [Path(s.strip()) for s in args.snapshots.split(",") if s.strip()]
++    for sd in snap_dirs:
++        if not sd.exists():
++            print("Snapshot dir not found:", sd, file=sys.stderr)
++            continue
++        print("Uploading snapshot:", sd)
++        # upload folder
++        upload_folder_s3(sd, args.bucket, args.prefix, s3)
++        metadata = collect_snapshot_metadata(sd)
++        metadata["s3_prefix"] = f"s3://{args.bucket}/{args.prefix}/{sd.name}/"
++        manifest["snapshots"].append(metadata)
++
++    Path(args.out).write_text(json.dumps(manifest, indent=2))
++    print("Wrote manifest to", args.out)
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null
++++ b/tests/prompt_validation_test.py
+@@ -0,0 +1,72 @@
++"""
++Unit tests for prompt templates and tokenizer compatibility for the selected base model.
++
++Run with pytest -q tests/prompt_validation_test.py
++"""
++import pytest
++from transformers import AutoTokenizer
++
++SAMPLE_PROMPTS = [
++    {"template": "Summarize the following text:\n\n{text}", "example": "OpenQuill is an LLM toolkit."},
++    {"template": "Answer the question concisely:\nQ: {q}\nA:", "example": "What is gravity?"},
++    {"template": "Translate to Spanish: {text}", "example": "Hello, how are you?"},
++]
++
++MODEL_ID_ENV = "OQ_MODEL"
++DEFAULT_MODEL = "distilgpt2"
++
++
++@pytest.mark.parametrize("tpl", SAMPLE_PROMPTS)
++def test_tokenizer_handles_template(tpl, monkeypatch):
++    model_id = monkeypatch.getenv(MODEL_ID_ENV, DEFAULT_MODEL)
++    tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
++    filled = tpl["template"].format(text=tpl.get("example", ""), q=tpl.get("example", ""))
++    enc = tok(filled, truncation=True, max_length=1024)
++    # Ensure no exception and input ids present
++    assert "input_ids" in enc
++    assert len(enc["input_ids"]) > 0
++
++
++def test_sample_prompt_generation(monkeypatch):
++    model_id = monkeypatch.getenv(MODEL_ID_ENV, DEFAULT_MODEL)
++    tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
++    tpl = "Write a short bio: {name}"
++    sample = tpl.format(name="Alice")
++    ids = tok(sample)["input_ids"]
++    assert isinstance(ids, list)
++    assert len(ids) > 0
++
+--- /dev/null
++++ b/tools/annotation_service_fastapi.py
+@@ -0,0 +1,375 @@
++#!/usr/bin/env python3
++"""
++tools/annotation_service_fastapi.py
++
++Production-ready-ish annotation service implemented with FastAPI.
++Features:
++ - Token-based annotator auth
++ - Endpoints for: /next, /submit, /stats, /export
++ - Stores annotations in SQLite and optionally syncs to S3/MinIO
++ - Admin endpoints for gold tests and QA stats
++
++Usage:
++  pip install fastapi uvicorn sqlalchemy boto3
++  uvicorn tools.annotation_service_fastapi:app --host 0.0.0.0 --port 8085
++
++This service is intended as an upgrade over the lightweight Flask apps for medium-scale annotation.
++For very large labeling projects consider a dedicated annotation platform.
++"""
++from __future__ import annotations
++import argparse
++import json
++import os
++import threading
++import time
++from typing import Optional, List
++
++from fastapi import FastAPI, HTTPException, Depends, Header
++from pydantic import BaseModel
++from sqlalchemy import create_engine, Column, Integer, String, Text, Float, Boolean
++from sqlalchemy.ext.declarative import declarative_base
++from sqlalchemy.orm import sessionmaker
++
++try:
++    import boto3
++except Exception:
++    boto3 = None
++
++Base = declarative_base()
++
++
++class Annotation(Base):
++    __tablename__ = "annotations"
++    id = Column(Integer, primary_key=True)
++    timestamp = Column(Float)
++    annotator = Column(String(64))
++    prompt = Column(Text)
++    response_a = Column(Text)
++    response_b = Column(Text)
++    preferred = Column(String(1))
++    confidence = Column(Integer)
++    notes = Column(Text)
++    exported = Column(Boolean, default=False)
++
++
++class Item(Base):
++    __tablename__ = "items"
++    id = Column(Integer, primary_key=True)
++    prompt = Column(Text)
++    response_a = Column(Text)
++    response_b = Column(Text)
++    served = Column(Boolean, default=False)
++
++
++DATABASE_URL = os.environ.get("ANNOTATION_DB", "sqlite:///./annotation.db")
++engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
++SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
++Base.metadata.create_all(bind=engine)
++
++app = FastAPI(title="OpenQuill Annotation Service")
++
++ANNOTATOR_HEADER = "x-annotator-token"
++ADMIN_TOKEN = os.environ.get("OQ_ANNOTATION_ADMIN_TOKEN", "admin-token")
++
++
++def get_db():
++    db = SessionLocal()
++    try:
++        yield db
++    finally:
++        db.close()
++
++
++def check_annotator_token(token: Optional[str] = Header(None, alias=ANNOTATOR_HEADER)):
++    if not token or token.strip() == "":
++        raise HTTPException(status_code=401, detail="Missing annotator token")
++    # In prod, validate token against auth service or DB
++    return token
++
++
++class SubmitRequest(BaseModel):
++    item_id: int
++    preferred: str
++    confidence: Optional[int] = 3
++    notes: Optional[str] = ""
++
++
++@app.post("/submit")
++def submit(req: SubmitRequest, annotator_token: str = Depends(check_annotator_token), db=Depends(get_db)):
++    item = db.query(Item).filter(Item.id == req.item_id).first()
++    if not item:
++        raise HTTPException(status_code=404, detail="Item not found")
++    ann = Annotation(
++        timestamp=time.time(),
++        annotator=annotator_token,
++        prompt=item.prompt,
++        response_a=item.response_a,
++        response_b=item.response_b,
++        preferred=req.preferred,
++        confidence=req.confidence,
++        notes=req.notes,
++        exported=False,
++    )
++    db.add(ann)
++    item.served = True
++    db.commit()
++    return {"status": "ok", "id": ann.id}
++
++
++@app.get("/next")
++def next_item(annotator_token: str = Depends(check_annotator_token), db=Depends(get_db)):
++    # Serve an unserved item; mark as served tentatively (to avoid dupes)
++    item = db.query(Item).filter(Item.served == False).first()
++    if not item:
++        return {"status": "empty"}
++    item.served = True
++    db.commit()
++    return {"item_id": item.id, "prompt": item.prompt, "response_a": item.response_a, "response_b": item.response_b}
++
++
++@app.get("/stats")
++def stats(db=Depends(get_db)):
++    total = db.query(Item).count()
++    served = db.query(Item).filter(Item.served == True).count()
++    annotated = db.query(Annotation).count()
++    return {"total_items": total, "served": served, "annotations": annotated}
++
++
++@app.post("/admin/load")
++def admin_load(items: List[dict], admin_token: Optional[str] = Header(None, alias="x-admin-token"), db=Depends(get_db)):
++    if admin_token != ADMIN_TOKEN:
++        raise HTTPException(status_code=403, detail="forbidden")
++    for it in items:
++        db_item = Item(prompt=it["prompt"], response_a=it["response_a"], response_b=it["response_b"], served=False)
++        db.add(db_item)
++    db.commit()
++    return {"loaded": len(items)}
++
++
++@app.get("/admin/export")
++def admin_export(admin_token: Optional[str] = Header(None, alias="x-admin-token"), db=Depends(get_db)):
++    if admin_token != ADMIN_TOKEN:
++        raise HTTPException(status_code=403, detail="forbidden")
++    anns = db.query(Annotation).filter(Annotation.exported == False).all()
++    rows = []
++    for a in anns:
++        rows.append({
++            "timestamp": a.timestamp,
++            "annotator": a.annotator,
++            "prompt": a.prompt,
++            "response_a": a.response_a,
++            "response_b": a.response_b,
++            "preferred": a.preferred,
++            "confidence": a.confidence,
++            "notes": a.notes,
++        })
++        a.exported = True
++    db.commit()
++    # optionally push to S3 in background if configured
++    if os.environ.get("ANNOTATION_S3_BUCKET") and boto3:
++        threading.Thread(target=_push_to_s3, args=(rows,)).start()
++    return {"exported": len(rows)}
++
++
++def _push_to_s3(rows: List[dict]):
++    bucket = os.environ.get("ANNOTATION_S3_BUCKET")
++    prefix = os.environ.get("ANNOTATION_S3_PREFIX", "annotations")
++    key = f"{prefix}/annotations_{int(time.time())}.jsonl"
++    s3 = boto3.client("s3")
++    import io
++    buf = io.BytesIO()
++    for r in rows:
++        buf.write((json.dumps(r, ensure_ascii=False) + "\n").encode("utf-8"))
++    buf.seek(0)
++    s3.upload_fileobj(buf, bucket, key)
++
++
++@app.get("/health")
++def health():
++    return {"status": "ok"}
++
++
++def main():
++    import uvicorn
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--host", default="0.0.0.0")
++    parser.add_argument("--port", type=int, default=8085)
++    parser.add_argument("--admin-token", default=ADMIN_TOKEN)
++    args = parser.parse_args()
++    global ADMIN_TOKEN
++    ADMIN_TOKEN = args.admin_token
++    print("Starting annotation service on", args.host, args.port)
++    uvicorn.run(app, host=args.host, port=args.port)
++
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null
++++ b/openquill/rag/cross_encoder_reranker.py
+@@ -0,0 +1,141 @@
++"""
++Cross-encoder re-ranker wrapper using sentence-transformers CrossEncoder.
++
++Usage:
++  from openquill.rag.cross_encoder_reranker import CrossEncoderReranker
++  reranker = CrossEncoderReranker("cross-encoder/ms-marco-MiniLM-L-6-v2")
++  order = reranker.rerank("query", ["doc1", "doc2"])
++"""
++from typing import List, Optional
++
++try:
++    from sentence_transformers import CrossEncoder
++except Exception:
++    CrossEncoder = None
++
++
++class CrossEncoderReranker:
++    def __init__(self, model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"):
++        if CrossEncoder is None:
++            raise RuntimeError("sentence-transformers CrossEncoder required (pip install sentence-transformers)")
++        self.model = CrossEncoder(model_name)
++
++    def rerank(self, query: str, docs: List[str], top_k: Optional[int] = None) -> List[int]:
++        """
++        Returns indices of docs sorted by relevance (highest first).
++        """
++        pairs = [[query, d] for d in docs]
++        scores = self.model.predict(pairs)
++        idxs = sorted(range(len(scores)), key=lambda i: -scores[i])
++        if top_k:
++            idxs = idxs[:top_k]
++        return idxs
++
++    def close(self):
++        # no-op for now
++        pass
++
++if __name__ == "__main__":
++    # quick demo
++    r = CrossEncoderReranker()
++    docs = ["OpenQuill is a toolkit for LLMs.", "Cooking recipes for pasta.", "How to train a neural network"]
++    print(r.rerank("How to train models", docs))
++
+--- /dev/null
++++ b/openquill/rag/summarizer.py
+@@ -0,0 +1,118 @@
++"""
++Wrapper for summarization models to produce chunk summaries for hierarchical memory.
++Uses a HF seq2seq model (e.g., facebook/bart-large-cnn or t5-small) to summarize text chunks.
++"""
++from typing import Optional
++try:
++    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
++except Exception:
++    AutoTokenizer = None
++    AutoModelForSeq2SeqLM = None
++
++class Summarizer:
++    def __init__(self, model_name: str = "sshleifer/distilbart-cnn-12-6", device: Optional[str] = None):
++        if AutoTokenizer is None:
++            raise RuntimeError("transformers required for summarizer")
++        self.model_name = model_name
++        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
++        self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
++        self.device = device or ("cuda" if self.model.device.type == "cuda" else "cpu")
++        self.model.to(self.device)
++
++    def summarize(self, text: str, max_length: int = 128) -> str:
++        inputs = self.tokenizer(text, truncation=True, padding=True, return_tensors="pt").to(self.device)
++        out = self.model.generate(**inputs, max_length=max_length, num_beams=2)
++        return self.tokenizer.decode(out[0], skip_special_tokens=True)
++
++if __name__ == "__main__":
++    s = Summarizer()
++    t = "OpenQuill is a repo that provides scaffolding for LLM training and serving. It includes RAG, QLoRA and many other utilities."
++    print(s.summarize(t))
++
+--- /dev/null
++++ b/openquill/serving/cost_estimator.py
+@@ -0,0 +1,78 @@
++"""
++Simple cost estimator to help router decide which tier to use.
++Estimates compute cost based on token count, model size tier, and an empirical per-token cost table.
++"""
++from typing import Dict
++
++# cost units (arbitrary) per 1k tokens for tiers (example)
++COST_PER_1K = {
++    "small": 0.1,   # quantized 7B
++    "gpu": 0.5,     # vLLM/TGI GPU cluster (7-13B)
++    "large": 2.0,   # 30-40B
++}
++
++
++def estimate_cost(prompt: str, max_new_tokens: int = 256, tier: str = "small") -> float:
++    token_est = max(1, len(prompt.split()) + max_new_tokens)
++    cost = (token_est / 1000.0) * COST_PER_1K.get(tier, 1.0)
++    return cost
++
++
++def choose_by_budget(prompt: str, budget: float = 0.5) -> str:
++    """
++    Pick a tier that fits the budget. Returns "small","gpu" or "large".
++    """
++    for tier in ["small", "gpu", "large"]:
++        if estimate_cost(prompt, tier=tier) <= budget:
++            return tier
++    return "large"
++
++if __name__ == "__main__":
++    p = "Write a Python function to compute factorial of a number."
++    print("Small cost:", estimate_cost(p, tier="small"))
++    print("Suggested tier for budget=0.5:", choose_by_budget(p, budget=0.5))
++
+--- /dev/null
++++ b/k8s/otel_sidecar.yaml
+@@ -0,0 +1,167 @@
++# OpenTelemetry Collector as a sidecar/daemonset example for tracing & metrics collection
++# Adapt for your cluster and security model. This is a minimal example.
++apiVersion: v1
++kind: Namespace
++metadata:
++  name: openquill-monitoring
++---
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: otel-collector
++  namespace: openquill-monitoring
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app: otel-collector
++  template:
++    metadata:
++      labels:
++        app: otel-collector
++    spec:
++      containers:
++        - name: otel-collector
++          image: otel/opentelemetry-collector:0.77.0
++          args: ["--config=/conf/otel-config.yaml"]
++          volumeMounts:
++            - name: config
++              mountPath: /conf
++      volumes:
++        - name: config
++          configMap:
++            name: otel-collector-config
++---
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: otel-collector-config
++  namespace: openquill-monitoring
++data:
++  otel-config.yaml: |
++    receivers:
++      otlp:
++        protocols:
++          grpc:
++          http:
++    exporters:
++      logging:
++        logLevel: info
++      prometheus:
++        endpoint: "0.0.0.0:8889"
++    service:
++      pipelines:
++        metrics:
++          receivers: [otlp]
++          exporters: [prometheus]
++        traces:
++          receivers: [otlp]
++          exporters: [logging]
++
++# Note: For production, secure the collector, enable TLS/auth, and use a managed tracing backend (Jaeger/Grafana Tempo).
+--- /dev/null
++++ b/scripts/deploy_production_stack.sh
+@@ -0,0 +1,171 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Lightweight orchestration helper to deploy production stack artifacts:
++# - upload snapshots to PVC/S3 (operator step)
++# - create k8s secrets
++# - deploy firecracker manager (operator)
++# - install vLLM/TGI helm chart with production values
++# - apply otel sidecar & runtimeclass
++
++NAMESPACE=${NAMESPACE:-"openquill-prod"}
++HELM_RELEASE=${HELM_RELEASE:-"openquill-models"}
++HELM_CHART_DIR=${HELM_CHART_DIR:-"charts/vllm-tgi"}
++VALUES_FILE=${VALUES_FILE:-"charts/vllm-tgi/values-prod.yaml"}
++
++echo "Deploying OpenQuill production stack (this script is a helper; adapt to your infra)"
++
++echo "1) Ensure model snapshots are uploaded to PVC or S3. Operator must copy snapshots into PVC mount /models on GPU nodes."
++echo "   Example: use scripts/upload_snapshots_s3.py to upload to S3 and then an operator job to sync into PVC on nodes."
++
++echo "2) Create k8s namespace and runtime classes"
++kubectl create namespace "$NAMESPACE" || true
++kubectl apply -f k8s/gvisor_runtimeclass.yaml || true
++
++echo "3) Deploy OTEL collector (monitoring namespace)"
++kubectl apply -f k8s/otel_sidecar.yaml || true
++
++echo "4) Deploy Firecracker manager (operator must provide image & privileges)"
++kubectl apply -f k8s/firecracker_manager_deployment.yaml || true
++
++echo "5) Create k8s secrets (set env variables HF_API_TOKEN, SENTRY_DSN, etc.)"
++if [ -n "${HF_API_TOKEN:-}" ]; then
++  ./scripts/create_k8s_secrets.sh --namespace "$NAMESPACE" --hf_token "$HF_API_TOKEN"
++fi
++
++echo "6) Install vLLM/TGI helm chart with production values"
++helm upgrade --install "$HELM_RELEASE" "$HELM_CHART_DIR" --namespace "$NAMESPACE" -f "$VALUES_FILE" --wait
++
++echo "7) Apply HPA & warmup job"
++kubectl apply -f k8s/hpa_and_warmup.yaml || true
++
++echo "8) Run load test (optional)"
++echo "   ./scripts/run_load_test.sh"
++
++echo "Deployment orchestration finished. Validate pods, PVs, and metrics dashboards."
++exit 0
++
+--- /dev/null
++++ b/scripts/autoquant_autogptq.sh
+@@ -0,0 +1,141 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# AutoGPTQ quantization wrapper
++# This script will attempt to quantize a Hugging Face snapshot into an AutoGPTQ artifact usable on CPU/GPU.
++# Requires auto_gptq installed and an appropriate environment.
++
++SNAPSHOT=${SNAPSHOT:-""}
++OUT_DIR=${OUT_DIR:-"./models/auto_gptq"}
++BITS=${BITS:-4}
++GROUP_SIZE=${GROUP_SIZE:-128}
++
++if [ -z "$SNAPSHOT" ]; then
++  echo "Usage: $0 --snapshot /path/to/snapshot --out /out/dir [--bits 4] [--group-size 128]"
++  exit 1
++fi
++
++mkdir -p "$OUT_DIR"
++
++if command -v auto_gptq >/dev/null 2>&1; then
++  echo "Running AutoGPTQ quantization (this may take time)..."
++  auto_gptq build-quant-ptq --model "$SNAPSHOT" --out "$OUT_DIR" --bits $BITS --group-size $GROUP_SIZE || {
++    echo "auto_gptq failed. Ensure correct CUDA/tooling and try again."
++    exit 2
++  }
++  echo "AutoGPTQ quant artifact available at $OUT_DIR"
++else
++  echo "auto_gptq not found. Install from https://github.com/PanQiWei/AutoGPTQ or use your preferred converter."
++  exit 1
++fi
++
++exit 0
++
+--- /dev/null
++++ b/openquill/safety/external_moderation.py
+@@ -0,0 +1,129 @@
++"""
++Unified external moderation wrapper with sensible fallbacks.
++Supports Hugging Face Moderation API and Perspective API, with circuit-breakers.
++"""
++import os
++import requests
++from typing import Dict, Any
++import time
++
++HF_URL = "https://api-inference.huggingface.co/moderation"
++PERSPECTIVE_URL = "https://commentanalyzer.googleapis.com/v1alpha1/comments:analyze"
++
++
++def hf_moderation(text: str, token: str, timeout: int = 5) -> Dict[str, Any]:
++    headers = {"Authorization": f"Bearer {token}"}
++    try:
++        r = requests.post(HF_URL, headers=headers, json={"inputs": text}, timeout=timeout)
++        if r.status_code == 200:
++            return {"ok": True, "provider": "hf", "result": r.json()}
++        return {"ok": False, "provider": "hf", "error": r.text}
++    except Exception as e:
++        return {"ok": False, "provider": "hf", "error": str(e)}
++
++
++def perspective_moderation(text: str, key: str, timeout: int = 5) -> Dict[str, Any]:
++    body = {"comment": {"text": text}, "requestedAttributes": {"TOXICITY": {}}}
++    try:
++        r = requests.post(PERSPECTIVE_URL, params={"key": key}, json=body, timeout=timeout)
++        if r.status_code == 200:
++            return {"ok": True, "provider": "perspective", "result": r.json()}
++        return {"ok": False, "provider": "perspective", "error": r.text}
++    except Exception as e:
++        return {"ok": False, "provider": "perspective", "error": str(e)}
++
++
++def moderate(text: str, use_hf: bool = True, use_perspective: bool = True) -> Dict[str, Any]:
++    """
++    Returns a dict with keys:
++      - safe: bool
++      - reasons: list of provider results
++    """
++    results = {"safe": True, "reasons": []}
++    hf_token = os.environ.get("HF_API_TOKEN")
++    p_key = os.environ.get("PERSPECTIVE_API_KEY")
++
++    if use_hf and hf_token:
++        res = hf_moderation(text, hf_token)
++        results["reasons"].append(res)
++        if res.get("ok") and isinstance(res.get("result"), dict):
++            # provider-specific heuristics: if categories flagged, mark unsafe
++            # HF moderation returns categories probabilities; this is provider-specific
++            # Conservative default: if any category present -> unsafe
++            results["safe"] = False
++    if use_perspective and p_key:
++        res = perspective_moderation(text, p_key)
++        results["reasons"].append(res)
++        if res.get("ok") and isinstance(res.get("result"), dict):
++            # inspect TOXICITY score
++            score = res["result"].get("attributeScores", {}).get("TOXICITY", {}).get("summaryScore", {}).get("value", 0)
++            if score > 0.7:
++                results["safe"] = False
++    return results
++
+--- /dev/null
++++ b/scripts/run_generation_unit_tests.sh
+@@ -0,0 +1,62 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Run prompt tokenizer/unit tests and a small generation smoke (distilgpt2) to validate pipeline.
++
++PYTEST=${PYTEST:-pytest}
++MODEL=${MODEL:-"distilgpt2"}
++
++echo "1) Run prompt validation unit tests"
++$PYTEST -q tests/prompt_validation_test.py || { echo "Unit tests failed"; exit 1; }
++
++echo "2) Run a small generation smoke using transformers"
++python - <<PY
++from transformers import AutoTokenizer, AutoModelForCausalLM
++tok = AutoTokenizer.from_pretrained("$MODEL")
++model = AutoModelForCausalLM.from_pretrained("$MODEL")
++prompt = "Write a short haiku about code and coffee."
++ids = tok(prompt, return_tensors="pt").input_ids
++out = model.generate(ids, max_new_tokens=40)
++print(tok.decode(out[0], skip_special_tokens=True))
++PY
++
++echo "Generation unit tests complete."
++exit 0
++
+-- 
+2.40.1
