@@ -1,0 +1,10 @@
+__pycache__/
+.venv/
+runs/
+models/
+indexes/
+.vscode/
+*.pyc
+*.pth
+*.ckpt
+.env
