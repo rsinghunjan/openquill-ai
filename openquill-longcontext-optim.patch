@@ -1,0 +1,619 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Ops <openquill-ops@example.com>
+Date: 2026-02-19 00:00:00 +0000
+Subject: [PATCH] long-context: native context checker, attention-kernel benchmark, RAG throughput benchmark, model candidate list, runbook & wrapper
+---
+ configs/long_context_models.json                       |  38 +++
+ docs/long_context_runbook.md                           | 294 ++++++++++++++++
+ openquill/rag/throughput_benchmark.py                  | 483 +++++++++++++++++++++++++++++++++++++++++++++
+ scripts/longcontext/attention_kernel_benchmark.py      | 320 ++++++++++++++++++++++++++
+ scripts/longcontext/native_context_checker.py          | 177 +++++++++++
+ scripts/run_longcontext_validation.sh                  |  85 ++++++
+ 6 files changed, 1399 insertions(+)
+ create mode 100644 configs/long_context_models.json
+ create mode 100644 docs/long_context_runbook.md
+ create mode 100644 openquill/rag/throughput_benchmark.py
+ create mode 100755 scripts/longcontext/attention_kernel_benchmark.py
+ create mode 100755 scripts/longcontext/native_context_checker.py
+ create mode 100755 scripts/run_longcontext_validation.sh
+--- /dev/null
++++ b/configs/long_context_models.json
+@@ -0,0 +1,38 @@
++{
++  "candidates": [
++    {
++      "model_id": "placeholder/long-context-32k-model",
++      "max_context": 32768,
++      "notes": "Replace with an actual open-weight model id that supports 32k context. Verify license before use."
++    },
++    {
++      "model_id": "mistralai/mistral-7b",
++      "max_context": 8192,
++      "notes": "Good baseline; not 32k-native. Use hierarchical memory + RAG for long-context."
++    },
++    {
++      "model_id": "tiiuae/falcon-40b",
++      "max_context": 8192,
++      "notes": "Large fallback; consider quantization for serving."
++    }
++  ],
++  "notes": "Edit this list with real open-weight long-context models you evaluate (id, max_context, license)."
++}
+--- /dev/null
++++ b/docs/long_context_runbook.md
+@@ -0,0 +1,294 @@
++# Long‑context strategy runbook
++
++Purpose
++- Provide operator/engineer guidance and runnable tooling to:
++  - detect whether a candidate model supports native long context (32k+),
++  - benchmark attention kernels (FlashAttention / xFormers / Triton) on your hardware,
++  - evaluate hierarchical memory + RAG throughput (retrieval + rerank + generation),
++  - recommend whether to adopt a native long-context model or a hierarchical approach.
++
++Files added
++- configs/long_context_models.json — editable candidate model list (placeholders).
++- scripts/longcontext/native_context_checker.py — inspect HF model configs (max_position_embeddings) and report candidates >= 32k.
++- scripts/longcontext/attention_kernel_benchmark.py — micro-benchmarks for attention kernels (flash_attn / xformers) and native generate timing sample.
++- openquill/rag/throughput_benchmark.py — build FAISS index from a sample corpus, run retrieval + cross-encoder rerank + generation pipeline, measure latencies and throughput.
++- scripts/run_longcontext_validation.sh — wrapper to run benchmarks end-to-end and produce JSON reports.
++
++High-level decision flow
++1) Run native_context_checker.py against your candidate models:
++   - If you find an open-weight model with max_context >= 32k and a permissive license, evaluate native performance and memory consumption with attention_kernel_benchmark.py.
++2) If no native long-context model is acceptable (license/perf), use hierarchical memory + RAG:
++   - Run throughput_benchmark.py to measure retrieval + rerank + generation latencies for your corpus and target QPS.
++3) Use the results to choose:
++   - Native long-context model if latency/memory fit SLOs and license allowed.
++   - Otherwise adopt hierarchical memory + RAG and optimize attention kernels or use windowed/summarization pipelines.
++
++How to run (quick)
++1) Prepare environment
++   - python 3.10+, pip install -r requirements.txt (requirements needed: transformers, sentence-transformers, faiss-cpu or faiss-gpu, datasets, torch; optional: flash-attn, xformers)
++2) Check model contexts:
++   - python scripts/longcontext/native_context_checker.py --models configs/long_context_models.json --out results/context_report.json
++3) Run attention kernel micro-benchmarks:
++   - python scripts/longcontext/attention_kernel_benchmark.py --model <hf-id-or-path> --tokens 32768 --runs 2 --out results/attention_report.json
++4) Run RAG throughput benchmark:
++   - Prepare a sample corpus in data/long_corpus/*.txt (one file per doc) or provide --corpus-dir
++   - python openquill/rag/throughput_benchmark.py --corpus-dir data/long_corpus --embedder sentence-transformers/all-MiniLM-L6-v2 --topk 10 --queries tests/long_queries.txt --out results/rag_throughput.json
++5) Run wrapper:
++   - ./scripts/run_longcontext_validation.sh --models configs/long_context_models.json --corpus-dir data/long_corpus --queries tests/long_queries.txt --out-dir results
++
++Notes on attention kernels
++- FlashAttention and xFormers provide faster and more memory-efficient attention kernels for long windows.
++- Availability depends on your PyTorch build and CUDA driver. The benchmark attempts to detect them and exercise simple attention ops. For production, recompile/troubleshoot according to the respective upstream docs.
++
++Optimizing hierarchical memory & RAG
++- Token-aware chunking: chunk documents into token-sized pieces (not characters) and store token offsets.
++- Summarization: maintain condensed summaries for older chunks; surface summaries first.
++- Retriever latency: keep FAISS indices on GPU for highest QPS or shard indices across nodes.
++- Cross-encoder rerank: only run on top-N (e.g., N=20) to control CPU/GPU cost.
++- Generation: use multi-tier routing — attempt quantized 7B local first, then vLLM/TGI GPU cluster, then large fallback.
++
++Acceptance criteria (examples)
++- Native path: model with 32k context yields generation latency p95 <= target (e.g., 2s) on chosen infra and memory fits GPU availability.
++- Hierarchical path: retrieval + rerank + generation pipeline p95 <= target and recall+precision for retrieval meets information needs; hallucination reduced vs baseline.
++
++Troubleshooting
++- If FlashAttention missing or ImportError: recompile with proper CUDA/Triton versions as per flash-attn docs.
++- If FAISS indexing slow: precompute embeddings and use incremental add; use GPU Faiss for high QPS.
++- If cross-encoder too slow: reduce top-K pre-ranker or distill cross-encoder.
++
++Security & privacy
++- For long documents containing PII, redact or skip ingestion for memory indices. Run scripts/scan_pii.py before indexing.
++- Audit retrieval logs for sensitive retrievals and policy compliance.
++
++If you'd like, I can:
++- produce a Helm Job that runs throughput_benchmark.py in-cluster against a PV-hosted corpus and collects metrics in Prometheus,
++- or adapt throughput_benchmark.py to run against a deployed vLLM/TGI endpoint (for end-to-end production validation).
++
++End of runbook.
+--- /dev/null
++++ b/openquill/rag/throughput_benchmark.py
+@@ -0,0 +1,483 @@
++#!/usr/bin/env python3
++"""
++openquill/rag/throughput_benchmark.py
++
++Benchmark RAG/hierarchical memory pipeline throughput and latency.
++ - Builds (or loads) a FAISS index from a corpus of text documents
++ - Encodes queries with an embedder and retrieves top-K
++ - Optionally reranks with a cross-encoder
++ - Measures retrieval + rerank latency and end-to-end generation latency using a local LM or external endpoint
++
++Notes:
++ - This script is designed for experimentation and benchmarking. Do not use as a production service.
++ - Dependencies (install as needed):
++     pip install sentence-transformers transformers faiss-cpu torch requests
++   For GPU faiss: install faiss-gpu compatible with your CUDA.
++ - For cross-encoder rerank you can use sentence-transformers CrossEncoder.
++ - For generation, you may call a local HF model or an external vLLM/TGI endpoint.
++
++Usage:
++  python openquill/rag/throughput_benchmark.py --corpus-dir data/long_corpus --embedder sentence-transformers/all-MiniLM-L6-v2 --queries tests/long_queries.txt --topk 20 --out results/rag_throughput.json
++"""
++from __future__ import annotations
++import argparse
++import json
++import math
++import os
++import time
++from pathlib import Path
++from typing import List, Tuple, Optional, Dict, Any
++
++try:
++    import numpy as np
++    import faiss
++except Exception:
++    faiss = None
++
++try:
++    from sentence_transformers import SentenceTransformer
++except Exception:
++    SentenceTransformer = None
++
++try:
++    from sentence_transformers import CrossEncoder
++except Exception:
++    CrossEncoder = None
++
++try:
++    from transformers import AutoTokenizer, AutoModelForCausalLM
++except Exception:
++    AutoTokenizer = None
++    AutoModelForCausalLM = None
++
++import requests
++
++def load_corpus(corpus_dir: str) -> List[Tuple[str, str]]:
++    """
++    Load corpus files: each file in corpus_dir is treated as a document.
++    Returns list of (doc_id, text).
++    """
++    p = Path(corpus_dir)
++    if not p.exists() or not p.is_dir():
++        raise FileNotFoundError(corpus_dir)
++    docs = []
++    for f in sorted(p.glob("**/*.txt")):
++        docs.append((str(f.relative_to(p)), f.read_text(encoding="utf-8")))
++    print(f"Loaded {len(docs)} docs from {corpus_dir}")
++    return docs
++
++
++def build_faiss_index(embs: np.ndarray, index_path: Optional[str] = None, use_gpu: bool = False):
++    """
++    Build a simple FAISS index (Flat L2). For production consider IVF/PQ.
++    """
++    if faiss is None:
++        raise RuntimeError("faiss is required for indexing")
++    d = embs.shape[1]
++    index = faiss.IndexFlatL2(d)
++    if use_gpu:
++        res = faiss.StandardGpuResources()
++        index = faiss.index_cpu_to_gpu(res, 0, index)
++    index.add(embs)
++    if index_path:
++        faiss.write_index(faiss.index_gpu_to_cpu(index) if use_gpu else index, index_path)
++    return index
++
++
++def encode_texts(embedder_name: str, texts: List[str], batch: int = 32, device: Optional[str] = None):
++    if SentenceTransformer is None:
++        raise RuntimeError("sentence-transformers required for embedding")
++    model = SentenceTransformer(embedder_name, device=device or "cpu")
++    embs = model.encode(texts, batch_size=batch, show_progress_bar=True, convert_to_numpy=True)
++    return embs, model
++
++
++def retrieve(index, query_emb: np.ndarray, topk: int = 10) -> Tuple[List[int], List[float]]:
++    D, I = index.search(query_emb.reshape(1, -1), topk)
++    return I[0].tolist(), D[0].tolist()
++
++
++def rerank_with_crossencoder(crossencoder_model: str, query: str, candidates: List[str], topk: int = 10):
++    if CrossEncoder is None:
++        raise RuntimeError("sentence-transformers CrossEncoder required for reranking")
++    model = CrossEncoder(crossencoder_model)
++    pairs = [[query, c] for c in candidates]
++    scores = model.predict(pairs)
++    idxs = sorted(range(len(scores)), key=lambda i: -scores[i])[:topk]
++    return idxs, [scores[i] for i in idxs]
++
++
++def generate_with_local_model(model_name: str, prompt: str, max_new_tokens: int = 128) -> str:
++    if AutoTokenizer is None:
++        raise RuntimeError("transformers required for local generation")
++    tok = AutoTokenizer.from_pretrained(model_name)
++    model = AutoModelForCausalLM.from_pretrained(model_name)
++    ids = tok(prompt, return_tensors="pt").input_ids
++    out = model.generate(ids, max_new_tokens=max_new_tokens)
++    return tok.decode(out[0], skip_special_tokens=True)
++
++
++def generate_with_endpoint(endpoint: str, prompt: str, timeout: int = 30) -> str:
++    """
++    Call an HTTP generation endpoint that accepts JSON {"prompt": "...", ...}
++    and returns a JSON with 'generated_text' or similar.
++    """
++    payload = {"prompt": prompt, "max_new_tokens": 128}
++    r = requests.post(endpoint, json=payload, timeout=timeout)
++    r.raise_for_status()
++    j = r.json()
++    # try common shapes
++    if "generated_text" in j:
++        return j["generated_text"]
++    if "text" in j:
++        return j["text"]
++    if "outputs" in j and isinstance(j["outputs"], list):
++        return j["outputs"][0].get("text","")
++    return json.dumps(j)
++
++
++def run_benchmark(corpus_dir: str, embedder: str, queries_file: str, topk: int = 10, crossencoder: Optional[str] = None, model_for_gen: Optional[str] = None, endpoint: Optional[str] = None, use_gpu_faiss: bool = False, out: Optional[str] = None):
++    docs = load_corpus(corpus_dir)
++    ids = [d[0] for d in docs]
++    texts = [d[1] for d in docs]
++
++    embs, embed_model = encode_texts(embedder, texts, batch=32, device="cuda" if use_gpu_faiss else "cpu")
++    print("Embeddings shape:", embs.shape)
++    index = build_faiss_index(embs, index_path=None, use_gpu=use_gpu_faiss)
++
++    queries = []
++    qf = Path(queries_file)
++    if qf.exists():
++        queries = [l.strip() for l in qf.read_text(encoding="utf-8").splitlines() if l.strip()]
++    else:
++        queries = ["Summarize the following document.", "What is the key claim of the corpus?"]
++
++    results = {"metadata": {"embedder": embedder, "corpus_size": len(docs), "topk": topk}, "queries": []}
++    for q in queries:
++        q_start = time.time()
++        q_emb = embed_model.encode([q], convert_to_numpy=True)[0]
++        ret_start = time.time()
++        idxs, dists = retrieve(index, q_emb, topk=topk if crossencoder is None else max(topk*3, topk))
++        ret_dur = time.time() - ret_start
++        candidates = [texts[i] for i in idxs]
++        rerank_start = time.time()
++        if crossencoder:
++            try:
++                r_idxs, r_scores = rerank_with_crossencoder(crossencoder, q, candidates, topk=topk)
++                final_candidates = [candidates[i] for i in r_idxs]
++            except Exception as e:
++                print("Cross-encoder failed:", e)
++                final_candidates = candidates[:topk]
++        else:
++            final_candidates = candidates[:topk]
++        rerank_dur = time.time() - rerank_start
++
++        context = "\n\n".join(final_candidates)
++        prompt = f"Context:\n{context}\n\nQuestion:\n{q}\n\nAnswer:"
++        gen_start = time.time()
++        try:
++            if endpoint:
++                gen_out = generate_with_endpoint(endpoint, prompt)
++            elif model_for_gen:
++                gen_out = generate_with_local_model(model_for_gen, prompt)
++            else:
++                gen_out = "[no generation (no model or endpoint provided)]"
++        except Exception as e:
++            gen_out = f"[generation failed: {e}]"
++        gen_dur = time.time() - gen_start
++
++        total_dur = time.time() - q_start
++        qres = {
++            "query": q,
++            "retrieval_time_s": ret_dur,
++            "rerank_time_s": rerank_dur,
++            "generation_time_s": gen_dur,
++            "total_time_s": total_dur,
++            "retrieved_doc_ids": [ids[i] for i in idxs[:topk]],
++            "generated": gen_out[:1000]  # truncate
++        }
++        print(f"Query done: retrieval {ret_dur:.3f}s rerank {rerank_dur:.3f}s gen {gen_dur:.3f}s total {total_dur:.3f}s")
++        results["queries"].append(qres)
++
++    if out:
++        Path(out).write_text(json.dumps(results, indent=2), encoding="utf-8")
++        print("Wrote benchmark results to", out)
++    return results
++
++
++def parse_args():
++    p = argparse.ArgumentParser()
++    p.add_argument("--corpus-dir", required=True)
++    p.add_argument("--embedder", default="sentence-transformers/all-MiniLM-L6-v2")
++    p.add_argument("--queries", default="tests/long_queries.txt")
++    p.add_argument("--topk", type=int, default=10)
++    p.add_argument("--crossencoder", default=None)
++    p.add_argument("--model-for-gen", default=None)
++    p.add_argument("--endpoint", default=None)
++    p.add_argument("--use-gpu-faiss", action="store_true")
++    p.add_argument("--out", default="rag_throughput.json")
++    return p.parse_args()
++
++
++if __name__ == "__main__":
++    args = parse_args()
++    run_benchmark(args.corpus_dir, args.embedder, args.queries, topk=args.topk, crossencoder=args.crossencoder, model_for_gen=args.model_for_gen, endpoint=args.endpoint, use_gpu_faiss=args.use_gpu_faiss, out=args.out)
++
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,3 +1,6 @@
+ # ignore artifacts
+ outputs/
+ models/
++
++# longcontext results
++results/
+--- /dev/null
++++ b/scripts/longcontext/attention_kernel_benchmark.py
+@@ -0,0 +1,320 @@
++#!/usr/bin/env python3
++"""
++scripts/longcontext/attention_kernel_benchmark.py
++
++Benchmark attention kernels and simple native generation timimg on a candidate model.
++ - Detect availability of FlashAttention and xFormers
++ - Run a micro-benchmark of scaled attention memory/time (random tensors)
++ - Attempt a native generate on a large prompt (may OOM depending on model and hardware)
++
++Usage:
++  python scripts/longcontext/attention_kernel_benchmark.py --model <hf-id-or-path> --tokens 32768 --runs 2 --out results/attention_report.json
++
++Notes:
++ - This script is experimental; running native large-context generate may require large GPU memory.
++ - Install flash-attn/xformers according to upstream instructions for best performance.
++"""
++from __future__ import annotations
++import argparse
++import json
++import time
++from pathlib import Path
++from typing import Dict
++
++def check_package(pkg: str) -> bool:
++    try:
++        __import__(pkg)
++        return True
++    except Exception:
++        return False
++
++def attention_microbench(seq_len: int, dim: int = 64, runs: int = 3) -> Dict:
++    """
++    Create random tensors and compute self-attention via PyTorch matmul as baseline.
++    If flash_attn or xformers are installed, try to import and run a simple op (best-effort).
++    """
++    import torch
++    out = {"seq_len": seq_len, "dim": dim, "runs": runs, "baseline_times": []}
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    q = torch.randn((1, seq_len, dim), device=device)
++    k = torch.randn((1, seq_len, dim), device=device)
++    v = torch.randn((1, seq_len, dim), device=device)
++    for _ in range(runs):
++        t0 = time.time()
++        # scaled dot-product attention naive
++        attn_scores = q @ k.transpose(-2, -1) / (dim ** 0.5)
++        attn = torch.softmax(attn_scores, dim=-1)
++        out_t = attn @ v
++        torch.cuda.synchronize() if device == "cuda" else None
++        out["baseline_times"].append(time.time() - t0)
++    # try flash_attn
++    out["flash_attn_available"] = check_package("flash_attn")
++    if out["flash_attn_available"]:
++        try:
++            import torch
++            from flash_attn.ops.attention import memory_efficient_attention
++            tms = []
++            for _ in range(runs):
++                t0 = time.time()
++                me = memory_efficient_attention(q, k, v)
++                torch.cuda.synchronize()
++                tms.append(time.time() - t0)
++            out["flash_attn_times"] = tms
++        except Exception as e:
++            out["flash_attn_error"] = str(e)
++    out["xformers_available"] = check_package("xformers")
++    if out["xformers_available"]:
++        try:
++            import torch
++            from xformers.ops import memory_efficient_attention as x_mem
++            tms = []
++            for _ in range(runs):
++                t0 = time.time()
++                x = x_mem(q, k, v)
++                torch.cuda.synchronize()
++                tms.append(time.time() - t0)
++            out["xformers_times"] = tms
++        except Exception as e:
++            out["xformers_error"] = str(e)
++    return out
++
++def native_generate_timing(model_id: str, tokens: int = 32768, max_new_tokens: int = 32, runs: int = 1) -> Dict:
++    """
++    Attempt to run a generation with a synthetic long prompt by repeating a short sentence until tokens length.
++    This may OOM depending on model/context and hardware.
++    """
++    try:
++        from transformers import AutoTokenizer, AutoModelForCausalLM
++    except Exception as e:
++        return {"error": f"transformers unavailable: {e}"}
++    import torch
++    tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
++    model = AutoModelForCausalLM.from_pretrained(model_id)
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    model.to(device)
++    base = "This is a test sentence. "
++    # produce approx tokens length
++    rep = max(1, tokens // 6)
++    prompt = base * rep
++    timings = []
++    for _ in range(runs):
++        try:
++            ids = tok(prompt, return_tensors="pt", truncation=False).input_ids.to(device)
++            t0 = time.time()
++            _ = model.generate(ids, max_new_tokens=max_new_tokens)
++            torch.cuda.synchronize() if device == "cuda" else None
++            timings.append(time.time() - t0)
++        except Exception as e:
++            return {"error": f"generation failed: {e}"}
++    return {"model": model_id, "device": device, "prompt_tokens_approx": tokens, "timings": timings}
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--model", required=False, default="", help="HF id or local path for native generate test")
++    p.add_argument("--tokens", type=int, default=32768)
++    p.add_argument("--dim", type=int, default=64)
++    p.add_argument("--runs", type=int, default=2)
++    p.add_argument("--out", default="results/attention_report.json")
++    args = p.parse_args()
++
++    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
++    report = {"timestamp": time.time(), "seq_bench": None, "native_generate": None}
++    try:
++        report["seq_bench"] = attention_microbench(args.tokens, dim=args.dim, runs=args.runs)
++    except Exception as e:
++        report["seq_bench"] = {"error": str(e)}
++    if args.model:
++        try:
++            report["native_generate"] = native_generate_timing(args.model, tokens=args.tokens, runs=args.runs)
++        except Exception as e:
++            report["native_generate"] = {"error": str(e)}
++    Path(args.out).write_text(json.dumps(report, indent=2))
++    print("Wrote attention benchmark report to", args.out)
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null
++++ b/scripts/longcontext/native_context_checker.py
+@@ -0,0 +1,177 @@
++#!/usr/bin/env python3
++"""
++scripts/longcontext/native_context_checker.py
++
++Check model configs (HF) for maximum context length (max_position_embeddings / n_ctx) and report models with >= threshold.
++
++Usage:
++  python scripts/longcontext/native_context_checker.py --models configs/long_context_models.json --threshold 32768 --out results/context_report.json
++"""
++from __future__ import annotations
++import argparse
++import json
++import sys
++import time
++from pathlib import Path
++from typing import Dict, Any
++
++try:
++    from huggingface_hub import HfApi
++except Exception:
++    HfApi = None
++
++def inspect_model_info(model_id: str) -> Dict[str, Any]:
++    """
++    Query HF model config for context length. Best-effort: try to load config using HuggingFace hub or transformers.
++    """
++    info = {"model_id": model_id, "checked_at": time.time(), "max_context": None, "error": None}
++    try:
++        # Try huggingface hub model_info
++        if HfApi is not None:
++            api = HfApi()
++            mi = api.model_info(model_id)
++            # model card may contain context info; otherwise try transformers config
++            cfg = getattr(mi, "pipeline_tag", None)
++        # Fallback: try transformers config
++        try:
++            from transformers import AutoConfig
++            c = AutoConfig.from_pretrained(model_id, trust_remote_code=False)
++            max_ctx = getattr(c, "max_position_embeddings", None) or getattr(c, "n_ctx", None) or getattr(c, "context_window", None)
++            info["max_context"] = int(max_ctx) if max_ctx else None
++        except Exception as e:
++            # cannot load config
++            info["error"] = f"config_error: {e}"
++    except Exception as e:
++        info["error"] = str(e)
++    return info
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--models", required=True, help="JSON file with candidate models (configs/long_context_models.json)")
++    p.add_argument("--threshold", type=int, default=32768)
++    p.add_argument("--out", default="results/context_report.json")
++    args = p.parse_args()
++
++    models_cfg = Path(args.models)
++    if not models_cfg.exists():
++        print("Models file not found:", models_cfg)
++        sys.exit(2)
++    cfg = json.loads(models_cfg.read_text())
++    candidates = cfg.get("candidates", [])
++    report = {"checked": [], "qualified": [], "threshold": args.threshold}
++    for c in candidates:
++        mid = c.get("model_id")
++        print("Inspecting", mid)
++        try:
++            info = inspect_model_info(mid)
++        except Exception as e:
++            info = {"model_id": mid, "error": str(e)}
++        report["checked"].append(info)
++        if info.get("max_context") and info["max_context"] >= args.threshold:
++            report["qualified"].append(info)
++    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
++    Path(args.out).write_text(json.dumps(report, indent=2))
++    print("Wrote context report to", args.out)
++    if report["qualified"]:
++        print("Qualified models (>= threshold):")
++        for q in report["qualified"]:
++            print(" -", q["model_id"], "max_context=", q.get("max_context"))
++    else:
++        print("No qualified native long-context models found in candidates.")
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null
++++ b/scripts/run_longcontext_validation.sh
+@@ -0,0 +1,85 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# scripts/run_longcontext_validation.sh
++#
++# Wrapper to run native context check, attention kernel benchmark, and RAG throughput benchmark.
++# Usage:
++#   ./scripts/run_longcontext_validation.sh --models configs/long_context_models.json --corpus-dir data/long_corpus --queries tests/long_queries.txt --out-dir results
++
++MODELS=${MODELS:-"configs/long_context_models.json"}
++CORPUS_DIR=${CORPUS_DIR:-"data/long_corpus"}
++QUERIES=${QUERIES:-"tests/long_queries.txt"}
++OUT_DIR=${OUT_DIR:-"results"}
++
++mkdir -p "$OUT_DIR"
++
++echo "1) Native context checker"
++python scripts/longcontext/native_context_checker.py --models "$MODELS" --threshold 32768 --out "$OUT_DIR/context_report.json"
++
++echo "2) Attention kernel benchmark (run on a representative candidate if available)"
++# pick first candidate with a non-empty model id
++MODEL_ID=$(python - <<PY
++import json
++data=json.load(open("$MODELS"))
++cand=data.get("candidates",[])
++print(cand[0].get("model_id") if cand else "")
++PY
++)
++if [ -n "$MODEL_ID" ]; then
++  python scripts/longcontext/attention_kernel_benchmark.py --model "$MODEL_ID" --tokens 32768 --runs 2 --out "$OUT_DIR/attention_report.json"
++else
++  echo "No model id found in $MODELS; skipping attention benchmark"
++fi
++
++echo "3) RAG throughput benchmark"
++python openquill/rag/throughput_benchmark.py --corpus-dir "$CORPUS_DIR" --embedder "sentence-transformers/all-MiniLM-L6-v2" --queries "$QUERIES" --topk 10 --out "$OUT_DIR/rag_throughput.json"
++
++echo "Validation complete. Results in $OUT_DIR"
++exit 0
++
+-- 
+2.40.1
