@@ -1,0 +1,639 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Ops <ops@example.com>
+Date: 2026-03-02 00:00:00 +0000
+Subject: [PATCH] production pipeline orchestration: k8s jobs, launcher, human signoff service, CI workflow skeleton, GPU provision helper
+
+---
+ .github/workflows/prod_release_pipeline.yml         | 204 ++++++++++++++++++++++++++++++
+ k8s/prod_pipeline_jobs.yaml                         | 423 +++++++++++++++++++++++++++++++++++++++++++++++++++++
+ scripts/launch_prod_pipeline.py                     | 256 +++++++++++++++++++++++++++++++++
+ tools/signoff_service_fastapi.py                    | 235 ++++++++++++++++++++++++++++++
+ scripts/provision_gpu_nodepool.sh                   | 119 ++++++++++++++
+ 5 files changed, 1237 insertions(+)
+ create mode 100644 .github/workflows/prod_release_pipeline.yml
+ create mode 100644 k8s/prod_pipeline_jobs.yaml
+ create mode 100755 scripts/launch_prod_pipeline.py
+ create mode 100644 tools/signoff_service_fastapi.py
+ create mode 100755 scripts/provision_gpu_nodepool.sh
+--- /dev/null
++++ b/.github/workflows/prod_release_pipeline.yml
+@@ -0,0 +1,204 @@
++name: "OpenQuill Production Release Pipeline (trigger up to human gate)"
++
++# This workflow runs the production pipeline up to the human/legal signoff gate.
++# It assumes you have:
++#  - kubectl configured in the runner (or use a self-hosted runner with cluster access)
++#  - SIGNOFF_API_URL / SIGNOFF_API_TOKEN set in repository secrets to poll the signoff service
++#  - S3/HF credentials available as secrets for the final publish step (not executed here)
++
++on:
++  workflow_dispatch:
++    inputs:
++      merged_ckpt:
++        description: 'Path to merged checkpoint (PVC path or container path)'
++        required: true
++        default: 'outputs/sft-run/merged'
++      staging_namespace:
++        description: 'Kubernetes namespace for staging'
++        required: true
++        default: 'openquill-staging'
++
++jobs:
++  launch-pipeline:
++    name: Launch prod pipeline (Kubernetes)
++    runs-on: ubuntu-latest
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Set up kubectl
++        uses: azure/setup-kubectl@v3
++        with:
++          version: 'v1.28.0'
++
++      - name: Apply k8s pipeline jobs
++        env:
++          MERGED_CKPT: ${{ github.event.inputs.merged_ckpt }}
++          STAGING_NS: ${{ github.event.inputs.staging_namespace }}
++        run: |
++          # Substitute env vars into manifest and apply
++          sed "s|{{MERGED_CKPT}}|${MERGED_CKPT}|g; s|{{STAGING_NAMESPACE}}|${STAGING_NS}|g" k8s/prod_pipeline_jobs.yaml > /tmp/prod_pipeline_applied.yaml
++          kubectl apply -f /tmp/prod_pipeline_applied.yaml
++
++      - name: Wait for Jobs to complete (SFT, reward, PPO, redteam, quant)
++        run: |
++          # These job names must match names in k8s/prod_pipeline_jobs.yaml
++          jobs=(openquill-sft-job openquill-reward-job openquill-ppo-job openquill-redteam-job openquill-quant-job)
++          for j in "${jobs[@]}"; do
++            echo "Waiting for job $j to complete..."
++            # wait up to 6h for SFT; shorter for others. Adjust as needed.
++            if [[ "$j" == "openquill-sft-job" ]]; then
++              timeout="6h"
++            else
++              timeout="60m"
++            fi
++            kubectl wait --for=condition=complete --timeout=$timeout job/$j -n ${{ github.event.inputs.staging_namespace }} || (kubectl logs job/$j -n ${{ github.event.inputs.staging_namespace }} --all-containers=true; exit 1)
++          done
++
++      - name: Show PPO rollouts location
++        run: |
++          echo "PPO rollouts and HIL items should be available in the PVC mounted by the jobs (see job logs and volumes)."
++
++  wait-for-signoff:
++    name: Wait for human/legal signoff
++    runs-on: ubuntu-latest
++    needs: launch-pipeline
++    steps:
++      - name: Poll signoff API until approval or timeout
++        env:
++          SIGNOFF_API_URL: ${{ secrets.SIGNOFF_API_URL }}
++          SIGNOFF_API_TOKEN: ${{ secrets.SIGNOFF_API_TOKEN }}
++          TIMEOUT_MIN: 10080  # 7 days default (in minutes)
++        run: |
++          if [ -z "$SIGNOFF_API_URL" ] || [ -z "$SIGNOFF_API_TOKEN" ]; then
++            echo "SIGNOFF_API_URL or SIGNOFF_API_TOKEN not configured in secrets. Create signoff file manually to proceed."
++            exit 78
++          fi
++          echo "Polling $SIGNOFF_API_URL for approval..."
++          start=$(date +%s)
++          timeout_seconds=$(( TIMEOUT_MIN * 60 ))
++          while true; do
++            resp=$(curl -s -H "Authorization: Bearer $SIGNOFF_API_TOKEN" "$SIGNOFF_API_URL/status" || true)
++            echo "Status: $resp"
++            approved=$(echo "$resp" | jq -r '.approved' 2>/dev/null || echo "false")
++            if [ "$approved" == "true" ]; then
++              echo "Signoff approved."
++              echo "$resp" > signoff_result.json
++              exit 0
++            fi
++            now=$(date +%s)
++            if [ $((now-start)) -ge $timeout_seconds ]; then
++              echo "Timed out waiting for signoff."
++              exit 124
++            fi
++            sleep 60
++          done
++
++  finalize-publish:
++    name: Finalize & publish (manual / requires signoff)
++    runs-on: ubuntu-latest
++    needs: wait-for-signoff
++    if: success()
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Run finalizer to publish artifacts
++        env:
++          HF_API_TOKEN: ${{ secrets.HF_API_TOKEN }}
++          S3_BUCKET: ${{ secrets.S3_BUCKET }}
++        run: |
++          # This runs finalize_and_publish_release.py which expects merged_ckpt and other artifacts staged
++          python scripts/finalize_and_publish_release.py --merged_ckpt ${{ github.event.inputs.merged_ckpt }} --sft_data_dir data --annotations_csv annotations/annotations.csv --gold_tests annotations/gold_tests.json --publish_s3_bucket $S3_BUCKET --hf_repo ${{ secrets.HF_REPO }} --hf_token $HF_API_TOKEN
++
++      - name: Upload release manifest
++        uses: actions/upload-artifact@v4
++        with:
++          name: release-final-manifest
++          path: release_final_manifest.json
++
++# Note: This workflow is a template. In most orgs, the job launching and waiting should be run on a self-hosted runner
++# with secure access to the Kubernetes cluster and necessary secrets. The SIGNOFF_API should be the signoff service
++# that your safety/legal team uses to approve releases (see tools/signoff_service_fastapi.py).
+--- a/k8s/prod_pipeline_jobs.yaml
++++ b/k8s/prod_pipeline_jobs.yaml
+@@ -0,0 +1,423 @@
++# Kubernetes Job definitions for production pipeline stages.
++# Each Job assumes an image that contains the OpenQuill repository and runtime dependencies,
++# and that model data, annotations, and output PVCs are mounted at the paths shown.
++#
++# Operator notes:
++# - Replace the image fields with your curated runner image (built from the repo).
++# - Ensure ServiceAccount has minimal RBAC rights to read/write the mounted PVCs.
++# - The MERGED_CKPT placeholder is substituted by the CI or operator.
++
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: openquill-sft-job
++  namespace: {{STAGING_NAMESPACE}}
++spec:
++  backoffLimit: 1
++  template:
++    spec:
++      serviceAccountName: openquill-controller-sa
++      nodeSelector:
++        openquill/gpu: "true"
++      restartPolicy: Never
++      containers:
++        - name: sft-run
++          image: ghcr.io/yourorg/openquill-runner:latest
++          imagePullPolicy: IfNotPresent
++          command: ["/bin/sh", "-c"]
++          args:
++            - |
++              set -euo pipefail
++              # Run full SFT via repo script. MERGED_CKPT is the mounted path where base snapshot lives.
++              bash /opt/openquill/scripts/run_sft_and_merge.sh --model {{MERGED_CKPT}} --data /data/sft.jsonl --out /work/sft_out --max_steps 50000 --hf_token "${HF_API_TOKEN}"
++              # Copy merged output to PVC path /models/merged -> used by subsequent jobs
++              cp -r /work/sft_out/merged /models/merged
++          env:
++            - name: HF_API_TOKEN
++              valueFrom:
++                secretKeyRef:
++                  name: openquill-hf-token
++                  key: HF_API_TOKEN
++          volumeMounts:
++            - name: models
++              mountPath: /models
++            - name: data
++              mountPath: /data
++            - name: work
++              mountPath: /work
++      volumes:
++        - name: models
++          persistentVolumeClaim:
++            claimName: openquill-model-pvc
++        - name: data
++          persistentVolumeClaim:
++            claimName: openquill-data-pvc
++        - name: work
++          emptyDir: {}
++
++---
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: openquill-reward-job
++  namespace: {{STAGING_NAMESPACE}}
++spec:
++  backoffLimit: 1
++  template:
++    spec:
++      serviceAccountName: openquill-controller-sa
++      restartPolicy: Never
++      containers:
++        - name: reward-train
++          image: ghcr.io/yourorg/openquill-runner:latest
++          imagePullPolicy: IfNotPresent
++          command: ["/bin/sh", "-c"]
++          args:
++            - |
++              set -euo pipefail
++              # Expect annotations CSV mounted at /data/annotations.csv
++              python /opt/openquill/openquill/safety/reward_holdout.py --pairs /data/reward_pairs.jsonl --out /work/reward_out --model_name distilbert-base-uncased
++              cp -r /work/reward_out /models/reward_out
++          volumeMounts:
++            - name: data
++              mountPath: /data
++            - name: models
++              mountPath: /models
++            - name: work
++              mountPath: /work
++      volumes:
++        - name: data
++          persistentVolumeClaim:
++            claimName: openquill-data-pvc
++        - name: models
++          persistentVolumeClaim:
++            claimName: openquill-model-pvc
++        - name: work
++          emptyDir: {}
++
++---
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: openquill-ppo-job
++  namespace: {{STAGING_NAMESPACE}}
++spec:
++  backoffLimit: 1
++  template:
++    spec:
++      serviceAccountName: openquill-controller-sa
++      nodeSelector:
++        openquill/gpu: "true"
++      restartPolicy: Never
++      containers:
++        - name: ppo-run
++          image: ghcr.io/yourorg/openquill-runner:latest
++          imagePullPolicy: IfNotPresent
++          command: ["/bin/sh", "-c"]
++          args:
++            - |
++              set -euo pipefail
++              # Run PPO pilot with conservative shaping. Prompts mounted at /data/ppo_prompts.txt
++              python /opt/openquill/openquill/training/ppo_shaped.py --prompts /data/ppo_prompts.txt --policy distilgpt2 --reward_model /models/reward_out/reward_model --out_dir /work/ppo_out --ppo_epochs 1 --batch_size 1 --shaping_cfg /opt/openquill/configs/reward_shaping.yaml
++              cp -r /work/ppo_out /models/ppo_out
++          volumeMounts:
++            - name: data
++              mountPath: /data
++            - name: models
++              mountPath: /models
++            - name: work
++              mountPath: /work
++          env:
++            - name: PYTHONWARNINGS
++              value: "ignore"
++      volumes:
++        - name: data
++          persistentVolumeClaim:
++            claimName: openquill-data-pvc
++        - name: models
++          persistentVolumeClaim:
++            claimName: openquill-model-pvc
++        - name: work
++          emptyDir: {}
++
++---
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: openquill-redteam-job
++  namespace: {{STAGING_NAMESPACE}}
++spec:
++  backoffLimit: 0
++  template:
++    spec:
++      serviceAccountName: openquill-controller-sa
++      restartPolicy: Never
++      containers:
++        - name: redteam
++          image: ghcr.io/yourorg/openquill-runner:latest
++          command: ["/bin/sh", "-c"]
++          args:
++            - |
++              set -euo pipefail
++              # Run red-team campaign using staging endpoint configured in env
++              python /opt/openquill/scripts/run_redteam_campaign.sh --server http://openquill-staging.example.com --out /work/redteam_results.jsonl
++              cp /work/redteam_results.jsonl /models/redteam_results.jsonl
++          volumeMounts:
++            - name: models
++              mountPath: /models
++            - name: work
++              mountPath: /work
++      volumes:
++        - name: models
++          persistentVolumeClaim:
++            claimName: openquill-model-pvc
++        - name: work
++          emptyDir: {}
++
++---
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: openquill-quant-job
++  namespace: {{STAGING_NAMESPACE}}
++spec:
++  backoffLimit: 0
++  template:
++    spec:
++      serviceAccountName: openquill-controller-sa
++      nodeSelector:
++        openquill/gpu: "true"
++      restartPolicy: Never
++      containers:
++        - name: quantize
++          image: ghcr.io/yourorg/openquill-runner:latest
++          command: ["/bin/sh", "-c"]
++          args:
++            - |
++              set -euo pipefail
++              # Attempt AutoGPTQ quantization (if available) and run validation via quant_eval
++              python /opt/openquill/scripts/quant_eval.py --teacher /models/merged --auto_quant --mode auto_gptq --quant_out /work/quant_out --prompts /data/prompts.txt --out /work/quant_report.json
++              cp -r /work/quant_out /models/quant_out || true
++              cp /work/quant_report.json /models/quant_report.json || true
++          volumeMounts:
++            - name: models
++              mountPath: /models
++            - name: data
++              mountPath: /data
++            - name: work
++              mountPath: /work
++      volumes:
++        - name: models
++          persistentVolumeClaim:
++            claimName: openquill-model-pvc
++        - name: data
++          persistentVolumeClaim:
++            claimName: openquill-data-pvc
++        - name: work
++          emptyDir: {}
++
++---
++# Note: After these jobs complete, PPO rollouts and redteam results will be available on the model PVC.
++# Operators / safety leads should review HIL queue (via openquill.safety.hil_queue) and the files under /models/ppo_out, /models/redteam_results.jsonl.
+--- a/scripts/launch_prod_pipeline.py
++++ b/scripts/launch_prod_pipeline.py
+@@ -0,0 +1,256 @@
++#!/usr/bin/env python3
++"""
++scripts/launch_prod_pipeline.py
++
++Orchestrate the production pipeline on Kubernetes by applying the prod pipeline jobs manifest
++and waiting for the key jobs to complete. This is an operator helper (run from a machine with kubectl access).
++
++Usage:
++  python scripts/launch_prod_pipeline.py --manifest k8s/prod_pipeline_jobs.yaml --namespace openquill-staging --merged_ckpt /models/base_snapshot
++
++This script:
++ - Substitutes placeholders in the manifest with provided values
++ - Applies the manifest
++ - Waits for each Job to complete (SFT may be long-running)
++ - Prints locations of outputs for review (ppo rollouts, redteam results)
++
++Operator responsibilities:
++ - Ensure the runner image referenced in the jobs is built and pushed to your internal registry
++ - Ensure PVCs are available and secrets (HF API token, S3 creds) are present
++ - Provide cluster credentials to kubectl
++"""
++from __future__ import annotations
++import argparse
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++def run_cmd(cmd: str, check=True):
++    print("RUN:", cmd)
++    res = subprocess.run(cmd, shell=True)
++    if check and res.returncode != 0:
++        raise RuntimeError(f"Command failed: {cmd}")
++    return res.returncode
++
++def apply_manifest(manifest_path: Path, merged_ckpt: str, namespace: str):
++    content = manifest_path.read_text()
++    content = content.replace("{{MERGED_CKPT}}", merged_ckpt).replace("{{STAGING_NAMESPACE}}", namespace)
++    tmp = Path("/tmp/openquill_prod_manifest.yaml")
++    tmp.write_text(content)
++    run_cmd(f"kubectl apply -f {tmp}")
++    return tmp
++
++def wait_for_job(job_name: str, namespace: str, timeout_seconds: int):
++    print(f"Waiting for job {job_name} in ns {namespace} (timeout {timeout_seconds}s)...")
++    start = time.time()
++    while True:
++        try:
++            # check conditions
++            out = subprocess.check_output(f"kubectl get job {job_name} -n {namespace} -o jsonpath='{{.status}}'", shell=True, text=True)
++            if "complete" in out or "\"succeeded\": 1" in out:
++                print(f"Job {job_name} completed.")
++                return True
++        except subprocess.CalledProcessError:
++            pass
++        if time.time() - start > timeout_seconds:
++            print(f"Timeout waiting for job {job_name}")
++            # tail logs for debugging
++            try:
++                run_cmd(f"kubectl logs job/{job_name} -n {namespace} --all-containers=true")
++            except Exception:
++                pass
++            raise TimeoutError(f"Timeout waiting for job {job_name}")
++        time.sleep(30)
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--manifest", default="k8s/prod_pipeline_jobs.yaml")
++    parser.add_argument("--merged_ckpt", required=True)
++    parser.add_argument("--namespace", default="openquill-staging")
++    args = parser.parse_args()
++
++    manifest = Path(args.manifest)
++    if not manifest.exists():
++        print("Manifest not found:", manifest)
++        sys.exit(2)
++
++    tmp_manifest = apply_manifest(manifest, args.merged_ckpt, args.namespace)
++
++    # Wait for jobs in order. SFT can be long -> allow up to 6 hours (21600s)
++    jobs = [
++        ("openquill-sft-job", 21600),
++        ("openquill-reward-job", 7200),
++        ("openquill-ppo-job", 7200),
++        ("openquill-redteam-job", 3600),
++        ("openquill-quant-job", 7200),
++    ]
++
++    for job_name, timeout in jobs:
++        try:
++            wait_for_job(job_name, args.namespace, timeout)
++        except TimeoutError as e:
++            print("Aborting pipeline due to timeout:", e)
++            sys.exit(3)
++
++    print("All pipeline jobs completed. Inspect outputs in the model PVC (openquill-model-pvc).")
++    print("PPO rollouts: check /models/ppo_out on the PVC")
++    print("Red-team results: check /models/redteam_results.jsonl on the PVC")
++    print("Quant report: check /models/quant_report.json on the PVC")
++    print("When safety and legal teams have reviewed HIL items and redteam results, create a signoff via the signoff service.")
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null
++++ b/tools/signoff_service_fastapi.py
+@@ -0,0 +1,235 @@
++#!/usr/bin/env python3
++"""
++tools/signoff_service_fastapi.py
++
++Small FastAPI service to record human/legal signoff for a release candidate.
++This provides a simple UI/API for safety & legal to approve a release and add notes.
++The finalizer scripts poll this service to detect approval.
++
++Usage (dev):
++  uvicorn tools.signoff_service_fastapi:app --host 0.0.0.0 --port 8086
++
++Security:
++ - In production put this behind SSO or require a short-lived token (SIGNOFF_API_TOKEN).
++ - The service writes signoff JSON to a configurable path (default: docs/release_human_signoff.json)
++"""
++from __future__ import annotations
++import json
++import os
++from pathlib import Path
++from typing import Optional
++
++from fastapi import FastAPI, HTTPException, Header, Request
++from pydantic import BaseModel
++
++DEFAULT_SIGNOFF_PATH = os.environ.get("SIGNOFF_PATH", "docs/release_human_signoff.json")
++API_TOKEN = os.environ.get("SIGNOFF_API_TOKEN", "")
++
++app = FastAPI(title="OpenQuill Release Signoff Service")
++
++class Signoff(BaseModel):
++    approved: bool
++    approved_by: str
++    role: str
++    notes: Optional[str] = None
++    timestamp: Optional[float] = None
++
++def require_token(auth_header: Optional[str]):
++    if API_TOKEN:
++        if not auth_header:
++            raise HTTPException(status_code=401, detail="Missing Authorization header")
++        if not auth_header.startswith("Bearer "):
++            raise HTTPException(status_code=401, detail="Invalid auth header")
++        token = auth_header.split(" ", 1)[1]
++        if token != API_TOKEN:
++            raise HTTPException(status_code=403, detail="Invalid token")
++
++@app.get("/status")
++def status():
++    p = Path(DEFAULT_SIGNOFF_PATH)
++    if p.exists():
++        try:
++            data = json.loads(p.read_text(encoding="utf-8"))
++            return {"approved": data.get("approved", False), "signoff": data}
++        except Exception:
++            return {"approved": False, "signoff": None}
++    return {"approved": False, "signoff": None}
++
++@app.post("/signoff")
++async def signoff(req: Request, payload: Signoff, authorization: Optional[str] = Header(None)):
++    # Simple token auth (configurable via env SIGNOFF_API_TOKEN)
++    require_token(authorization)
++    data = payload.dict()
++    # add timestamp if missing
++    import time
++    if not data.get("timestamp"):
++        data["timestamp"] = time.time()
++    p = Path(DEFAULT_SIGNOFF_PATH)
++    p.parent.mkdir(parents=True, exist_ok=True)
++    p.write_text(json.dumps(data, indent=2), encoding="utf-8")
++    return {"ok": True, "written_to": str(p)}
++
++@app.post("/clear")
++def clear(authorization: Optional[str] = Header(None)):
++    require_token(authorization)
++    p = Path(DEFAULT_SIGNOFF_PATH)
++    if p.exists():
++        p.unlink()
++    return {"ok": True}
++
++if __name__ == "__main__":
++    import uvicorn
++    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8086)))
++
+--- /dev/null
++++ b/scripts/provision_gpu_nodepool.sh
+@@ -0,0 +1,119 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# scripts/provision_gpu_nodepool.sh
++#
++# Helper templates to provision GPU nodepools on common cloud providers.
++# This script prints provider-specific example commands for operators to run. It does NOT run them automatically.
++
++PROVIDER=${PROVIDER:-"gke"}  # gke | eks | aks | manual
++CLUSTER=${CLUSTER:-"my-cluster"}
++POOL_NAME=${POOL_NAME:-"openquill-gpu-pool"}
++ZONE=${ZONE:-"us-central1"}
++MACHINE_TYPE=${MACHINE_TYPE:-"a2-highgpu-1g"}
++NUM_NODES=${NUM_NODES:-1}
++
++function gke_example() {
++  cat <<EOF
++GKE example (run in gcloud):
++gcloud container node-pools create ${POOL_NAME} \\
++  --cluster ${CLUSTER} \\
++  --machine-type ${MACHINE_TYPE} \\
++  --accelerator type=nvidia-tesla-a100,count=1 \\
++  --num-nodes ${NUM_NODES} \\
++  --region ${ZONE} \\
++  --node-labels=role=openquill,gpu=true \\
++  --node-taints=nvidia.com/gpu=present:NoSchedule
++EOF
++}
++
++function eks_example() {
++  cat <<EOF
++EKS example (using eksctl):
++eksctl create nodegroup \\
++  --cluster=${CLUSTER} \\
++  --name=${POOL_NAME} \\
++  --node-type=${MACHINE_TYPE} \\
++  --nodes=${NUM_NODES} \\
++  --node-labels role=openquill,gpu=true \\
++  --node-taints nvidia.com/gpu=present:NoSchedule
++EOF
++}
++
++function aks_example() {
++  cat <<EOF
++AKS example:
++az aks nodepool add \\
++  --cluster-name ${CLUSTER} \\
++  --name ${POOL_NAME} \\
++  --node-vm-size ${MACHINE_TYPE} \\
++  --node-count ${NUM_NODES} \\
++  --labels role=openquill,gpu=true \\
++  --node-taints nvidia.com/gpu=present:NoSchedule
++EOF
++}
++
++case "$PROVIDER" in
++  gke) gke_example ;;
++  eks) eks_example ;;
++  aks) aks_example ;;
++  manual)
++    echo "Manual provisioning: create VMs with GPUs, install device plugin, join them to the cluster, then label/taint nodes."
++    echo "Sample commands:"
++    echo "kubectl label node <node-name> openquill/gpu=true --overwrite"
++    echo "kubectl taint nodes <node-name> nvidia.com/gpu=present:NoSchedule --overwrite"
++    ;;
++  *)
++    echo "Unknown provider: $PROVIDER"
++    exit 1
++    ;;
++esac
++
++echo
++echo "After provisioning, run scripts/label_gpu_nodes.sh to double-check labels and taints and ensure NVIDIA device plugin is deployed."
++exit 0
++
+-- 
+2.40.1
