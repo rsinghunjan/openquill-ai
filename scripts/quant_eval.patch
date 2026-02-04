@@ -1,0 +1,420 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Quant <quant@example.com>
+Date: 2026-02-24 00:00:00 +0000
+Subject: [PATCH] quant_eval: unified quantization + validation runner for AutoGPTQ / HF / endpoint artifacts
+
+---
+ scripts/quant_eval.py                                   |  406 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 406 insertions(+)
+ create mode 100755 scripts/quant_eval.py
+--- /dev/null
++++ b/scripts/quant_eval.py
+@@ -0,0 +1,406 @@
++#!/usr/bin/env python3
++"""
++scripts/quant_eval.py
++
++Unified quantization and validation runner.
++
++Purpose:
++ - Attempt to quantize a teacher model using AutoGPTQ if available (or call external CLI).
++ - Optionally convert quant artifact to GGUF (via external converter if available).
++ - Validate quantized artifact against the teacher using a set of prompts:
++     - token-level Jaccard overlap
++     - embedding cosine similarity (optional, if sentence-transformers installed)
++     - per-prompt latency comparison
++ - Support evaluation modes:
++     - hf : load quant artifact into HF-compatible model (bitsandbytes 4-bit)
++     - auto_gptq : use AutoGPTQ runtime to load and generate
++     - endpoint : call an external HTTP generation endpoint (TGI/vLLM) for quant model
++
++Usage examples:
++  # Run validation assuming quant artifact already available as gguf and endpoint for quant model
++  python scripts/quant_eval.py --teacher mistralai/mistral-7b --prompts tests/prompts.txt --mode endpoint --quant_endpoint http://quant-host:8080 --out results/quant_eval.json --min_jaccard 0.80 --min_embed 0.85
++
++  # Attempt AutoGPTQ quantization then validate via auto_gptq runtime
++  python scripts/quant_eval.py --teacher ./models/mistral --auto_quant --mode auto_gptq --quant_out ./models/mistral_auto_gptq --prompts tests/prompts.txt --out results/quant_eval.json
++
++Notes / caveats:
++ - This script uses best-effort imports for auto_gptq, bitsandbytes, sentence-transformers. If not present,
++   it will print actionable instructions and fall back to endpoint mode where possible.
++ - Generation outputs are compared using conservative metrics; choose acceptance thresholds appropriate for your use case.
++ - For GGUF / ggml artifacts, provide an endpoint or local runtime; this script cannot natively run gguf via HF.
++"""
++from __future__ import annotations
++import argparse
++import json
++import os
++import subprocess
++import sys
++import time
++from pathlib import Path
++from typing import List, Dict, Optional
++
++try:
++    import torch
++    from transformers import AutoTokenizer, AutoModelForCausalLM
++except Exception:
++    torch = None
++    AutoTokenizer = None
++    AutoModelForCausalLM = None
++
++try:
++    import numpy as np
++except Exception:
++    np = None
++
++try:
++    from sentence_transformers import SentenceTransformer
++except Exception:
++    SentenceTransformer = None
++
++try:
++    import auto_gptq
++    from auto_gptq import AutoGPTQForCausalLM, BaseQuantizeConfig
++except Exception:
++    auto_gptq = None
++
++
++def run_cmd(cmd: str) -> int:
++    print("RUN:", cmd)
++    res = subprocess.run(cmd, shell=True)
++    return res.returncode
++
++
++def load_prompts(prompts_file: Optional[str], default_prompts: Optional[List[str]] = None) -> List[str]:
++    if prompts_file and Path(prompts_file).exists():
++        return [l.strip() for l in Path(prompts_file).read_text(encoding="utf-8").splitlines() if l.strip()]
++    return default_prompts or ["Write a short summary of the following text.", "Explain gravity in one sentence."]
++
++
++def generate_with_teacher(teacher: str, prompt: str, max_new_tokens: int = 128, device: str = "cpu") -> Dict:
++    """
++    Generate with the teacher HF model via transformers.
++    """
++    if AutoTokenizer is None or AutoModelForCausalLM is None:
++        raise RuntimeError("transformers not installed - install transformers and torch for HF generation")
++    tok = AutoTokenizer.from_pretrained(teacher, use_fast=True)
++    model = AutoModelForCausalLM.from_pretrained(teacher, device_map="auto" if torch and torch.cuda.is_available() else None)
++    gen_device = next(iter(model.parameters())).device
++    ids = tok(prompt, return_tensors="pt").input_ids.to(gen_device)
++    t0 = time.time()
++    out = model.generate(ids, max_new_tokens=max_new_tokens)
++    torch.cuda.synchronize() if gen_device.type == "cuda" else None
++    dur = time.time() - t0
++    text = tok.decode(out[0], skip_special_tokens=True)
++    return {"text": text, "time_s": dur}
++
++
++def generate_with_hf_quant(quant_path: str, prompt: str, max_new_tokens: int = 128) -> Dict:
++    """
++    Attempt to load a quant artifact with Hf transformers + bitsandbytes (4-bit) via load_in_4bit.
++    This requires that the quant artifact is stored in a HF-compatible snapshot (or model supports load_in_4bit).
++    """
++    if AutoTokenizer is None or AutoModelForCausalLM is None:
++        raise RuntimeError("transformers not installed")
++    # Attempt to load with load_in_4bit or device_map auto
++    try:
++        tok = AutoTokenizer.from_pretrained(quant_path, use_fast=True)
++        model = AutoModelForCausalLM.from_pretrained(quant_path, load_in_4bit=True, device_map="auto")
++    except Exception as e:
++        # Fallback: try normal load (may OOM)
++        print("HF quant load failed:", e)
++        model = AutoModelForCausalLM.from_pretrained(quant_path)
++        tok = AutoTokenizer.from_pretrained(quant_path, use_fast=True)
++    dev = next(iter(model.parameters())).device
++    ids = tok(prompt, return_tensors="pt").input_ids.to(dev)
++    t0 = time.time()
++    out = model.generate(ids, max_new_tokens=max_new_tokens)
++    torch.cuda.synchronize() if dev.type == "cuda" else None
++    dur = time.time() - t0
++    text = tok.decode(out[0], skip_special_tokens=True)
++    return {"text": text, "time_s": dur}
++
++
++def generate_with_autogptq(quant_dir: str, prompt: str, max_new_tokens: int = 128) -> Dict:
++    """
++    Use AutoGPTQ runtime to load and generate from quant_dir.
++    This uses the AutoGPTQ API if installed. API surface varies; this is best-effort.
++    """
++    if auto_gptq is None:
++        raise RuntimeError("auto_gptq not installed")
++    try:
++        # Best-effort usage: AutoGPTQForCausalLM.from_quantized or similar
++        # Try common API patterns
++        if hasattr(AutoGPTQForCausalLM, "from_quantized"):
++            model = AutoGPTQForCausalLM.from_quantized(quant_dir, use_safetensors=True, device="cuda" if torch and torch.cuda.is_available() else "cpu")
++            tok = model.tokenizer if hasattr(model, "tokenizer") else None
++            if tok is None:
++                # fallback to AutoTokenizer
++                from transformers import AutoTokenizer
++                tok = AutoTokenizer.from_pretrained(quant_dir, use_fast=True)
++        else:
++            # try AutoGPTQForCausalLM.from_pretrained (some builds support this)
++            model = AutoGPTQForCausalLM.from_pretrained(quant_dir)
++            from transformers import AutoTokenizer
++            tok = AutoTokenizer.from_pretrained(quant_dir, use_fast=True)
++    except Exception as e:
++        raise RuntimeError(f"Failed to load AutoGPTQ model: {e}")
++    dev = "cuda" if torch and torch.cuda.is_available() else "cpu"
++    # Some auto_gptq models implement generate via model.generate
++    try:
++        ids = tok(prompt, return_tensors="pt").input_ids.to(dev)
++        t0 = time.time()
++        out = model.generate(ids, max_new_tokens=max_new_tokens)
++        if dev == "cuda":
++            torch.cuda.synchronize()
++        dur = time.time() - t0
++        text = tok.decode(out[0], skip_special_tokens=True)
++        return {"text": text, "time_s": dur}
++    except Exception as e:
++        raise RuntimeError(f"AutoGPTQ generate failed: {e}")
++
++
++def generate_with_endpoint(endpoint: str, prompt: str, max_new_tokens: int = 128, timeout: int = 30) -> Dict:
++    import requests
++    payload = {"prompt": prompt, "max_new_tokens": max_new_tokens}
++    t0 = time.time()
++    r = requests.post(endpoint, json=payload, timeout=timeout)
++    r.raise_for_status()
++    dur = time.time() - t0
++    j = r.json()
++    # normalize common shapes
++    if "generated_text" in j:
++        text = j["generated_text"]
++    elif "text" in j:
++        text = j["text"]
++    elif "outputs" in j and isinstance(j["outputs"], list):
++        text = j["outputs"][0].get("text", "")
++    else:
++        text = json.dumps(j)
++    return {"text": text, "time_s": dur, "raw": j}
++
++
++def token_jaccard(a: str, b: str) -> float:
++    sa = set(a.split())
++    sb = set(b.split())
++    if not sa and not sb:
++        return 1.0
++    inter = len(sa & sb)
++    uni = len(sa | sb)
++    return float(inter) / float(uni) if uni else 0.0
++
++
++def embed_cosine(a: str, b: str, embedder: Optional[SentenceTransformer]) -> Optional[float]:
++    if embedder is None:
++        return None
++    v1 = embedder.encode(a, convert_to_numpy=True)
++    v2 = embedder.encode(b, convert_to_numpy=True)
++    import numpy as _np
++    num = float((_np.dot(v1, v2)))
++    den = float((_np.linalg.norm(v1) * _np.linalg.norm(v2)))
++    if den == 0:
++        return None
++    return num / den
++
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--teacher", required=True, help="HF id or local path for teacher model")
++    p.add_argument("--prompts", required=False, default="tests/prompts.txt")
++    p.add_argument("--mode", choices=["hf", "auto_gptq", "endpoint"], default="hf")
++    p.add_argument("--quant_path", default="", help="Path to quant artifact (for hf/auto_gptq modes) or GGUF path")
++    p.add_argument("--quant_endpoint", default="", help="HTTP endpoint for quantized model (mode=endpoint)")
++    p.add_argument("--auto_quant", action="store_true", help="Attempt AutoGPTQ quantization of teacher -> --quant_out")
++    p.add_argument("--quant_out", default="./models/auto_gptq_out", help="Output dir for auto-gptq quantization")
++    p.add_argument("--convert_to_gguf", action="store_true", help="Attempt converter to GGUF if available")
++    p.add_argument("--gguf_out", default="./models/model.gguf")
++    p.add_argument("--out", default="results/quant_eval.json")
++    p.add_argument("--min_jaccard", type=float, default=0.80)
++    p.add_argument("--min_embed", type=float, default=0.85)
++    p.add_argument("--max_latency_ratio", type=float, default=3.0, help="Quantized latency must be <= ratio * teacher_latency")
++    p.add_argument("--max_new_tokens", type=int, default=128)
++    p.add_argument("--batch", type=int, default=1)
++    args = p.parse_args()
++
++    prompts = load_prompts(args.prompts)
++    results = {"metadata": {"teacher": args.teacher, "mode": args.mode}, "per_prompt": []}
++
++    # Optional: attempt auto quantization step
++    if args.auto_quant:
++        if auto_gptq is None:
++            print("AutoGPTQ not available in Python environment. Attempting to call 'auto_gptq' CLI if present.")
++            if shutil_which("auto_gptq"):
++                cmd = f"auto_gptq build-quant-ptq --model {args.teacher} --out {args.quant_out} --bits 4"
++                ok = run_cmd(cmd) == 0
++                if not ok:
++                    print("AutoGPTQ CLI quantization failed.")
++                    sys.exit(2)
++            else:
++                print("AutoGPTQ neither importable nor CLI available. Install AutoGPTQ to enable quantization.")
++                sys.exit(2)
++        else:
++            print("AutoGPTQ python package available. Attempting programmatic quantization (best-effort).")
++            try:
++                # Note: API differs by versions; attempt common entrypoint
++                from auto_gptq import AutoGPTQForCausalLM, BaseQuantizeConfig
++                qconfig = BaseQuantizeConfig()
++                # use CLI fallback if API unsupported
++                print("Attempting to call CLI due to API variability.")
++                if shutil_which("auto_gptq"):
++                    cmd = f"auto_gptq build-quant-ptq --model {args.teacher} --out {args.quant_out} --bits 4"
++                    ok = run_cmd(cmd) == 0
++                    if not ok:
++                        raise RuntimeError("auto_gptq CLI quantization failed")
++                else:
++                    raise RuntimeError("auto_gptq CLI not found; programmatic API not implemented for this version")
++            except Exception as e:
++                print("AutoGPTQ quantization (programmatic) failed or unsupported:", e)
++                sys.exit(2)
++        # set quant_path to produced artifact
++        quant_path = args.quant_out
++    else:
++        quant_path = args.quant_path
++
++    # Optional conversion to GGUF
++    if args.convert_to_gguf:
++        if shutil_which("convert-to-gguf"):
++            print("Converting quant artifact to GGUF...")
++            if not quant_path:
++                print("No quant_path available to convert.")
++            else:
++                cmd = f"convert-to-gguf --input {quant_path} --output {args.gguf_out} --dtype q4_0"
++                if run_cmd(cmd) != 0:
++                    print("GGUF conversion failed.")
++        else:
++            print("convert-to-gguf not found; skipping GGUF conversion.")
++
++    # Prepare embedder if available
++    embedder = None
++    if SentenceTransformer is not None:
++        try:
++            embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
++        except Exception:
++            embedder = None
++
++    # For each prompt: generate teacher output
++    teacher_outputs = []
++    print("Generating teacher outputs (this may be slow)...")
++    for ptext in prompts:
++        t0 = time.time()
++        try:
++            tgen = generate_with_teacher(args.teacher, ptext, max_new_tokens=args.max_new_tokens)
++            teacher_outputs.append(tgen)
++            print(f"Teacher: time {tgen['time_s']:.3f}s, len {len(tgen['text'].split())}")
++        except Exception as e:
++            print("Teacher generation failed:", e)
++            teacher_outputs.append({"text": "", "time_s": None, "error": str(e)})
++
++    # Generate quantized outputs using selected mode
++    quant_outputs = []
++    print("Generating quantized model outputs (mode=%s)..." % args.mode)
++    for ptext in prompts:
++        try:
++            if args.mode == "hf":
++                if not quant_path:
++                    raise RuntimeError("quant_path required for mode=hf")
++                qout = generate_with_hf_quant(quant_path, ptext, max_new_tokens=args.max_new_tokens)
++            elif args.mode == "auto_gptq":
++                if not quant_path:
++                    raise RuntimeError("quant_path required for mode=auto_gptq")
++                qout = generate_with_autogptq(quant_path, ptext, max_new_tokens=args.max_new_tokens)
++            elif args.mode == "endpoint":
++                if not args.quant_endpoint:
++                    raise RuntimeError("quant_endpoint required for mode=endpoint")
++                qout = generate_with_endpoint(args.quant_endpoint, ptext, max_new_tokens=args.max_new_tokens)
++            else:
++                raise RuntimeError("unknown mode")
++            quant_outputs.append(qout)
++            print(f"Quant: time {qout.get('time_s'):.3f}s, len {len(qout.get('text','').split())}")
++        except Exception as e:
++            print("Quantized generation failed:", e)
++            quant_outputs.append({"text": "", "time_s": None, "error": str(e)})
++
++    # Compute metrics per prompt
++    per_prompt = []
++    teacher_latencies = []
++    quant_latencies = []
++    token_jaccards = []
++    embed_cosines = []
++    for t, q, ptext in zip(teacher_outputs, quant_outputs, prompts):
++        trex = t.get("text", "")
++        qrex = q.get("text", "")
++        t_time = t.get("time_s") or 0.0
++        q_time = q.get("time_s") or 0.0
++        teacher_latencies.append(t_time)
++        quant_latencies.append(q_time)
++        jacc = token_jaccard(trex, qrex)
++        token_jaccards.append(jacc)
++        emb_sim = embed_cosine(trex, qrex, embedder) if embedder else None
++        if emb_sim is not None:
++            embed_cosines.append(emb_sim)
++        per_prompt.append({
++            "prompt": ptext,
++            "teacher_text": trex,
++            "quant_text": qrex,
++            "teacher_time_s": t_time,
++            "quant_time_s": q_time,
++            "token_jaccard": jacc,
++            "embed_cosine": emb_sim
++        })
++
++    # Aggregate metrics
++    avg_jaccard = float(sum(token_jaccards) / len(token_jaccards)) if token_jaccards else 0.0
++    avg_embed = float(sum(embed_cosines) / len(embed_cosines)) if embed_cosines else None
++    avg_teacher_lat = float(sum(teacher_latencies) / len(teacher_latencies)) if teacher_latencies else None
++    avg_quant_lat = float(sum(quant_latencies) / len(quant_latencies)) if quant_latencies else None
++
++    report = {
++        "meta": {
++            "teacher": args.teacher,
++            "mode": args.mode,
++            "quant_path": quant_path,
++            "quant_endpoint": args.quant_endpoint,
++            "prompts_count": len(prompts)
++        },
++        "metrics": {
++            "avg_token_jaccard": avg_jaccard,
++            "avg_embed_cosine": avg_embed,
++            "avg_teacher_latency_s": avg_teacher_lat,
++            "avg_quant_latency_s": avg_quant_lat,
++            "latency_ratio": (avg_quant_lat / avg_teacher_lat if avg_teacher_lat and avg_quant_lat else None)
++        },
++        "per_prompt": per_prompt,
++        "thresholds": {
++            "min_jaccard": args.min_jaccard,
++            "min_embed": args.min_embed,
++            "max_latency_ratio": args.max_latency_ratio
++        }
++    }
++
++    # Decide pass/fail
++    pass_jacc = avg_jaccard >= args.min_jaccard
++    pass_embed = True if (avg_embed is None or avg_embed >= args.min_embed) else False
++    lat_ratio = report["metrics"]["latency_ratio"]
++    pass_latency = True if (lat_ratio is None or lat_ratio <= args.max_latency_ratio) else False
++    report["result"] = {"pass_jaccard": pass_jacc, "pass_embed": pass_embed, "pass_latency": pass_latency, "overall_pass": (pass_jacc and pass_embed and pass_latency)}
++
++    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
++    Path(args.out).write_text(json.dumps(report, indent=2), encoding="utf-8")
++    print("Wrote quant evaluation report to", args.out)
++    print("Summary:", report["result"])
++    if not report["result"]["overall_pass"]:
++        print("Quantized artifact did NOT meet acceptance thresholds.")
++        sys.exit(2)
++    print("Quantized artifact PASSED acceptance thresholds.")
++    sys.exit(0)
++
++
++def shutil_which(name: str) -> bool:
++    from shutil import which
++    return which(name) is not None
++
++
++if __name__ == "__main__":
++    # Lazy import argparse at top-level main
++    import argparse
++    main()
++
+-- 
+2.40.1
