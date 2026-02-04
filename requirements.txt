@@ -1,0 +1,17 @@
+accelerate>=0.19.0
+transformers>=4.30.0
+datasets
+peft
+bitsandbytes
+auto-gptq
+torch>=2.0.0
+sentence-transformers
+faiss-cpu
+uvicorn
+fastapi
+pydantic
+opencv-python
+Pillow
+trl>=0.4.8
+safetensors
+einops
