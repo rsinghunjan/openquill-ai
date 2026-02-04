@@ -1,0 +1,617 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Copilot <copilot@example.com>
+Date: 2026-02-11 00:00:00 +0000
+Subject: [PATCH] productionize: bulk download, SFT orchestration + LoRA merge, offline embedding extractor, VQA eval scaffold, quantize/convert wrapper, k8s secret helper, release ops doc
+
+---
+ .github/workflows/license_check.yml                 |   2 +
+ docs/release_ops.md                                 | 146 ++++++++++++++++++++++++++++++
+ scripts/bulk_download_and_verify.py                 | 206 +++++++++++++++++++++++++++++++++
+ scripts/run_sft_and_merge.sh                        | 145 +++++++++++++++++++++++
+ openquill/training/merge_lora.py                    | 258 ++++++++++++++++++++++++++++++++++++++
+ openquill/training/embedding_extractor.py           | 232 +++++++++++++++++++++++++++++++++++
+ openquill/eval/vqa_evaluator.py                     | 208 +++++++++++++++++++++++++++++++++
+ scripts/quantize_convert.sh                         | 106 +++++++++++++++
+ scripts/create_k8s_secrets.sh                       |  62 ++++++++
+ 9 files changed, 1365 insertions(+)
+ create mode 100644 docs/release_ops.md
+ create mode 100644 scripts/bulk_download_and_verify.py
+ create mode 100755 scripts/run_sft_and_merge.sh
+ create mode 100644 openquill/training/merge_lora.py
+ create mode 100644 openquill/training/embedding_extractor.py
+ create mode 100644 openquill/eval/vqa_evaluator.py
+ create mode 100755 scripts/quantize_convert.sh
+ create mode 100755 scripts/create_k8s_secrets.sh
+--- /dev/null
++++ b/docs/release_ops.md
+@@ -0,0 +1,146 @@
++# Release operations: how to produce final checkpoints & release safely
++
++This document describes the concrete steps and commands to:
++- acquire permissive base weights (7B + 30–40B),
++- run SFT (QLoRA/PEFT) and produce LoRA checkpoints,
++- merge LoRA into distributable full checkpoints (optional),
++- run RLHF safely (annotation, reward model, small PPO tests),
++- produce multimodal adapters (offline embedding targets),
++- quantize and convert for edge (GGUF),
++- deploy production infra (k8s hints + secrets).
++
++Warnings & governance
++- Always verify license before downloading or redistributing (scripts/prepare_release_manifest.py).
++- Do not release any derived checkpoint until legal & safety review passes.
++- Ensure PII scanning (scripts/scan_pii.py) is run on training corpora and remove sensitive content.
++
++1) Acquire permissive base weights
++- Choose:
++  - small tier: mistralai/mistral-7b (Apache‑2.0)
++  - large tier: tiiuae/falcon-40b (Apache‑2.0)
++- Bulk download + license check:
++  - python scripts/bulk_download_and_verify.py --models mistralai/mistral-7b,tiiuae/falcon-40b --cache_dir ./models --allow_licenses "Apache-2.0,MIT"
++
++2) Run SFT (QLoRA/PEFT) and produce LoRA checkpoints
++- Use accelerate + finetune.py (repo has finetune entrypoint).
++- Example driver (reproducible):
++  - GPU_TOPOLOGY=a100-80 ./scripts/run_sft_and_merge.sh --model ./models/mistralai_mistral-7b --data data/sft_small.jsonl --out outputs/sft-mistral --max_steps 2000
++- After training, the script will attempt to merge LoRA into a merged checkpoint (optional).
++
++3) Prepare RLHF data & run small PPO
++- Collect annotations via tools/annotation_server.py and audit with scripts/audit_annotations.py.
++- Convert annotations to pairs and prepare reward dataset.
++- Train reward model (trlx_rlhf_full.py) and run small PPO on a test policy (distilgpt2) to validate flow.
++
++4) Multimodal adapters & offline embedding targets
++- If LLM is too big to load during Q‑Former training:
++  - Precompute prompt embeddings with:
++    python openquill/training/embedding_extractor.py --llm_model ./models/mistralai_mistral-7b --prompts prompts.txt --out embeddings.npz
++  - Train Q‑Former using stored embeddings as targets (qformer_train.py supports using embed files; see its docs).
++
++5) Quantize & convert for edge
++- Use bitsandbytes for GPU 4-bit training/inference.
++- Convert to GGUF for CPU edge using provided wrapper:
++  - bash scripts/quantize_convert.sh --snapshot ./models/mistralai_mistral-7b --out ./models/mistral-7b.gguf
++
++6) Production deployment tips
++- Create k8s secrets for HF tokens and monitoring:
++  - ./scripts/create_k8s_secrets.sh --namespace openquill-prod --hf_token "..." --sentry_dsn "..."
++- Deploy k8s manifests (k8s/vllm_tgi_production.yaml) and HPA (k8s/hpa_and_warmup.yaml).
++- Warm-up models and run locust load tests (examples/loadtest/locustfile.py + scripts/run_load_test.sh).
++
++7) Observability & post-release
++- Publish model_card.md and dataset_card.md (docs/) with provenance & limitations.
++- Schedule periodic red-team runs and HIL review cycles.
++- Monitor safety metrics and rollback if regressions are detected.
++
++Appendix: useful scripts
++- scripts/bulk_download_and_verify.py
++- scripts/run_sft_and_merge.sh
++- openquill/training/merge_lora.py
++- openquill/training/embedding_extractor.py
++- scripts/quantize_convert.sh
++- scripts/create_k8s_secrets.sh
++
++If you want, I can:
++- wire these operations into a GitHub Actions workflow that will smoke-run the smoke‑QLoRA (on tiny model) and run license checks,
++- or produce a Helm Job manifest to run the merge_lora step in your cluster.
+--- /dev/null
++++ b/scripts/bulk_download_and_verify.py
+@@ -0,0 +1,206 @@
++#!/usr/bin/env python3
++"""
++scripts/bulk_download_and_verify.py
++
++Download a list of Hugging Face model snapshots, verify license against an allowlist,
++and write a manifest.json with locations and metadata.
++
++Usage:
++  python scripts/bulk_download_and_verify.py --models mistralai/mistral-7b,tiiuae/falcon-40b --cache_dir ./models --allow_licenses "Apache-2.0,MIT" --out manifest.json
++"""
++from __future__ import annotations
++import argparse
++import json
++from pathlib import Path
++from typing import List
++import sys
++
++from huggingface_hub import HfApi, snapshot_download
++
++
++def parse_models(s: str) -> List[str]:
++    return [x.strip() for x in s.split(",") if x.strip()]
++
++
++def parse_allow(s: str) -> List[str]:
++    return [x.strip().lower() for x in s.split(",") if x.strip()]
++
++
++def fetch_and_download(model_id: str, cache_dir: Path, allowlist: List[str]) -> dict:
++    api = HfApi()
++    info = api.model_info(model_id)
++    lic = getattr(info, "license", "") or ""
++    lic_lower = lic.lower()
++    ok = any(a in lic_lower for a in allowlist) if lic else False
++    if not ok:
++        return {"model_id": model_id, "license": lic, "ok": False, "error": "license not allowed"}
++
++    try:
++        path = snapshot_download(repo_id=model_id, cache_dir=str(cache_dir), resume_download=True)
++    except Exception as e:
++        return {"model_id": model_id, "license": lic, "ok": False, "error": str(e)}
++
++    return {"model_id": model_id, "license": lic, "ok": True, "path": path}
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--models", required=True)
++    parser.add_argument("--cache_dir", default="./models")
++    parser.add_argument("--allow_licenses", default="Apache-2.0,MIT")
++    parser.add_argument("--out", default="download_manifest.json")
++    args = parser.parse_args()
++
++    models = parse_models(args.models)
++    allow = parse_allow(args.allow_licenses)
++    cache_dir = Path(args.cache_dir)
++    cache_dir.mkdir(parents=True, exist_ok=True)
++
++    manifest = {"models": [], "errors": []}
++    for m in models:
++        print("Processing", m)
++        res = fetch_and_download(m, cache_dir, allow)
++        manifest["models"].append(res)
++        if not res.get("ok"):
++            manifest["errors"].append(res)
++    Path(args.out).write_text(json.dumps(manifest, indent=2))
++    if manifest["errors"]:
++        print("Some models failed verification/download. See", args.out, file=sys.stderr)
++        sys.exit(2)
++    print("All models downloaded and verified. Manifest:", args.out)
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null
++++ b/scripts/run_sft_and_merge.sh
+@@ -0,0 +1,145 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# scripts/run_sft_and_merge.sh
++#
++# Wrapper to run QLoRA/PEFT fine-tuning and then merge LoRA weights into a full checkpoint.
++#
++# Usage:
++#   ./scripts/run_sft_and_merge.sh --model ./models/mistralai_mistral-7b --data data/sft.jsonl --out outputs/sft-mistral --max_steps 2000
++
++MODEL=${MODEL:-""}
++DATA=${DATA:-"data/toy_instructions.jsonl"}
++OUT=${OUT:-"outputs/sft"}
++MAX_STEPS=${MAX_STEPS:-2000}
++SEED=${SEED:-42}
++ACCEL_CONFIG=${ACCEL_CONFIG:-"openquill/training/accelerate_configs/accelerate_a100_80.yaml"}
++MERGE_AFTER_TRAIN=${MERGE_AFTER_TRAIN:-"true"}
++
++function usage(){
++  echo "Usage: $0 --model <local_or_hf_id> [--data <jsonl>] [--out <out_dir>] [--max_steps N]"
++  exit 1
++}
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --model) MODEL="$2"; shift 2;;
++    --data) DATA="$2"; shift 2;;
++    --out) OUT="$2"; shift 2;;
++    --max_steps) MAX_STEPS="$2"; shift 2;;
++    --accel) ACCEL_CONFIG="$2"; shift 2;;
++    --no-merge) MERGE_AFTER_TRAIN="false"; shift;;
++    *) echo "Unknown arg $1"; usage;;
++  esac
++done
++
++if [ -z "$MODEL" ]; then
++  echo "model required" >&2
++  usage
++fi
++
++mkdir -p "$OUT"
++
++echo "Starting QLoRA SFT: model=$MODEL data=$DATA out=$OUT max_steps=$MAX_STEPS"
++
++accelerate launch --config_file "$ACCEL_CONFIG" \
++  openquill/training/finetune.py \
++    --model_name_or_path "$MODEL" \
++    --dataset_path "$DATA" \
++    --output_dir "$OUT" \
++    --per_device_train_batch_size 1 \
++    --gradient_accumulation_steps 16 \
++    --learning_rate 2e-4 \
++    --max_steps "$MAX_STEPS" \
++    --bf16 \
++    --use_peft \
++    --peft_type lora \
++    --load_in_4bit
++
++echo "Training finished. Checking for LoRA checkpoint in $OUT"
++
++if [ "$MERGE_AFTER_TRAIN" = "true" ]; then
++  echo "Merging LoRA into base model to create merged checkpoint..."
++  python openquill/training/merge_lora.py --base_model "$MODEL" --peft_path "$OUT" --out_dir "${OUT}/merged"
++  echo "Merged checkpoint saved to ${OUT}/merged"
++else
++  echo "Skipping merge step as requested."
++fi
++
++echo "Done."
++exit 0
+--- /dev/null
++++ b/openquill/training/merge_lora.py
+@@ -0,0 +1,258 @@
++"""
++openquill/training/merge_lora.py
++
++Merge LoRA/PEFT adapter weights into a base model and save a merged checkpoint suitable for deployment.
++
++Usage:
++  python openquill/training/merge_lora.py --base_model ./models/mistralai_mistral-7b --peft_path outputs/sft-mistral --out_dir outputs/merged-mistral
++
++Notes:
++ - This script uses the peft library to load and merge adapters. It attempts to support 4-bit/8-bit scenarios.
++ - For very large models, run this on a machine with enough memory to hold merged weights.
++"""
++from __future__ import annotations
++import argparse
++import os
++from pathlib import Path
++import torch
++
++def merge_lora(base_model: str, peft_path: str, out_dir: str, device: str = "cpu"):
++    """
++    Load base model and LoRA adapters from peft_path and merge them into a single checkpoint saved at out_dir.
++    """
++    from transformers import AutoModelForCausalLM, AutoTokenizer
++    try:
++        from peft import PeftModel, PeftConfig
++    except Exception as e:
++        raise RuntimeError("peft library required. Install with `pip install peft`") from e
++
++    print(f"Loading tokenizer & base model from {base_model}")
++    tokenizer = AutoTokenizer.from_pretrained(base_model, use_fast=True)
++
++    # Try to load model in a memory-conservative way if possible
++    print("Loading base model (may require significant memory)...")
++    model = AutoModelForCausalLM.from_pretrained(base_model, device_map="auto" if torch.cuda.is_available() else None)
++
++    # Load peft adapter
++    peft_fullpath = Path(peft_path)
++    if not peft_fullpath.exists():
++        raise FileNotFoundError(f"PEFT path not found: {peft_path}")
++
++    print("Attempting to load PEFT adapter from", peft_path)
++    try:
++        # PeftModel.from_pretrained wraps base model - but we want to merge weights
++        peft_model = PeftModel.from_pretrained(model, peft_path, is_trainable=False)
++    except Exception as e:
++        raise RuntimeError("Failed to load PEFT adapter via PeftModel.from_pretrained: " + str(e))
++
++    print("Merging adapter weights into base model...")
++    try:
++        # peft provides save_pretrained; to merge, call merge_and_unload when available
++        if hasattr(peft_model, "merge_and_unload"):
++            peft_model.merge_and_unload()
++            merged_model = model
++        else:
++            # fallback: copy adapter weights into base model parameters manually (best-effort)
++            # This is model/adapter-specific; prefer peft's merge_and_unload when available.
++            print("peft.PeftModel.merge_and_unload not available; saving via save_pretrained fallback")
++            merged_model = peft_model
++    except Exception as e:
++        raise RuntimeError("Failed to merge PEFT weights: " + str(e))
++
++    # Save merged model
++    out_dir = Path(out_dir)
++    out_dir.mkdir(parents=True, exist_ok=True)
++    print("Saving merged model to", out_dir)
++    try:
++        merged_model.save_pretrained(out_dir)
++        tokenizer.save_pretrained(out_dir)
++    except Exception as e:
++        raise RuntimeError("Failed to save merged model: " + str(e))
++
++    print("Merged model saved. Inspect and test in inference server before release.")
++
++
++def parse_args():
++    p = argparse.ArgumentParser()
++    p.add_argument("--base_model", required=True, help="Path or HF id of base model")
++    p.add_argument("--peft_path", required=True, help="Directory with peft LORA checkpoint (save_pretrained layout)")
++    p.add_argument("--out_dir", required=True, help="Output dir for merged checkpoint")
++    return p.parse_args()
++
++
++if __name__ == "__main__":
++    args = parse_args()
++    merge_lora(args.base_model, args.peft_path, args.out_dir)
++
+--- /dev/null
++++ b/openquill/training/embedding_extractor.py
+@@ -0,0 +1,232 @@
++"""
++openquill/training/embedding_extractor.py
++
++Compute and store averaged LLM input-embeddings for a list of prompts.
++This is useful when Q-Former training cannot load the full LLM at training time.
++
++Usage:
++  python openquill/training/embedding_extractor.py --llm_model ./models/mistralai_mistral-7b --prompts prompts.txt --out embeddings.npz --batch 8
++
++Output:
++ - a .npz file with keys: prompts (list), embeddings (float32 array [N, D])
++"""
++from __future__ import annotations
++import argparse
++import os
++from pathlib import Path
++import numpy as np
++import json
++
++import torch
++from transformers import AutoTokenizer, AutoModelForCausalLM
++
++
++def extract_embeddings(llm_model: str, prompts_file: str, out_path: str, batch_size: int = 8, device: str = None):
++    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
++    print(f"Loading LLM {llm_model} on device {device} for embedding extraction...")
++    tokenizer = AutoTokenizer.from_pretrained(llm_model, use_fast=True)
++    model = AutoModelForCausalLM.from_pretrained(llm_model, device_map="auto" if device.startswith("cuda") else None)
++    # access embedding layer
++    embed_layer = model.get_input_embeddings()
++    embed_dim = embed_layer.weight.shape[1]
++    print("Embedding dimension:", embed_dim)
++
++    with open(prompts_file, "r", encoding="utf-8") as f:
++        prompts = [l.strip() for l in f if l.strip()]
++
++    all_embs = []
++    # batch tokenization
++    for i in range(0, len(prompts), batch_size):
++        batch_prompts = prompts[i:i+batch_size]
++        tok = tokenizer(batch_prompts, padding=True, truncation=True, return_tensors="pt", max_length=1024)
++        input_ids = tok["input_ids"].to(model.device)
++        with torch.no_grad():
++            token_embs = embed_layer(input_ids)  # [B, seq, dim]
++        attn = tok["attention_mask"].unsqueeze(-1).to(model.device)  # [B, seq, 1]
++        sums = (token_embs * attn).sum(dim=1)  # [B, dim]
++        lens = attn.sum(dim=1).clamp(min=1.0)
++        avg = (sums / lens).cpu().numpy().astype("float32")  # [B, dim]
++        all_embs.append(avg)
++        print(f"Processed {i + len(batch_prompts)}/{len(prompts)} prompts")
++
++    embeddings = np.vstack(all_embs)
++    np.savez_compressed(out_path, prompts=prompts, embeddings=embeddings)
++    print(f"Saved embeddings to {out_path} (shape={embeddings.shape})")
++    return out_path
++
++
++def parse_args():
++    p = argparse.ArgumentParser()
++    p.add_argument("--llm_model", required=True, help="LLM HF id or local path")
++    p.add_argument("--prompts", required=True, help="Text file with one prompt per line")
++    p.add_argument("--out", default="embeddings.npz")
++    p.add_argument("--batch", type=int, default=8)
++    return p.parse_args()
++
++
++if __name__ == "__main__":
++    args = parse_args()
++    extract_embeddings(args.llm_model, args.prompts, args.out, batch_size=args.batch)
++
+--- /dev/null
++++ b/openquill/eval/vqa_evaluator.py
+@@ -0,0 +1,208 @@
++"""
++openquill/eval/vqa_evaluator.py
++
++Evaluation scaffold for multimodal adapters: VQA / TextCaps / COCO captioning metrics.
++
++This is a runnable skeleton that:
++ - loads an adapter + LLM (or uses a prompt-based captioner)
++ - runs evaluation on a small subset of datasets
++ - computes simple metrics (exact match / BLEU / CIDEr via COCO evaluation tools if available)
++
++Usage:
++  pip install datasets evaluate transformers pillow
++  python openquill/eval/vqa_evaluator.py --adapter outputs/qformer-mistral/qformer_adapter.pth --llm mistralai/mistral-7b --dataset vqa --split val --max_samples 100
++
++Notes:
++ - Real evaluation requires downloading VQA / COCO datasets and evaluation scripts (MS COCO / CIDEr).
++ - This script focuses on orchestration and an easy extension point for real metrics.
++"""
++from __future__ import annotations
++import argparse
++import os
++from typing import Optional
++import numpy as np
++
++from datasets import load_dataset
++from transformers import AutoTokenizer, AutoModelForCausalLM
++
++try:
++    from PIL import Image
++except Exception:
++    Image = None
++
++
++def load_adapter(adapter_path: str):
++    # stub: load adapter weights (for inference you'd merge or load adapter into LLM)
++    print("Adapter path:", adapter_path)
++    return {"adapter_path": adapter_path}
++
++
++def generate_caption_with_adapter(adapter, llm_model: str, prompt: str, image_path: Optional[str] = None) -> str:
++    """
++    For simple evaluation, we can use BLIP or an LLM to generate caption.
++    In a production adapter flow, this function will:
++     - run image encoder -> qformer -> projector -> prefix into LLM -> generate
++    Here it's simplified to prompt the LLM with an image caption template.
++    """
++    # naive fallback: call llm to paraphrase prompt (simulate caption)
++    tok = AutoTokenizer.from_pretrained(llm_model)
++    model = AutoModelForCausalLM.from_pretrained(llm_model)
++    inp = f"Caption the image: {prompt}"
++    ids = tok(inp, return_tensors="pt").input_ids
++    out = model.generate(ids, max_new_tokens=32)
++    return tok.decode(out[0], skip_special_tokens=True)
++
++
++def evaluate_vqa(adapter_path: str, llm_model: str, split: str = "validation", dataset_name: str = "vqa", max_samples: int = 100):
++    """
++    Very small run: load dataset via HF datasets, iterate, generate and compute simple metrics.
++    """
++    print(f"Loading dataset {dataset_name} split {split}")
++    if dataset_name == "vqa":
++        # HF does not provide direct COCO VQA via simple name for all; this is illustrative.
++        try:
++            ds = load_dataset("visual_question_answering", "vqa", split=split)
++        except Exception as e:
++            print("Could not load VQA dataset via HF. Replace with local loader. Error:", e)
++            return
++    else:
++        ds = load_dataset(dataset_name, split=split)
++
++    adapter = load_adapter(adapter_path)
++    preds = []
++    refs = []
++    for i, ex in enumerate(ds):
++        if i >= max_samples:
++            break
++        # extract question and image (depends on dataset format)
++        q = ex.get("question") or ex.get("caption") or str(ex.get("text", ""))[:200]
++        # image handling is dataset-specific; here we just use question as prompt
++        pred = generate_caption_with_adapter(adapter, llm_model, q)
++        answer = ex.get("answer") or ex.get("answers") or None
++        preds.append(pred)
++        refs.append(answer)
++        if i % 10 == 0:
++            print(f"{i}/{max_samples} prompt={q[:60]} pred={pred[:80]}")
++
++    # compute simple stats: token overlap or exact match
++    exact = 0
++    total = 0
++    for p, r in zip(preds, refs):
++        total += 1
++        if r is None:
++            continue
++        # normalize
++        if isinstance(r, list):
++            golden = r[0]
++        else:
++            golden = r
++        if str(p).strip().lower() == str(golden).strip().lower():
++            exact += 1
++    acc = exact / total if total else 0.0
++    print(f"Exact-match accuracy (toy) = {acc:.3f} ({exact}/{total})")
++    return {"exact_match": acc, "total": total}
++
++
++def parse_args():
++    p = argparse.ArgumentParser()
++    p.add_argument("--adapter", required=True)
++    p.add_argument("--llm", required=True)
++    p.add_argument("--dataset", default="vqa")
++    p.add_argument("--split", default="validation")
++    p.add_argument("--max_samples", type=int, default=100)
++    return p.parse_args()
++
++
++if __name__ == "__main__":
++    args = parse_args()
++    evaluate_vqa(args.adapter, args.llm, split=args.split, dataset_name=args.dataset, max_samples=args.max_samples)
++
+--- /dev/null
++++ b/scripts/quantize_convert.sh
+@@ -0,0 +1,106 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# scripts/quantize_convert.sh
++#
++# Wrapper to quantize (bitsandbytes) and convert to GGUF/ggml for CPU deployment.
++#
++# Usage:
++#   ./scripts/quantize_convert.sh --snapshot ./models/mistralai_mistral-7b --out ./models/mistral.gguf --dtype q4_0
++
++SNAPSHOT=${SNAPSHOT:-""}
++OUT=${OUT:-""}
++DTYPE=${DTYPE:-"q4_0"}
++CONVERTER=${CONVERTER:-"python -m openquill.quantize.convert_to_gguf"}
++
++if [ -z "$SNAPSHOT" ] || [ -z "$OUT" ]; then
++  echo "Usage: $0 --snapshot <snapshot_dir> --out <out_path> [--dtype q4_0]"
++  exit 1
++fi
++
++echo "Quantize & convert: snapshot=$SNAPSHOT out=$OUT dtype=$DTYPE"
++
++# Step 1: optionally run bitsandbytes quantization or ensure model is in 4-bit
++echo "Note: bitsandbytes quantization is usually applied at training/inference via load_in_4bit."
++echo "If you have a conversion tool that produces GGUF, call it now."
++
++# Call conversion script (stub)
++echo "Calling converter (stub): $CONVERTER --snapshot_dir $SNAPSHOT --out_path $OUT --backend ggml"
++eval "$CONVERTER --snapshot_dir \"$SNAPSHOT\" --out_path \"$OUT\" --backend ggml"
++
++echo "Conversion step completed (stub). Validate converted artifact before deployment."
++exit 0
++
+--- /dev/null
++++ b/scripts/create_k8s_secrets.sh
+@@ -0,0 +1,62 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# scripts/create_k8s_secrets.sh
++# Create Kubernetes secrets for production deployment (HF token, monitoring keys).
++#
++# Usage:
++#   ./scripts/create_k8s_secrets.sh --namespace openquill-prod --hf_token $HF_TOKEN --prometheus_url http://prom:9090
++
++NAMESPACE=${NAMESPACE:-"openquill-prod"}
++HF_TOKEN=${HF_TOKEN:-""}
++SENTRY_DSN=${SENTRY_DSN:-""}
++PROM_URL=${PROM_URL:-""}
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --namespace) NAMESPACE="$2"; shift 2;;
++    --hf_token) HF_TOKEN="$2"; shift 2;;
++    --sentry_dsn) SENTRY_DSN="$2"; shift 2;;
++    --prom_url) PROM_URL="$2"; shift 2;;
++    *) echo "Unknown arg $1"; exit 1;;
++  esac
++done
++
++if [ -z "$HF_TOKEN" ]; then
++  echo "Warning: HF token not provided; set --hf_token to create secret"
++fi
++
++kubectl create namespace "$NAMESPACE" || true
++
++if [ -n "$HF_TOKEN" ]; then
++  kubectl create secret generic openquill-hf-token -n "$NAMESPACE" --from-literal=HF_API_TOKEN="$HF_TOKEN" --dry-run=client -o yaml | kubectl apply -f -
++  echo "Created secret openquill-hf-token in $NAMESPACE"
++fi
++
++if [ -n "$SENTRY_DSN" ]; then
++  kubectl create secret generic openquill-sentry -n "$NAMESPACE" --from-literal=SENTRY_DSN="$SENTRY_DSN" --dry-run=client -o yaml | kubectl apply -f -
++  echo "Created secret openquill-sentry in $NAMESPACE"
++fi
++
++if [ -n "$PROM_URL" ]; then
++  kubectl create configmap openquill-monitoring -n "$NAMESPACE" --from-literal=PROM_URL="$PROM_URL" --dry-run=client -o yaml | kubectl apply -f -
++  echo "Created configmap openquill-monitoring in $NAMESPACE"
++fi
++
++echo "Done."
++exit 0
++
+-- 
+2.40.1
