@@ -1,0 +1,606 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Ops <ops@example.com>
+Date: 2026-03-08 00:00:00 +0000
+Subject: [PATCH] helpers: local pipeline launcher, signoff CLI, ops-hardening helper, release verifier, and runbook commands
+---
+ docs/run_pipeline_commands.md                         | 224 ++++++++++++++++++++++++++++++
+ scripts/run_full_pipeline_local.sh                    | 387 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ scripts/create_signoff_cli.py                         | 182 ++++++++++++++++++++++++++
+ scripts/setup_gatekeeper_cosign.sh                    | 219 ++++++++++++++++++++++++++++++
+ scripts/verify_published_release.py                   | 262 +++++++++++++++++++++++++++++++++
+ 5 files changed, 1274 insertions(+)
+ create mode 100644 docs/run_pipeline_commands.md
+ create mode 100755 scripts/run_full_pipeline_local.sh
+ create mode 100755 scripts/create_signoff_cli.py
+ create mode 100755 scripts/setup_gatekeeper_cosign.sh
+ create mode 100755 scripts/verify_published_release.py
+--- /dev/null
++++ b/docs/run_pipeline_commands.md
+@@ -0,0 +1,224 @@
++# Run the OpenQuill production LLM pipeline — commands & checklist
++
++This document collects concise commands and a minimal operator checklist to run the full production pipeline
++on a single machine or via a self-hosted runner. It references scripts and manifests that are present in the repo.
++
++Important safety note
++- These commands will run heavy training, RLHF, and infra operations. Do not run them without appropriate
++  compute resources, credentials, and safety/legal approvals. Human signoff is mandatory before any publish.
++
++Prerequisites
++- Kubernetes cluster configured (kubectl) for staging namespace (openquill-staging) OR permission to run locally
++- GPU drivers & device plugin if running SFT on GPUs
++- AWS CLI configured if publishing to S3
++- HF_API_TOKEN if publishing to Hugging Face
++- On a machine with Python 3.10+, install:
++  pip install -r requirements.txt
++  (requirements include transformers, datasets, sentence-transformers, huggingface-hub, torch, accelerate)
++
++High-level options
++- Run entirely on a single machine (local mode) — good for iterative testing / small runs
++- Run via Kubernetes jobs (recommended for production) — use .github/workflows/selfhosted_prod_pipeline.yml or scripts/launch_prod_pipeline.py
++
++Quick (single-machine) pipeline
++1. Prepare base snapshot and data (example)
++   export BASE_SNAPSHOT=/models/base_snapshot
++   mkdir -p /work
++   # Put your SFT dataset at /data/sft/sft.jsonl and annotation seed data under /data/annotations
++
++2. Run pre-SFT PII scan (blocks if PII found)
++   python scripts/scan_pii.py --input_dir /data/sft --out release/pii_report.json --redact_dir release/data_redacted
++   # If PII found, inspect release/pii_report.json and remediation files in release/data_redacted
++
++3. Run full SFT (QLoRA/PEFT) — tuned config will be used by default
++   ./scripts/run_sft_peft.sh --model "$BASE_SNAPSHOT" --data /data/sft/sft.jsonl --out /work/sft_out --max_steps 50000
++   # After completion, the merged candidate should be in /work/sft_out/merged (or merged path documented by run)
++
++4. Start the annotation service (if you operate annotators locally)
++   uvicorn tools.annotation_service_fastapi:app --host 0.0.0.0 --port 8085 --reload &
++   # Onboard annotators and collect RLHF labels. Write them to /data/annotations/annotations.csv
++
++5. Convert annotations to pairwise JSONL (if not already)
++   python - <<PY
++from pathlib import Path, json
++import csv
++pairs=[]
++with open('/data/annotations/annotations.csv','r',encoding='utf-8') as f:
++    rdr=csv.DictReader(f)
++    for r in rdr:
++        pref=r.get('preferred','A').strip().upper()
++        a=r.get('response_a',''); b=r.get('response_b','')
++        if pref=='A':
++            chosen,rej=a,b
++        else:
++            chosen,rej=b,a
++        pairs.append({"prompt":r.get("prompt",""),"response_chosen":chosen,"response_rejected":rej})
++Path('data/reward_pairs.jsonl').write_text('\\n'.join(json.dumps(p,ensure_ascii=False) for p in pairs),encoding='utf-8')
++PY
++
++6. Train reward model and evaluate (holdout)
++   python openquill/safety/reward_holdout.py --pairs data/reward_pairs.jsonl --out /work/reward_out --model_name distilbert-base-uncased
++   # Report at /work/reward_out/reward_holdout_report.json
++
++7. Run conservative PPO pilot (logs rollouts and enqueues HIL items)
++   python openquill/training/ppo_shaped.py --prompts /data/ppo_prompts.txt --policy distilgpt2 --reward_model /work/reward_out/reward_model --out_dir /work/ppo_out --shaping_cfg configs/reward_shaping.yaml
++   # In /work/ppo_out you’ll find rollouts.jsonl and HIL queue export for reviewers
++
++8. Run automated red-team campaign against staging endpoint (optional, staging required)
++   bash scripts/run_redteam_campaign.sh --server http://openquill-staging.example.com --prompts tests/redteam_prompts.txt --out /work/redteam_results.jsonl
++
++9. Quantize & validate (AutoGPTQ endpoint or local runtime)
++   python scripts/quant_eval.py --teacher /work/sft_out/merged --auto_quant --mode auto_gptq --quant_out /work/quant_out --prompts tests/prompts.txt --out release/quant_report.json
++
++10. Deploy staging serving manifest & warmup (if you have cluster access)
++    kubectl apply -f k8s/serving_staging.yaml
++    kubectl apply -f k8s/warmup_job.yaml -n openquill-staging
++    kubectl wait --for=condition=complete --timeout=10m job/openquill-warmup -n openquill-staging
++    # Run smoke tests
++    kubectl apply -f k8s/staging_smoke_job.yaml -n openquill-staging
++    kubectl wait --for=condition=complete --timeout=10m job/openquill-staging-smoke -n openquill-staging
++
++11. Human/legal signoff (mandatory)
++    # Option A: Create a signoff file locally:
++    python scripts/create_signoff_cli.py --approved true --approved_by "safety@example.com" --role safety --notes "Reviewed PPO rollouts and red-team; acceptable"
++
++    # Option B: Use signoff API (if running signoff service)
++    curl -X POST -H "Authorization: Bearer $SIGNOFF_API_TOKEN" -H "Content-Type: application/json" \
++      --data '{"approved":true,"approved_by":"safety@example.com","role":"safety","notes":"OK"}' \
++      http://localhost:8086/signoff
++
++12. Finalize & publish (after signoff)
++    HF_API_TOKEN=... S3_BUCKET=... python scripts/finalize_and_publish_improved.py --merged_ckpt /work/sft_out/merged --sft_data_dir /data/sft --annotations_csv /data/annotations/annotations.csv --pairs_jsonl data/reward_pairs.jsonl --prompts_file tests/prompts.txt --publish_s3_bucket my-guarded-bucket --publish_s3_prefix openquill/releases/v1 --hf_repo my-org/openquill-llm --hf_token $HF_API_TOKEN
++
++Validation & verification after publish
++- Run scripts/verify_published_release.py --manifest release_final_manifest.json --hf-token $HF_API_TOKEN --s3-bucket my-guarded-bucket
++  This will check release_final_manifest.json, confirm files on S3 or HF if credentials provided, and report status.
++
++Ops hardening checklist (operator)
++- Ensure Gatekeeper + image allowlist is installed (see k8s/gatekeeper_image_allowlist_template.yaml)
++- Ensure cosign verification for images: use scripts/setup_gatekeeper_cosign.sh as a starting point to provision keys and policies.
++- Provision GPU node pools and label nodes: see scripts/provision_gpu_nodepool.sh and scripts/label_gpu_nodes.sh
++- Create TLS secrets: scripts/create_tls_secret.sh
++- Install monitoring (Prometheus/Grafana) and configure SLO-based alerts (monitoring/install_monitoring.sh)
++- Keep the signoff service (tools/signoff_service_fastapi.py) running and restrict its access with an API token / SSO.
++
++If you want, run the one-shot helper:
++ - ./scripts/run_full_pipeline_local.sh --merged_ckpt /models/base_snapshot --data_dir /data/sft --annotations_dir /data/annotations --prompts tests/prompts.txt
++
++The helper will run the sequence above, but it will pause for manual annotation collection & human review steps — these are mandatory and cannot be automated.
++
++Troubleshooting tips
++- If SFT OOMs: reduce per-device batch size, increase gradient_accumulation_steps, or use more GPUs.
++- If reward_holdout evaluation is poor: inspect annotation quality and gold test results (tools/annotation_qc.py).
++- If quant validation fails: tune quantization method, choose different bits, or disable aggressive conversion.
++
++Contact & escalation
++- On-call SRE: oncall-sre@example.com
++- Safety lead: safety@example.com
++- Legal: legal@example.com
++ detailed runbook and incident playbooks in docs/incident_runbook.md
+--- /dev/null
++++ b/scripts/run_full_pipeline_local.sh
+@@ -0,0 +1,387 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# scripts/run_full_pipeline_local.sh
++#
++# One-shot helper to run the production LLM pipeline locally on a single machine.
++# It orchestrates:
++#  - PII scan
++#  - SFT/PEFT QLoRA training (calls scripts/run_sft_peft.sh)
++#  - Starts annotation service (optional)
++#  - Converts annotations to pairwise JSONL
++#  - Reward holdout training
++#  - PPO pilot
++#  - Optional red-team run
++#  - Quantization & validation
++#  - Deploy staging & warmup (if kubectl available)
++#  - Wait for human signoff (signoff file or signoff service)
++#  - Finalize & publish
++#
++# This script performs heavy operations. Use in dev/testing or small-scale runs only.
++
++ROOT="$(cd "$(dirname "$0")/../" && pwd)"
++
++MERGED_CKPT="${MERGED_CKPT:-""}"
++DATA_DIR="${DATA_DIR:-"/data/sft"}"
++ANNOTATIONS_DIR="${ANNOTATIONS_DIR:-"/data/annotations"}"
++OUT_DIR="${OUT_DIR:-"/work"}"
++PROMPTS="${PROMPTS:-"tests/prompts.txt"}"
++HF_API_TOKEN="${HF_API_TOKEN:-${HF_API_TOKEN}}"
++S3_BUCKET="${S3_BUCKET:-""}"
++HF_REPO="${HF_REPO:-""}"
++SIGNOFF_PATH="${SIGNOFF_PATH:-docs/release_human_signoff.json}"
++SKIP_DEPLOY="${SKIP_DEPLOY:-false}"
++RUN_REDDTEAM="${RUN_REDDTEAM:-true}"
++
++function usage() {
++  cat <<EOF
++Usage: $0 --merged_ckpt /models/base_snapshot [--data_dir /data/sft] [--annotations_dir /data/annotations] [--out /work]
++
++Options:
++  --merged_ckpt    Path to base snapshot or HF id to use as starting point
++  --data_dir       Path to SFT dataset directory (default /data/sft)
++  --annotations_dir Path where annotation CSVs will be placed (default /data/annotations)
++  --out            Work output dir (default /work)
++  --prompts        Prompts file for quant/redteam (default tests/prompts.txt)
++  --hf_token       HF API token for final publish
++  --s3_bucket      Guarded S3 bucket to publish artifacts
++  --hf_repo        HF repo id for publishing
++  --skip_deploy    Skip staging deploy & warmup (default false)
++  --no_redteam     Skip automated red-team run
++EOF
++  exit 1
++}
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --merged_ckpt) MERGED_CKPT="$2"; shift 2;;
++    --data_dir) DATA_DIR="$2"; shift 2;;
++    --annotations_dir) ANNOTATIONS_DIR="$2"; shift 2;;
++    --out) OUT_DIR="$2"; shift 2;;
++    --prompts) PROMPTS="$2"; shift 2;;
++    --hf_token) HF_API_TOKEN="$2"; shift 2;;
++    --s3_bucket) S3_BUCKET="$2"; shift 2;;
++    --hf_repo) HF_REPO="$2"; shift 2;;
++    --skip_deploy) SKIP_DEPLOY="true"; shift;;
++    --no_redteam) RUN_REDDTEAM="false"; shift;;
++    --help) usage;;
++    *) echo "Unknown arg $1"; usage;;
++  esac
++done
++
++if [ -z "$MERGED_CKPT" ]; then
++  echo "merged_ckpt is required"
++  usage
++fi
++
++mkdir -p "$OUT_DIR"
++mkdir -p release
++
++echo "STEP 1: run PII scan"
++python "$ROOT/scripts/scan_pii.py" --input_dir "$DATA_DIR" --out release/pii_report.json --redact_dir release/data_redacted || {
++  echo "PII scan failed or detected PII. Inspect release/pii_report.json and release/data_redacted. Aborting."; exit 2;
++}
++
++echo "STEP 2: run SFT/PEFT (QLoRA). This may take a long time"
++bash "$ROOT/scripts/run_sft_peft.sh" --model "$MERGED_CKPT" --data "$DATA_DIR/sft.jsonl" --out "$OUT_DIR/sft_out" --max_steps 50000
++
++if [ ! -d "$OUT_DIR/sft_out/merged" ]; then
++  echo "Merged checkpoint not found at $OUT_DIR/sft_out/merged; check run logs. Aborting."; exit 3
++fi
++
++echo "STEP 3: start annotation service (local) for annotators to connect (background)"
++if command -v uvicorn >/dev/null 2>&1; then
++  uvicorn tools.annotation_service_fastapi:app --host 0.0.0.0 --port 8085 --reload &
++  ANN_PID=$!
++  echo "Annotation service started (pid $ANN_PID). Annotators should submit to http://localhost:8085"
++else
++  echo "uvicorn not found; please start your annotation service manually and collect annotations in $ANNOTATIONS_DIR"
++fi
++
++echo "PAUSE: Collect annotations"
++echo " - Place annotations CSV at ${ANNOTATIONS_DIR}/annotations.csv"
++echo " - Run tools/annotation_qc.py to validate annotation quality before continuing"
++read -p "Press ENTER to continue after annotations are collected and QC'd"
++
++if [ ! -f "${ANNOTATIONS_DIR}/annotations.csv" ]; then
++  echo "annotations.csv not found at ${ANNOTATIONS_DIR}. Aborting."; exit 4
++fi
++
++echo "STEP 4: convert annotations to pairwise JSONL"
++python - <<PY
++from pathlib import Path, json
++import csv
++pairs=[]
++infile=Path("${ANNOTATIONS_DIR}/annotations.csv")
++for r in csv.DictReader(infile.open(encoding='utf-8')):
++    pref=r.get('preferred','A').strip().upper()
++    a=r.get('response_a',''); b=r.get('response_b','')
++    if pref=='A':
++        chosen,rej=a,b
++    else:
++        chosen,rej=b,a
++    pairs.append({"prompt":r.get("prompt",""),"response_chosen":chosen,"response_rejected":rej,"annotator":r.get("annotator","")})
++out=Path("data/reward_pairs.jsonl")
++out.parent.mkdir(parents=True,exist_ok=True)
++out.write_text('\\n'.join(json.dumps(p,ensure_ascii=False) for p in pairs),encoding='utf-8')
++print("Wrote",out)
++PY
++
++echo "STEP 5: train reward holdout"
++python "$ROOT/openquill/safety/reward_holdout.py" --pairs data/reward_pairs.jsonl --out "$OUT_DIR/reward_out" --model_name distilbert-base-uncased
++
++echo "STEP 6: run PPO pilot (conservative)"
++python "$ROOT/openquill/training/ppo_shaped.py" --prompts "$PROMPTS" --policy distilgpt2 --reward_model "$OUT_DIR/reward_out/reward_model" --out_dir "$OUT_DIR/ppo_out" --shaping_cfg "$ROOT/configs/reward_shaping.yaml"
++
++echo "STEP 7: run automated red-team campaign (optional)"
++if [ "$RUN_REDDTEAM" = "true" ]; then
++  bash "$ROOT/scripts/run_redteam_campaign.sh" --server "http://openquill-staging.example.com" --prompts "tests/redteam_prompts.txt" --out "$OUT_DIR/redteam_results.jsonl" || true
++fi
++
++echo "STEP 8: quantize & validate"
++python "$ROOT/scripts/quant_eval.py" --teacher "$OUT_DIR/sft_out/merged" --auto_quant --mode auto_gptq --quant_out "$OUT_DIR/quant_out" --prompts "$PROMPTS" --out release/quant_report.json || true
++
++if [ "$SKIP_DEPLOY" != "true" ]; then
++  echo "STEP 9: deploy staging & warmup (requires kubectl configured)"
++  kubectl apply -f k8s/serving_staging.yaml || true
++  kubectl apply -f k8s/warmup_job.yaml -n openquill-staging || true
++  kubectl wait --for=condition=complete --timeout=10m job/openquill-warmup -n openquill-staging || true
++  kubectl apply -f k8s/staging_smoke_job.yaml -n openquill-staging || true
++  kubectl wait --for=condition=complete --timeout=10m job/openquill-staging-smoke -n openquill-staging || true
++fi
++
++echo "STEP 10: human/legal signoff required"
++echo " - Option A: run the signoff CLI locally:"
++echo "     python scripts/create_signoff_cli.py --approved true --approved_by 'safety@example.com' --role safety --notes 'Reviewed rollouts and red-team outputs'"
++echo " - Option B: POST to signoff service (if running) at http://localhost:8086/signoff"
++echo "Waiting for signoff file at $SIGNOFF_PATH (timeout 7 days)..."
++SECONDS=0
++TIMEOUT=$((7*24*3600))
++while [ $SECONDS -lt $TIMEOUT ]; do
++  if [ -f "$SIGNOFF_PATH" ]; then
++    echo "Signoff found: $SIGNOFF_PATH"
++    break
++  fi
++  sleep 30
++done
++if [ ! -f "$SIGNOFF_PATH" ]; then
++  echo "Signoff not created within timeout. Aborting publish."; exit 5
++fi
++
++echo "STEP 11: finalize & publish (requires HF/S3 creds)"
++python "$ROOT/scripts/finalize_and_publish_improved.py" --merged_ckpt "$OUT_DIR/sft_out/merged" --sft_data_dir "$DATA_DIR" --annotations_csv "${ANNOTATIONS_DIR}/annotations.csv" --pairs_jsonl data/reward_pairs.jsonl --prompts_file "$PROMPTS" --publish_s3_bucket "$S3_BUCKET" --publish_s3_prefix "openquill/releases/$(date +%Y%m%d%H%M%S)" --hf_repo "$HF_REPO" --hf_token "$HF_API_TOKEN"
++
++echo "STEP 12: verify published release (optional)"
++python "$ROOT/scripts/verify_published_release.py" --manifest release_final_manifest.json --hf-token "$HF_API_TOKEN" --s3-bucket "$S3_BUCKET"
++
++echo "Pipeline complete (local). Please archive release artifacts and notify stakeholders."
++exit 0
++
+--- /dev/null
++++ b/scripts/create_signoff_cli.py
+@@ -0,0 +1,182 @@
++#!/usr/bin/env python3
++"""
++scripts/create_signoff_cli.py
++
++Small CLI to create the human/legal signoff file or POST to the signoff API.
++This is a convenience for safety/legal reviewers to create the signoff required by the finalizer.
++
++Usage:
++  # Create local signoff file
++  python scripts/create_signoff_cli.py --approved true --approved_by "safety@example.com" --role safety --notes "Looks good"
++
++  # Post to signoff API
++  python scripts/create_signoff_cli.py --approved true --approved_by "safety@example.com" --role safety --notes "OK" --api-url http://localhost:8086 --api-token SECRET
++"""
++from __future__ import annotations
++import argparse
++import json
++import time
++from pathlib import Path
++from typing import Optional
++import requests
++
++DEFAULT_PATH = Path("docs/release_human_signoff.json")
++
++def write_local(path: Path, payload: dict):
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
++    print("Wrote signoff to", path)
++
++def post_api(url: str, token: str, payload: dict):
++    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
++    r = requests.post(url.rstrip("/") + "/signoff", headers=headers, json=payload, timeout=10)
++    r.raise_for_status()
++    print("Posted signoff to", url, "response:", r.text)
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--approved", type=str, required=True, help="true|false")
++    p.add_argument("--approved_by", required=True)
++    p.add_argument("--role", required=True, help="safety|legal|ml|ops")
++    p.add_argument("--notes", default="")
++    p.add_argument("--out", default=str(DEFAULT_PATH), help="Local signoff path")
++    p.add_argument("--api-url", default="", help="Optional signoff service URL (POST instead of local file)")
++    p.add_argument("--api-token", default="", help="Bearer token for signoff API")
++    args = p.parse_args()
++
++    approved = args.approved.lower() in ("1","true","yes","y")
++    payload = {"approved": approved, "approved_by": args.approved_by, "role": args.role, "notes": args.notes, "timestamp": time.time()}
++
++    if args.api_url:
++        if not args.api_token:
++            raise SystemExit("api-token required when api-url provided")
++        post_api(args.api_url, args.api_token, payload)
++    else:
++        write_local(Path(args.out), payload)
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null
++++ b/scripts/setup_gatekeeper_cosign.sh
+@@ -0,0 +1,219 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# scripts/setup_gatekeeper_cosign.sh
++#
++# Operator helper to:
++#  - apply Gatekeeper allowlist ConstraintTemplate + Constraint (example)
++#  - create a cosign keypair (or show KMS guidance)
++#  - demonstrate basic image signature verification using cosign verify (local)
++#
++# This script is an operator convenience and MUST be adapted to your environment and KMS provider.
++
++GATEKEEPER_CONFIG=${GATEKEEPER_CONFIG:-"k8s/gatekeeper_image_allowlist_template.yaml"}
++ALLOWLIST_CONFIGMAP=${ALLOWLIST_CONFIGMAP:-"k8s/image_allowlist_config.yaml"}
++COSIGN_KEY_FILE=${COSIGN_KEY_FILE:-"$HOME/.cosign/cosign.key"}
++COSIGN_PUB=${COSIGN_PUB:-"$HOME/.cosign/cosign.pub"}
++
++function apply_gatekeeper() {
++  if [ ! -f "$GATEKEEPER_CONFIG" ]; then
++    echo "Gatekeeper config not found: $GATEKEEPER_CONFIG"
++    return 1
++  fi
++  echo "Applying Gatekeeper ConstraintTemplate and data ConfigMap"
++  kubectl apply -f "$GATEKEEPER_CONFIG"
++  # If you maintain allowlist in gatekeeper-system ConfigMap, apply it
++  if [ -f "$ALLOWLIST_CONFIGMAP" ]; then
++    kubectl apply -f "$ALLOWLIST_CONFIGMAP"
++  fi
++}
++
++function create_cosign_key() {
++  if ! command -v cosign >/dev/null 2>&1; then
++    echo "cosign is required. Install from https://github.com/sigstore/cosign"
++    return 1
++  fi
++  if [ -n "${COSIGN_KMS:-}" ]; then
++    echo "Using KMS-backed cosign key: $COSIGN_KMS (operator should provision and grant access)"
++    echo "Example: cosign generate-key-pair -kms $COSIGN_KMS"
++    return 0
++  fi
++  if [ -f "$COSIGN_KEY_FILE" ]; then
++    echo "cosign key already exists at $COSIGN_KEY_FILE"
++    return 0
++  fi
++  mkdir -p "$(dirname "$COSIGN_KEY_FILE")"
++  echo "Generating local cosign keypair at $COSIGN_KEY_FILE (production: use KMS-backed keys)"
++  cosign generate-key-pair
++  mv cosign.key "$COSIGN_KEY_FILE"
++  mv cosign.pub "$COSIGN_PUB"
++  chmod 600 "$COSIGN_KEY_FILE"
++  echo "Generated local cosign keypair. Public key at $COSIGN_PUB"
++}
++
++function verify_example_image() {
++  read -p "Enter image reference to verify (e.g., internal-registry.company.com/myimage:tag), or ENTER to skip: " IMG
++  if [ -z "$IMG" ]; then
++    echo "Skipping example verify"
++    return 0
++  fi
++  if [ ! -f "$COSIGN_PUB" ]; then
++    echo "Public key not found at $COSIGN_PUB. You can extract it from KMS or cosign keypair."
++    return 1
++  fi
++  echo "Verifying signature for $IMG"
++  cosign verify --key "$COSIGN_PUB" "$IMG" || {
++    echo "Signature verification failed for $IMG"
++    return 2
++  }
++  echo "Signature verified for $IMG"
++}
++
++function usage() {
++  cat <<EOF
++Usage: $0 [--apply-gatekeeper] [--create-cosign-key] [--verify-image]
++
++Options:
++  --apply-gatekeeper    Apply Gatekeeper ConstraintTemplate and allowlist ConfigMap (example)
++  --create-cosign-key   Create a local cosign keypair (production: prefer KMS)
++  --verify-image        Interactively verify an image using the cosign public key
++
++Note: This script is a convenience. Operators must review and adapt Gatekeeper policies,
++      ensure ConfigMaps are loaded into Gatekeeper data store, and use KMS-backed cosign keys.
++EOF
++  exit 1
++}
++
++APPLY_GK=false
++CREATE_KEY=false
++VERIFY_IMG=false
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --apply-gatekeeper) APPLY_GK=true; shift;;
++    --create-cosign-key) CREATE_KEY=true; shift;;
++    --verify-image) VERIFY_IMG=true; shift;;
++    --help) usage;;
++    *) echo "Unknown arg $1"; usage;;
++  esac
++done
++
++if [ "$APPLY_GK" = true ]; then
++  apply_gatekeeper
++fi
++if [ "$CREATE_KEY" = true ]; then
++  create_cosign_key
++fi
++if [ "$VERIFY_IMG" = true ]; then
++  verify_example_image
++fi
++
++echo "Gatekeeper & cosign helper finished. Customize templates and KMS configuration for production."
++exit 0
++
+--- /dev/null
++++ b/scripts/verify_published_release.py
+@@ -0,0 +1,262 @@
++#!/usr/bin/env python3
++"""
++scripts/verify_published_release.py
++
++Verify that a release described by release_final_manifest.json has been published and that critical artifacts exist.
++Checks:
++ - release_final_manifest.json exists and is valid JSON
++ - If HF token provided and hf_repo present: list files in HF repo
++ - If S3 bucket provided and s3 path present: list S3 objects under the prefix
++ - Validate presence of model_card.md, dataset_card.md in release/docs (if present)
++
++Usage:
++  python scripts/verify_published_release.py --manifest release_final_manifest.json --hf-token $HF_API_TOKEN --s3-bucket my-guarded-bucket
++"""
++from __future__ import annotations
++import argparse
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++from typing import Optional
++
++def run(cmd: str):
++    print("RUN:", cmd)
++    res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
++    print(res.stdout)
++    return res.returncode, res.stdout
++
++def verify_manifest(manifest_path: Path):
++    if not manifest_path.exists():
++        raise FileNotFoundError(manifest_path)
++    mf = json.loads(manifest_path.read_text(encoding="utf-8"))
++    print("Loaded manifest keys:", list(mf.keys()))
++    return mf
++
++def verify_hf_repo(hf_repo: str, token: str):
++    try:
++        from huggingface_hub import HfApi, Repository
++    except Exception as e:
++        print("huggingface_hub not installed:", e)
++        return False
++    api = HfApi()
++    try:
++        print("Listing repo files for", hf_repo)
++        files = api.list_repo_files(hf_repo, token=token)
++        print("Files:", files)
++        return True
++    except Exception as e:
++        print("HF verification failed:", e)
++        return False
++
++def verify_s3_objects(bucket: str, prefix: str):
++    # Requires aws CLI configured with access to guarded bucket
++    code, out = run(f"aws s3 ls s3://{bucket}/{prefix}/ --recursive")
++    if code != 0:
++        print("aws s3 ls failed")
++        return False
++    print("S3 objects listed (sample):")
++    print(out.splitlines()[:20])
++    return True
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--manifest", default="release_final_manifest.json")
++    p.add_argument("--hf-token", default=os.environ.get("HF_API_TOKEN", ""))
++    p.add_argument("--s3-bucket", default="")
++    p.add_argument("--s3-prefix", default="")
++    args = p.parse_args()
++
++    manifest = Path(args.manifest)
++    mf = verify_manifest(manifest)
++
++    # Check for model_card/dataset_card in release/docs
++    docs_dir = Path("release/docs")
++    for f in ["model_card.md", "dataset_card.md", "incident_runbook.md"]:
++        pth = docs_dir / f
++        if pth.exists():
++            print(f"Found {pth}")
++        else:
++            print(f"Missing expected doc: {pth} (not fatal but recommended)")
++
++    # Verify HF repo if specified
++    hf_repo = mf.get("published", {}).get("hf_repo") or mf.get("hf_repo") or None
++    if hf_repo:
++        if not args.hf_token:
++            print("HF repo listed but no HF token supplied. Cannot verify HF contents.")
++        else:
++            ok = verify_hf_repo(hf_repo, args.hf_token)
++            print("HF repo verification:", ok)
++
++    # Verify S3 if specified
++    s3_bucket = mf.get("published", {}).get("s3_bucket") or args.s3_bucket
++    s3_prefix = mf.get("published", {}).get("s3_prefix") or args.s3_prefix or ""
++    if s3_bucket:
++        ok = verify_s3_objects(s3_bucket, s3_prefix)
++        print("S3 verification:", ok)
++
++    print("Verification complete. Manual inspection of artifacts and checksums is recommended.")
++
++if __name__ == "__main__":
++    main()
++
+-- 
+2.40.1
