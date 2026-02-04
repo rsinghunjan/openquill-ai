@@ -1,0 +1,450 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Ops <ops@example.com>
+Date: 2026-02-14 00:00:00 +0000
+Subject: [PATCH] production orchestration scripts: full pipeline, RLHF runner wrapper, firecracker-containerd guide, legal signoff template, release validation helper
+
+---
+ scripts/full_production_pipeline.sh                 | 325 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ scripts/run_rlhf_pipeline.sh                         | 214 +++++++++++++++++++++++++++++++++++++++
+ scripts/deploy_firecracker_containerd_guide.sh       | 209 +++++++++++++++++++++++++++++++++++++
+ docs/legal_signoff_template.json                     |  78 ++++++++++
+ scripts/validate_release_and_publish.sh              | 171 ++++++++++++++++++++++++++++++
+ 5 files changed, 997 insertions(+)
+ create mode 100755 scripts/full_production_pipeline.sh
+ create mode 100755 scripts/run_rlhf_pipeline.sh
+ create mode 100755 scripts/deploy_firecracker_containerd_guide.sh
+ create mode 100644 docs/legal_signoff_template.json
+ create mode 100755 scripts/validate_release_and_publish.sh
+--- /dev/null
++++ b/scripts/full_production_pipeline.sh
+@@ -0,0 +1,325 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# scripts/full_production_pipeline.sh
++#
++# Top-level orchestration for taking OpenQuill from base model choice -> staged release.
++# This script wires together the pieces already in the repo and documents what is manual
++# vs. automated. It must be run by an operator with credentials for HF/S3 and cluster access.
++#
++# NOT a fully-automatic pipeline: many steps require human review (legal, safety, HIL).
++#
++# Usage (example):
++#   HF_API_TOKEN=... S3_BUCKET=my-bucket ./scripts/full_production_pipeline.sh
++
++ROOT_DIR=$(cd "$(dirname "$0")/../" && pwd)
++echo "OpenQuill production pipeline orchestrator"
++echo "Root dir: $ROOT_DIR"
++
++# Operator-configurable variables (export in env or override here)
++HF_API_TOKEN=${HF_API_TOKEN:-""}
++S3_BUCKET=${S3_BUCKET:-""}
++S3_PREFIX=${S3_PREFIX:-"openquill/snapshots"}
++MODEL_LIST=${MODEL_LIST:-"mistralai/mistral-7b,tiiuae/falcon-40b,togethercomputer/RedPajama-INCITE-7B-v1"}
++CACHE_DIR=${CACHE_DIR:-"$ROOT_DIR/models"}
++SFT_DATA=${SFT_DATA:-"$ROOT_DIR/data/sft.jsonl"}
++SFT_OUT=${SFT_OUT:-"$ROOT_DIR/outputs/sft"}
++ANNOTATIONS_OUT=${ANNOTATIONS_OUT:-"$ROOT_DIR/annotations/annotations.csv"}
++ANNOTATION_GOLD=${ANNOTATION_GOLD:-"$ROOT_DIR/annotations/gold_tests.json"}
++EMBED_PROMPTS=${EMBED_PROMPTS:-"$ROOT_DIR/data/embed_prompts.txt"}
++EMBED_OUT=${EMBED_OUT:-"$ROOT_DIR/outputs/embeddings.npz"}
++QFORMER_OUT=${QFORMER_OUT:-"$ROOT_DIR/outputs/qformer"}
++MERGED_DIR=${MERGED_DIR:-"$SFT_OUT/merged"}
++QUANT_OUT=${QUANT_OUT:-"$ROOT_DIR/models/quantized/mistral.gguf"}
++
++function require_env() {
++  for v in "$@"; do
++    if [ -z "${!v:-}" ]; then
++      echo "Environment variable $v is required. Set and re-run."
++      exit 2
++    fi
++  done
++}
++
++echo
++echo "STEP 0 — Sanity: check credentials and tooling"
++echo " - HF_API_TOKEN: ${HF_API_TOKEN:+present}"
++echo " - S3_BUCKET: ${S3_BUCKET:+present}"
++echo "Ensure kubectl / helm / docker are configured for your cluster."
++
++read -p "Proceed with orchestration (this will run long-running jobs)? [y/N] " PROCEED
++if [[ "${PROCEED:-n}" != "y" ]]; then
++  echo "Aborting."
++  exit 0
++fi
++
++echo
++echo "STEP 1 — Download & verify permissive base models"
++echo "Models: $MODEL_LIST"
++mkdir -p "$CACHE_DIR"
++python "$ROOT_DIR/scripts/bulk_download_and_verify.py" --models "$MODEL_LIST" --cache_dir "$CACHE_DIR" --allow_licenses "Apache-2.0,MIT" --out "$ROOT_DIR/download_manifest.json"
++
++echo
++echo "STEP 2 — Upload/pin snapshots to guarded artifact storage (S3/MinIO)"
++if [ -z "$S3_BUCKET" ]; then
++  echo "No S3_BUCKET configured, skipping upload step. Ensure snapshots are accessible via PVC if skipping."
++else
++  python "$ROOT_DIR/scripts/upload_snapshots_s3.py" --snapshots "$(echo $CACHE_DIR/* | tr ' ' ',')" --bucket "$S3_BUCKET" --prefix "$S3_PREFIX" --out "$ROOT_DIR/release_snapshots_manifest.json"
++  echo "Uploaded snapshots and wrote release_snapshots_manifest.json"
++fi
++
++echo
++echo "STEP 3 — Run production-scale SFT (QLoRA/PEFT)"
++echo "This step launches a long QLoRA job using accelerate. Make sure you have scheduled GPUs and tuned accelerate config."
++echo "SFT data: $SFT_DATA"
++echo "Output dir: $SFT_OUT"
++mkdir -p "$SFT_OUT"
++
++read -p "Did you review SFT hyperparameters and accelerator config? (yes to continue) " ans
++if [[ "$ans" != "yes" ]]; then
++  echo "Please review scripts/run_sft_and_merge.sh and openquill/training/accelerate_configs/* then re-run."
++  exit 1
++fi
++
++# launch SFT (this script will call merge via run_sft_and_merge.sh)
++bash "$ROOT_DIR/scripts/run_sft_and_merge.sh" --model "$CACHE_DIR/mistralai_mistral-7b" --data "$SFT_DATA" --out "$SFT_OUT" --max_steps 20000 --hf_token "$HF_API_TOKEN"
++
++echo
++echo "STEP 4 — Do NOT publish merged checkpoints until legal & safety gates pass"
++echo "Merged candidate: $MERGED_DIR"
++echo "Create a legal signoff at docs/legal_signoff.json (use docs/legal_signoff_template.json for format)."
++read -p "Once legal signoff file exists at docs/legal_signoff.json, type 'continue' to proceed to RLHF: " cont
++if [[ "$cont" != "continue" ]]; then
++  echo "Exiting. Publish blocked until legal signoff is provided."
++  exit 0
++fi
++
++echo
++echo "STEP 5 — Launch production annotator service (operator step)"
++echo "Start the annotation service in a separate terminal or k8s Job:"
++echo "  uvicorn tools.annotation_service_fastapi:app --host 0.0.0.0 --port 8085"
++echo "Point annotators to: http://<host>:8085 (use token header x-annotator-token for auth)."
++echo
++read -p "Have you provisioned annotators and started data collection? (yes) " ack
++if [[ "$ack" != "yes" ]]; then
++  echo "Please start annotation service and collect at least minimal dataset before continuing."
++  exit 0
++fi
++
++echo
++echo "STEP 6 — Run RLHF pipeline (annotation QC -> reward model -> PPO) (runs locally for validation)"
++bash "$ROOT_DIR/scripts/run_rlhf_pipeline.sh" --annotations_csv "$ANNOTATIONS_OUT" --gold "$ANNOTATION_GOLD" --policy "distilgpt2" --trl_version "0.4.6" --reward_out "$ROOT_DIR/outputs/reward" --ppo_out "$ROOT_DIR/outputs/ppo"
++
++echo
++echo "STEP 7 — Multimodal adapter production flow"
++echo "7.1 Precompute embeddings (if LLM too big to load on training nodes)"
++python "$ROOT_DIR/openquill/training/embedding_extractor.py" --llm_model "$CACHE_DIR/mistralai_mistral-7b" --prompts "$EMBED_PROMPTS" --out "$EMBED_OUT" --batch 8
++
++echo "7.2 Train Q‑Former (operator: ensure GPUs available for adapter training)"
++python "$ROOT_DIR/openquill/training/qformer_train.py" --image_dir "$ROOT_DIR/data/images" --captions_file "$ROOT_DIR/data/image_captions.txt" --output_dir "$QFORMER_OUT" --blip_model "Salesforce/blip-image-captioning-large" --llm_model "$CACHE_DIR/mistralai_mistral-7b"
++
++echo "7.3 Evaluate adapters on VQA/TextCaps/COCO (small sample)"
++python "$ROOT_DIR/openquill/eval/vqa_evaluator.py" --adapter "$QFORMER_OUT/qformer_adapter.pth" --llm "$CACHE_DIR/mistralai_mistral-7b" --dataset vqa --max_samples 200
++
++echo
++echo "STEP 8 — Long-context strategy & benchmarking"
++echo "Decide native vs hierarchical memory. If using hierarchical memory, run long_context_benchmark to validate."
++python "$ROOT_DIR/scripts/long_context_benchmark.py" --doc "$ROOT_DIR/data/long_doc.txt" --query "Summarize the document."
++
++echo
++echo "STEP 9 — Harden sandbox & microVMs (ops)"
++echo "Operator should deploy a hardened microVM controller (firecracker-containerd or managed). You can run the deploy guide locally:"
++bash "$ROOT_DIR/scripts/deploy_firecracker_containerd_guide.sh" || true
++
++echo
++echo "STEP 10 — Hardened production serving & ops: deploy vLLM/TGI + OTEL + HPA"
++echo "Ensure model snapshots (merged) are available under PVC or S3 and mount into k8s nodes."
++bash "$ROOT_DIR/scripts/deploy_production_stack.sh"
++
++echo
++echo "STEP 11 — Quantize & distill for multi‑tier serving (operator decides thresholds)"
++bash "$ROOT_DIR/scripts/autoquant_autogptq.sh" --snapshot "$MERGED_DIR" --out "$ROOT_DIR/models/auto_gptq" --bits 4
++bash "$ROOT_DIR/scripts/distill_quantize_enhanced.sh" --snapshot "$MERGED_DIR" --out "$ROOT_DIR/models/quantized"
++
++echo
++echo "STEP 12 — Validate quantized artifacts against teacher"
++python "$ROOT_DIR/scripts/quantize_validate.py" --model "$MERGED_DIR" --quantized "$QUANT_OUT" --test_prompts "$ROOT_DIR/tests/prompts.txt" --tolerance 0.80
++
++echo
++echo "STEP 13 — Run release validation & publish gate"
++bash "$ROOT_DIR/scripts/validate_release_and_publish.sh" --manifest "$ROOT_DIR/release_snapshots_manifest.json" --annotations "$ANNOTATIONS_OUT" --gold "$ANNOTATION_GOLD" --quant "$QUANT_OUT" --legal docs/legal_signoff.json
++
++echo
++echo "Pipeline complete (subject to manual approvals and gates). Review outputs and perform staged rollout."
++exit 0
++
+--- /dev/null
++++ b/scripts/run_rlhf_pipeline.sh
+@@ -0,0 +1,214 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# scripts/run_rlhf_pipeline.sh
++#
++# Wrapper to run a validated RLHF pilot:
++#  - run annotation QC
++#  - prepare pairwise JSONL if needed
++#  - train a reward model (HF Trainer)
++#  - run a small PPO experiment with trl/trlX
++#
++# Usage:
++#   ./scripts/run_rlhf_pipeline.sh --annotations annotations.csv --gold gold_tests.json --policy distilgpt2 --trl_version 0.4.6
++
++ROOT_DIR=$(cd "$(dirname "$0")/../" && pwd)
++
++ANNOTATIONS=${ANNOTATIONS:-""}
++GOLD=${GOLD:-""}
++POLICY=${POLICY:-"distilgpt2"}
++TRL_VERSION=${TRL_VERSION:-"0.4.6"}
++REWARD_OUT=${REWARD_OUT:-"$ROOT_DIR/outputs/reward"}
++PPO_OUT=${PPO_OUT:-"$ROOT_DIR/outputs/ppo"}
++PAIRS_JSONL=${PAIRS_JSONL:-"$ROOT_DIR/data/reward_pairs.jsonl"}
++
++function usage() {
++  echo "Usage: $0 --annotations annotations.csv --gold gold_tests.json --policy distilgpt2 --trl_version 0.4.6 [--pairs_out data/reward_pairs.jsonl]"
++  exit 1
++}
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --annotations) ANNOTATIONS="$2"; shift 2;;
++    --gold) GOLD="$2"; shift 2;;
++    --policy) POLICY="$2"; shift 2;;
++    --trl_version) TRL_VERSION="$2"; shift 2;;
++    --reward_out) REWARD_OUT="$2"; shift 2;;
++    --ppo_out) PPO_OUT="$2"; shift 2;;
++    --pairs_out) PAIRS_JSONL="$2"; shift 2;;
++    *) echo "Unknown arg $1"; usage;;
++  esac
++done
++
++if [ -z "$ANNOTATIONS" ]; then
++  echo "annotations csv required" >&2
++  usage
++fi
++
++echo "Running annotation QC..."
++python "$ROOT_DIR/tools/annotation_qc.py" --annotations "$ANNOTATIONS" --gold "$GOLD" --min_gold_pass 0.9
++
++echo "Converting annotations CSV -> pairwise JSONL for reward training"
++python - <<PY
++import csv, json, sys
++ann_csv = "$ANNOTATIONS"
++out_jsonl = "$PAIRS_JSONL"
++with open(ann_csv, 'r', encoding='utf-8') as f, open(out_jsonl, 'w', encoding='utf-8') as o:
++    reader = csv.DictReader(f)
++    for r in reader:
++        # assume response_a/response_b columns
++        j = {"prompt": r.get("prompt",""), "response_chosen": r.get("response_a",""), "response_rejected": r.get("response_b",""), "annotator": r.get("annotator",""), "metadata": {"confidence": r.get("confidence","")}}
++        o.write(json.dumps(j, ensure_ascii=False) + "\n")
++print("Wrote pairwise JSONL to", out_jsonl)
++PY
++
++echo "Training reward model (small) and running PPO pilot"
++python "$ROOT_DIR/openquill/training/ppo_trlx_runner.py" --pairs "$PAIRS_JSONL" --policy "$POLICY" --reward_out "$REWARD_OUT" --ppo_out "$PPO_OUT" --trl_version "$TRL_VERSION"
++
++echo "RLHF pilot finished. Inspect PPO outputs in $PPO_OUT and push candidate rollouts to HIL for human review before applying to SFT policy."
++echo "Important: Do NOT promote PPO-updated weights to production until human review and safety audits are complete."
++exit 0
++
+--- /dev/null
++++ b/scripts/deploy_firecracker_containerd_guide.sh
+@@ -0,0 +1,209 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# scripts/deploy_firecracker_containerd_guide.sh
++#
++# High-level guide script that helps operators prepare a node for firecracker-containerd.
++# This does NOT perform production installation automatically (privileged operations).
++# It prints commands and optionally attempts lightweight checks.
++#
++# Usage:
++#   ./scripts/deploy_firecracker_containerd_guide.sh [--check]
++
++ROOT=$(cd "$(dirname "$0")/../" && pwd)
++CHK=${CHK:-0}
++
++function usage() {
++  echo "Usage: $0 [--check]"
++  exit 1
++}
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --check) CHK=1; shift;;
++    *) usage;;
++  esac
++done
++
++echo "Firecracker-containerd deployment guide"
++echo
++echo "This script documents the recommended operator steps. Running this requires cluster admin privileges."
++echo
++echo "1) Prepare host OS (example for Ubuntu 20.04+):"
++cat <<'DOC'
++  sudo apt update
++  sudo apt install -y build-essential git curl unzip
++  # install containerd
++  sudo apt install -y containerd
++  # ensure cgroups v2 and kvm avail
++  sudo modprobe kvm_intel || sudo modprobe kvm_amd
++  ls /dev/kvm
++DOC
++
++echo
++echo "2) Install firecracker & firecracker-containerd (operator):"
++cat <<'DOC'
++  # example: follow firecracker-containerd docs
++  git clone https://github.com/firecracker-microvm/firecracker-containerd.git
++  cd firecracker-containerd
++  make
++  # install systemd unit and configuration, create runtime
++  sudo cp build/firecracker-containerd /usr/local/bin/
++  sudo cp packaging/systemd/* /etc/systemd/system/
++  sudo systemctl enable --now firecracker-containerd
++DOC
++
++echo
++echo "3) Configure controller & manager service (k8s):"
++cat <<'DOC'
++  - Deploy a manager (controller) service that exposes an API to accept payloads, create ephemeral microVMs, attach ephemeral volumes and run job.
++  - Manager must implement:
++      POST /v1/jobs  (payload, files, resources) -> job_id
++      GET  /v1/jobs/{job_id} -> status and stdout/stderr
++  - Ensure manager enforces network egress restrictions and image allowlists.
++DOC
++
++echo
++echo "4) Example k8s placement: run manager in a dedicated namespace with restricted RBAC and nodeSelectors."
++echo "   See k8s/firecracker_manager_deployment.yaml in this repo for example (replace image with your hardened manager)."
++
++echo
++echo "5) Security hardening checklist (must do):"
++cat <<'DOC'
++  - Use signed microVM images and verify integrity before launching
++  - No-network images by default; allow explicit egress whitelist
++  - Per-job resource quotas (vCPU, memory, disk)
++  - Filesystem policy: mount read-only base image, ephemeral writable workspace with size limits
++  - Audit logs: record every job submission and result with annotator/user identity
++DOC
++
++if [ "$CHK" -eq 1 ]; then
++  echo
++  echo "Performing quick local checks (non-privileged):"
++  if which containerd >/dev/null 2>&1; then
++    echo "containerd found: $(which containerd)"
++  else
++    echo "containerd not found in PATH"
++  fi
++  if [ -e /dev/kvm ]; then
++    echo "/dev/kvm present"
++  else
++    echo "/dev/kvm not present (VMs will not run)"
++  fi
++  echo "Check complete. For full install follow the steps above and operator-run commands."
++fi
++
++echo
++echo "Operator note: deploying firecracker-containerd requires privileged node access and careful security review."
++echo "If you prefer gVisor/runsc for isolation, follow k8s/gvisor_runtimeclass.yaml and ensure runsc is installed on nodes."
++exit 0
++
+--- /dev/null
++++ b/docs/legal_signoff_template.json
+@@ -0,0 +1,78 @@
++{
++  "model_id": "your-org/openquill-mistral-7b",
++  "release_tag": "v1.0.0",
++  "legal_reviewed_by": "",
++  "safety_reviewed_by": "",
++  "pii_reviewed": false,
++  "datasets": [
++    {
++      "name": "OpenAssistant",
++      "source": "https://example.com",
++      "license": "Apache-2.0",
++      "access_date": "2026-02-14"
++    }
++  ],
++  "annotations": {
++    "annotation_csv": "annotations/annotations.csv",
++    "gold_tests": "annotations/gold_tests.json",
++    "gold_pass_rate": 0.0
++  },
++  "notes": "Fill with required legal and safety notes. Attach audit reports and red-team results.",
++  "date": "2026-02-14T00:00:00Z"
++}
++
+--- /dev/null
++++ b/scripts/validate_release_and_publish.sh
+@@ -0,0 +1,171 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# scripts/validate_release_and_publish.sh
++#
++# Convenience wrapper to run the final release gates locally or in CI.
++# It calls the checks that must pass before publishing merged checkpoints.
++#
++# Usage:
++#   ./scripts/validate_release_and_publish.sh --manifest release_snapshots_manifest.json --annotations annotations.csv --gold docs/gold_tests.json --quant ./models/mistral.gguf --legal docs/legal_signoff.json
++
++ROOT_DIR=$(cd "$(dirname "$0")/../" && pwd)
++
++MANIFEST=${MANIFEST:-"release_snapshots_manifest.json"}
++ANNOTATIONS=${ANNOTATIONS:-"annotations/annotations.csv"}
++GOLD=${GOLD:-"annotations/gold_tests.json"}
++QUANT=${QUANT:-"./models/mistral.gguf"}
++LEGAL=${LEGAL:-"docs/legal_signoff.json"}
++
++function usage() {
++  echo "Usage: $0 --manifest <manifest.json> --annotations <csv> --gold <gold.json> --quant <quant_path> --legal <legal_json>"
++  exit 1
++}
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --manifest) MANIFEST="$2"; shift 2;;
++    --annotations) ANNOTATIONS="$2"; shift 2;;
++    --gold) GOLD="$2"; shift 2;;
++    --quant) QUANT="$2"; shift 2;;
++    --legal) LEGAL="$2"; shift 2;;
++    *) echo "Unknown arg $1"; usage;;
++  esac
++done
++
++echo "Running release validations..."
++
++if [ ! -f "$MANIFEST" ]; then
++  echo "Manifest not found: $MANIFEST"; exit 2
++fi
++
++echo "1) Check vetted/merged checkpoints in manifest"
++python "$ROOT_DIR/scripts/check_vetted_checkpoints.py" --manifest "$MANIFEST" --require
++
++echo "2) Annotation QC (gold tests)"
++python "$ROOT_DIR/tools/annotation_qc.py" --annotations "$ANNOTATIONS" --gold "$GOLD" --min_gold_pass 0.9
++
++echo "3) Quantized artifact validation"
++python "$ROOT_DIR/scripts/quantize_validate.py" --model "$ROOT_DIR/models/mistralai_mistral-7b" --quantized "$QUANT" --test_prompts "$ROOT_DIR/tests/prompts.txt" --tolerance 0.80
++
++echo "4) Legal signoff presence"
++if [ ! -f "$LEGAL" ]; then
++  echo "Legal signoff missing: $LEGAL"; exit 5
++fi
++python - <<PY
++import json,sys
++data=json.load(open("$LEGAL"))
++req=["legal_reviewed_by","safety_reviewed_by","date","model_id"]
++for r in req:
++    if r not in data or not data[r]:
++        print("Legal signoff missing field:",r); sys.exit(2)
++print("Legal signoff looks present for",data.get("model_id"))
++PY
++
++echo "All validations passed locally. Proceed with publishing (scripts/publish_checkpoint.py or CI)."
++exit 0
++
+-- 
+2.40.1
