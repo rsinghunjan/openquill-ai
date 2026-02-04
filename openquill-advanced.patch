@@ -1,0 +1,780 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Copilot <copilot@example.com>
+Date: Sat, 07 Feb 2026 00:00:00 +0000
+Subject: [PATCH] add model registry, multimodal adapters, RAG, tools sandbox stubs, router, quantization/conversion stubs, alignment stubs, multilingual config, observability helpers, and docs
+
+---
+ .github/workflows/ci.yml                     |   2 +-
+ docs/model_dataset_card_template.md         |  34 ++++++++++++++++++++++
+ docs/release_checklist.md                   |  44 ++++++++++++++++++++++++++++++
+ openquill/adapters/audio/whisper_wrapper.py |  40 ++++++++++++++++++
+ openquill/adapters/vision/qformer.py        |  66 ++++++++++++++++++++++++++++++++
+ openquill/alignment/reward_model_stub.py    |  36 ++++++++++++++
+ openquill/alignment/rlhf_pipeline_stub.py   |  50 +++++++++++++++++++
+ openquill/models/registry.py                | 104 +++++++++++++++++++++++++++++++++++++
+ openquill/observability/metrics.py          |  48 +++++++++++++++++
+ openquill/quantize/convert_to_gguf.py       |  38 ++++++++++++++
+ openquill/rag/retriever.py                  | 110 +++++++++++++++++++++++++++++++++++
+ openquill/serving/router.py                 |  86 ++++++++++++++++++++++++++
+ openquill/tools/executor.py                 |  96 ++++++++++++++++++++++++++++++
+ openquill/tools/tool_api.py                 |  74 +++++++++++++++++++++
+ openquill/training/multilingual_config.json |  32 ++++++++++++++
+ scripts/convert_to_gguf.sh                  |  20 ++++++++
+ 16 files changed, 980 insertions(+), 2 deletions(-)
+ create mode 100644 docs/model_dataset_card_template.md
+ create mode 100644 docs/release_checklist.md
+ create mode 100644 openquill/adapters/audio/whisper_wrapper.py
+ create mode 100644 openquill/adapters/vision/qformer.py
+ create mode 100644 openquill/alignment/reward_model_stub.py
+ create mode 100644 openquill/alignment/rlhf_pipeline_stub.py
+ create mode 100644 openquill/models/registry.py
+ create mode 100644 openquill/observability/metrics.py
+ create mode 100644 openquill/quantize/convert_to_gguf.py
+ create mode 100644 openquill/rag/retriever.py
+ create mode 100644 openquill/serving/router.py
+ create mode 100644 openquill/tools/executor.py
+ create mode 100644 openquill/tools/tool_api.py
+ create mode 100644 openquill/training/multilingual_config.json
+ create mode 100755 scripts/convert_to_gguf.sh
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -1,40 +1,40 @@
+ name: CI
+ 
+ on:
+   push:
+     branches: [ main, master ]
+   pull_request:
+     branches: [ main, master ]
+ 
+ jobs:
+   test:
+     runs-on: ubuntu-latest
+     strategy:
+       matrix:
+         python-version: [3.10]
+     steps:
+       - uses: actions/checkout@v4
+       - name: Set up Python
+         uses: actions/setup-python@v4
+         with:
+           python-version: ${{ matrix.python-version }}
+       - name: Install dependencies (light)
+         run: |
+           python -m pip install --upgrade pip
+-          pip install pytest==7.4.0 transformers==4.35.0 torch --quiet
++          pip install pytest==7.4.0 transformers==4.35.0 torch --quiet
+       - name: Run tests
+         run: |
+           pytest -q
+       - name: Lint (optional)
+         run: |
+           pip install flake8
+           flake8 --max-line-length=120 || true
++
++  # A second job could run lightweight smoke tests for server startup, but avoid heavy GPU steps in CI.
+--- /dev/null
++++ b/docs/model_dataset_card_template.md
+@@ -0,0 +1,34 @@
++# Model & Dataset Card Template
++
++Use this template to produce machine-readable and human-friendly documentation for each model and dataset.
++
++Model
++- name: (e.g. openquill/mistral-7b-qlora)
++- version: v0.1
++- license: (exact license string)
++- provenance: (training data sources, data collection time window)
++- base_model: (HF id or self-hosted)
++- tokenizer: (tokenizer id/version)
++
++Capabilities
++- modalities: text, image, audio
++- context window: (e.g. 8k, 32k)
++- languages: (list)
++- intended uses: (summarization, Q/A, coding, multimodal extraction)
++- limitations: (hallucination, unsafe content, legal/medical advice, etc.)
++
++Evaluation
++- benchmarks: (MMLU, GSM8K, HumanEval, VQA, FLORES)
++- results: link to evaluation artifacts
++
++Safety & Governance
++- safety mitigations: (filters, RLHF, abstention)
++- dataset license summary & data retention policy
++- contact: security/safety email
+--- /dev/null
++++ b/docs/release_checklist.md
+@@ -0,0 +1,44 @@
++# Release checklist
++
++Before releasing a model publicly, ensure you complete the following:
++
++1. License & provenance
++   - Confirm base model license and dataset licenses.
++   - Produce model card and dataset card under docs/.
++   - Ensure you have rights to redistribute any derived weights.
++
++2. Safety & alignment
++   - Run automated moderation and adversarial red-team suites.
++   - Have human-in-the-loop review for flagged outputs.
++   - Train and evaluate a reward model if RLHF used.
++   - Document known failure modes and abstention behavior.
++
++3. Privacy & personal data
++   - Scan training data for PII and remove sensitive records.
++   - Provide a takedown process and contact details.
++
++4. Observability & ops
++   - Add monitoring dashboards (Prometheus/Grafana).
++   - Add logging with redaction rules for PII.
++   - Add rate limits and API keys on public endpoints.
++
++5. Testing & QA
++   - Unit tests and integration tests pass.
++   - Small-scale smoke deployment performed.
++   - Benchmarks (MMLU/GSM8K/HumanEval/VQA) executed and results recorded.
++
++6. Packaging & distribution
++   - Provide conversion/quantization scripts (GGUF/ggml).
++   - Document recommended hardware and costs (docs/hardware.md).
++
++7. Post-release
++   - Maintain a vulnerability and takedown channel.
++   - Run periodic safety re-evaluations and update model card.
+--- /dev/null
++++ b/openquill/adapters/audio/whisper_wrapper.py
+@@ -0,0 +1,40 @@
++"""
++Simple Whisper encoder wrapper for generating audio embeddings or transcriptions.
++This is a light wrapper around transformers' Whisper/WhisperProcessor usage.
++"""
++from typing import Optional
++import torch
++from transformers import WhisperProcessor, WhisperForConditionalGeneration
++
++
++class WhisperEncoder:
++    def __init__(self, model_name: str = "openai/whisper-small", device: Optional[str] = None):
++        self.model_name = model_name
++        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
++        self.processor = WhisperProcessor.from_pretrained(model_name)
++        self.model = WhisperForConditionalGeneration.from_pretrained(model_name).to(self.device)
++
++    def transcribe(self, audio_bytes: bytes, **gen_kwargs) -> str:
++        """
++        Transcribe audio bytes to text. For multimodal integration you may convert
++        the transcript to embeddings via the LLM tokenizer.
++        """
++        import soundfile as sf
++        import io
++
++        audio, sr = sf.read(io.BytesIO(audio_bytes))
++        inputs = self.processor(audio, sampling_rate=sr, return_tensors="pt").to(self.device)
++        generated_ids = self.model.generate(**inputs, **gen_kwargs)
++        return self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
++
++    def encode_to_text(self, audio_bytes: bytes) -> str:
++        return self.transcribe(audio_bytes)
+--- /dev/null
++++ b/openquill/adapters/vision/qformer.py
+@@ -0,0 +1,66 @@
++"""
++Q-Former adapter stub for vision -> LLM conditioning (BLIP-2 / LLaVA style).
++
++Pattern:
++ - Image encoder (ViT/CLIP) produces visual features.
++ - Q-Former maps visual features to a small set of query embeddings.
++ - These embeddings are projected into the LLM token embedding space and concatenated to text tokens.
++
++This file contains a clear stub showing expected methods for integration.
++"""
++from typing import Any, Optional
++import torch
++from transformers import AutoFeatureExtractor, AutoModel
++
++
++class QFormerAdapter:
++    def __init__(self, image_encoder_name: str = "openai/clip-vit-base-patch32", device: Optional[str] = None):
++        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
++        self.feature_extractor = AutoFeatureExtractor.from_pretrained(image_encoder_name)
++        # Use a generic vision encoder; replace with BLIP/Q-Former when implementing
++        self.vision_model = AutoModel.from_pretrained(image_encoder_name).to(self.device)
++        # q_former is a small transformer mapping vision features -> query embeddings
++        self.q_former = torch.nn.Identity()
++
++    def preprocess_image(self, image_bytes: bytes) -> Any:
++        from PIL import Image
++        import io
++        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
++        return self.feature_extractor(images=img, return_tensors="pt").to(self.device)
++
++    def encode_image(self, image_bytes: bytes) -> torch.Tensor:
++        """
++        Return a tensor of shape [num_queries, dim] representing image-conditioned embeddings.
++        In a full implementation this runs the image encoder, then Q-Former to get queries.
++        """
++        inputs = self.preprocess_image(image_bytes)
++        with torch.no_grad():
++            feats = self.vision_model(**inputs).last_hidden_state  # shape [1, seq, dim]
++            # pass through q_former (stub)
++            queries = feats.mean(dim=1)  # [1, dim] simplified
++        return queries.squeeze(0)
++
++    def project_to_llm(self, query_emb: torch.Tensor, llm_embedding_dim: int) -> torch.Tensor:
++        """
++        Project query embeddings to the LLM embedding dimension. Return shape [num_queries, llm_dim].
++        """
++        if query_emb.dim() == 1:
++            query_emb = query_emb.unsqueeze(0)
++        # Simple linear projection stub
++        proj = torch.nn.Linear(query_emb.size(-1), llm_embedding_dim).to(self.device)
++        with torch.no_grad():
++            return proj(query_emb)
++
++    # Integration helper: given image bytes and LLM tokenizer/model, produce tokens/embs to prefix
++    def get_conditioning_tokens(self, image_bytes: bytes, llm_tokenizer, llm_model) -> Any:
++        emb = self.encode_image(image_bytes)
++        proj = self.project_to_llm(emb, llm_model.config.hidden_size)
++        # Strategy: prepend a special token and the projected embeddings in the model input
++        return proj
+--- /dev/null
++++ b/openquill/alignment/reward_model_stub.py
+@@ -0,0 +1,36 @@
++"""
++Stub for reward model training utilities.
++
++This module outlines functions needed to train a reward model on preference data.
++Replace with Hugging Face Trainer training loop or custom PyTorch implementation.
++"""
++from typing import Any, Dict
++
++
++def prepare_preference_dataset(raw_pairs):
++    """
++    raw_pairs: list of dicts { 'prompt':..., 'chosen':..., 'rejected':... }
++    Return a dataset suitable for reward-model training.
++    """
++    raise NotImplementedError("Implement preference dataset conversion to HF Dataset")
++
++
++def train_reward_model(model, dataset, output_dir: str, epochs: int = 3, **kwargs) -> Dict:
++    """
++    Train reward model and save to output_dir.
++    """
++    raise NotImplementedError("Implement reward model training using Trainer or custom loop")
+--- /dev/null
++++ b/openquill/alignment/rlhf_pipeline_stub.py
+@@ -0,0 +1,50 @@
++"""
++RLHF pipeline stub.
++
++This file sketches high-level steps and APIs for collecting rollouts, training reward models,
++and applying PPO updates to a policy model. For production use, integrate a library like trlX.
++"""
++from typing import Any, Dict
++
++
++def collect_rollouts(policy_model, prompts, max_steps: int = 128):
++    """
++    Given a policy model and a list of prompts, generate rollouts (model responses) and
++    store them for reward scoring.
++    """
++    raise NotImplementedError("Implement rollout collection and storage")
++
++
++def score_rollouts(reward_model, rollouts):
++    """
++    Score rollouts using reward model and return scalar rewards.
++    """
++    raise NotImplementedError("Implement reward scoring")
++
++
++def ppo_update(policy_model, rollouts, rewards, **kwargs):
++    """
++    Run PPO updates on policy model given rollouts and rewards.
++    """
++    raise NotImplementedError("Integrate with trlX or implement PPO loop")
+--- /dev/null
++++ b/openquill/models/registry.py
+@@ -0,0 +1,104 @@
++"""
++Model registry and helpers.
++
++Contains a small registry of recommended base models with license hints and helper
++functions to select models for prototyping vs high-quality runs.
++"""
++from typing import Dict, Any, Optional, List
++import os
++import subprocess
++
++
++MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
++    "mistral-7b": {
++        "hf_id": "mistralai/mistral-7b",
++        "size": 7_000_000_000,
++        "license": "Apache-2.0",
++        "notes": "Efficient 7B model good for prototyping.",
++    },
++    "mistral-7b-instruct": {
++        "hf_id": "mistralai/mistral-7b-instruct",
++        "size": 7_000_000_000,
++        "license": "Apache-2.0",
++        "notes": "Instruction-tuned variant.",
++    },
++    "redpajama-7b": {
++        "hf_id": "togethercomputer/RedPajama-INCITE-7B-v1",
++        "size": 7_000_000_000,
++        "license": "Apache-2.0",
++        "notes": "Open weights research lineage.",
++    },
++    "falcon-40b": {
++        "hf_id": "tiiuae/falcon-40b",
++        "size": 40_000_000_000,
++        "license": "Apache-2.0",
++        "notes": "High quality; heavy compute requirements.",
++    },
++}
++
++
++def get_model_info(key: str) -> Optional[Dict[str, Any]]:
++    return MODEL_REGISTRY.get(key)
++
++
++def list_models() -> List[str]:
++    return list(MODEL_REGISTRY.keys())
++
++
++def choose_model_by_budget(max_gpu_mem_gb: int = 24) -> str:
++    """
++    Heuristic: choose a model that fits under max_gpu_mem_gb (very rough).
++    - 24GB -> 7B quantized
++    - 80GB -> 30-40B full or quantized
++    """
++    if max_gpu_mem_gb < 32:
++        return "mistral-7b"
++    if max_gpu_mem_gb < 64:
++        return "redpajama-7b"
++    return "falcon-40b"
++
++
++def verify_license(hf_id: str) -> Optional[str]:
++    """
++    Try to use huggingface-cli to show model card license (best-effort).
++    Requires huggingface_hub or HF CLI installed and authenticated for private models.
++    """
++    try:
++        # Use huggingface_hub if available
++        from huggingface_hub import HfApi
++
++        api = HfApi()
++        info = api.model_info(hf_id)
++        return info.license or ""
++    except Exception:
++        # fallback: attempt to run `huggingface-cli` if present (best-effort)
++        try:
++            out = subprocess.check_output(["huggingface-cli", "repo", "ls-files", hf_id], stderr=subprocess.STDOUT)
++            return ""  # no direct license info; suggest manual check
++        except Exception:
++            return None
++
++
++def ensure_model_downloaded(hf_id: str, cache_dir: str = "./models") -> str:
++    """
++    Wrapper that calls the snapshot downloader script if needed.
++    Returns path to downloaded snapshot or raises RuntimeError.
++    """
++    from scripts.download_model import download_model
++
++    path = download_model(hf_id, cache_dir=cache_dir)
++    return path
+--- /dev/null
++++ b/openquill/observability/metrics.py
+@@ -0,0 +1,48 @@
++"""
++Centralized observability helpers (Prometheus metrics).
++Other modules should import and use these helpers.
++"""
++from prometheus_client import Counter, Histogram, Gauge
++
++# Request counters labeled by endpoint and status
++REQ_COUNTER = Counter("openquill_requests_total", "Total requests", ["endpoint", "status"])
++
++# Latency histogram per endpoint
++LATENCY_HIST = Histogram("openquill_request_latency_seconds", "Request latency seconds", ["endpoint"])
++
++# Model selection/generation metrics
++GEN_TOKENS = Counter("openquill_generated_tokens_total", "Total generated tokens")
++MODEL_INFER_TIME = Histogram("openquill_model_infer_seconds", "Model inference time seconds", ["model"])
++
++# Health gauges
++HEALTH_UP = Gauge("openquill_up", "Service up (1/0)")
++
++def observe_request(endpoint: str, status: str, latency_seconds: float):
++    REQ_COUNTER.labels(endpoint=endpoint, status=status).inc()
++    LATENCY_HIST.labels(endpoint=endpoint).observe(latency_seconds)
++
++def observe_generation(model: str, tokens: int, infer_seconds: float):
++    GEN_TOKENS.inc(tokens)
++    MODEL_INFER_TIME.labels(model=model).observe(infer_seconds)
+--- /dev/null
++++ b/openquill/quantize/convert_to_gguf.py
+@@ -0,0 +1,38 @@
++"""
++Stub for converting HF model weights to GGUF/GGML formats for CPU inference.
++Actual conversion depends on external tools (e.g., llama.cpp converters, gguf tools).
++This script demonstrates the expected inputs and where to call conversion utilities.
++"""
++import argparse
++import os
++import subprocess
++
++
++def convert_snapshot_to_gguf(snapshot_dir: str, out_path: str, backend: str = "ggml"):
++    """
++    Placeholder that would call an external conversion tool.
++    Example commands (not executed here):
++      python convert.py --input <snapshot> --out <out.gguf> --dtype q4_0
++    """
++    # Detect environment and try to call a known converter if available
++    # This is intentionally left as a stub; implement or call appropriate conversion tool.
++    print(f"Convert {snapshot_dir} -> {out_path} using backend {backend}")
++    # Example: subprocess.run(["python", "convert_llama_weights.py", "--input", snapshot_dir, "--output", out_path])
++    return out_path
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--snapshot_dir", required=True)
++    parser.add_argument("--out_path", required=True)
++    parser.add_argument("--backend", default="ggml")
++    args = parser.parse_args()
++    convert_snapshot_to_gguf(args.snapshot_dir, args.out_path, args.backend)
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null
++++ b/openquill/rag/retriever.py
+@@ -0,0 +1,110 @@
++"""
++Retrieval utilities and high-level RAG workflow helpers.
++
++This module provides:
++- chunk_document(text) -> list[str]
++- embed_texts(texts) -> numpy array (placeholder - call your embedding model)
++- build_faiss_index(embeddings)
++- search_and_rerank(query, top_k)
++
++For production use, integrate with Weaviate/Milvus or LlamaIndex/LangChain connectors.
++"""
++from typing import List, Tuple, Any
++import numpy as np
++import math
++
++try:
++    import faiss
++except Exception:
++    faiss = None
++
++from openquill.retrieval.faiss_index import build_index, search_index
++
++
++def chunk_document(text: str, chunk_size: int = 1024, overlap: int = 128) -> List[str]:
++    """
++    Simple sliding-window chunking by characters; replace with token-aware chunking in production.
++    """
++    chunks = []
++    start = 0
++    n = len(text)
++    while start < n:
++        end = min(n, start + chunk_size)
++        chunks.append(text[start:end])
++        if end == n:
++            break
++        start = max(0, end - overlap)
++    return chunks
++
++
++def embed_texts(texts: List[str], embedder=None) -> np.ndarray:
++    """
++    Placeholder embedding function. If `embedder` is provided it should expose an .encode(list[str]) -> np.ndarray API.
++    """
++    if embedder is not None:
++        return embedder.encode(texts)
++    # fallback: random vectors (for unit tests / scaffolding only)
++    d = 768
++    return np.random.randn(len(texts), d).astype("float32")
++
++
++def build_faiss_from_texts(texts: List[str], embedder=None, index_type: str = "flat"):
++    embeddings = embed_texts(texts, embedder=embedder)
++    index = build_index(embeddings, index_type=index_type)
++    return index, embeddings
++
++
++def search_and_get_docs(query: str, index, embeddings, embedder=None, k: int = 8) -> List[Tuple[int, float]]:
++    q_emb = embed_texts([query], embedder=embedder)
++    ids, dists = search_index(index, q_emb, k=k)
++    # ids shape [1,k], dists shape [1,k]
++    return list(zip(ids[0].tolist(), dists[0].tolist()))
++
++
++def rerank_candidates(query: str, candidates: List[Tuple[int, float]], texts: List[str], reranker=None) -> List[int]:
++    """
++    Optionally rerank using a cross-encoder. Return list of doc ids in reranked order.
++    """
++    if reranker is None:
++        return [c[0] for c in candidates]
++    # reranker should accept (query, doc_texts) and return scores
++    scores = reranker.score(query, [texts[c[0]] for c in candidates])
++    sorted_ids = [c[0] for _, c in sorted(zip(scores, candidates), key=lambda x: -x[0])]
++    return sorted_ids
++
++
++def summarize_chunk(chunk_text: str, summarizer=None) -> str:
++    """
++    For hierarchical memory, summarize chunks. If summarizer provided, call it.
++    """
++    if summarizer:
++        return summarizer.summarize(chunk_text)
++    # naive summarization stub
++    return chunk_text[: min(200, len(chunk_text))] + ("..." if len(chunk_text) > 200 else "")
++
++
++def rag_pipeline(query: str, index, texts: List[str], embedder=None, k: int = 8) -> List[str]:
++    """
++    High level: search, rerank, return top-k texts.
++    """
++    candidates = search_and_get_docs(query, index, embeddings=None, embedder=embedder, k=k)
++    doc_ids = rerank_candidates(query, candidates, texts)
++    return [texts[i] for i in doc_ids[:k]]
+--- /dev/null
++++ b/openquill/serving/router.py
+@@ -0,0 +1,86 @@
++"""
++Model router for multi-tier serving.
++
++Selects between:
++ - cheap local quantized model (small)
++ - high-quality larger model (large)
++Routing policy based on:
++ - explicit request param (quality)
++ - estimated cost (tokens, complexity)
++ - latency & SLAs (placeholder)
++"""
++from typing import Optional, Dict, Any
++import os
++import time
++import logging
++
++logger = logging.getLogger("openquill.router")
++
++# configure via env
++SMALL_MODEL_KEY = os.environ.get("OQ_SMALL_MODEL", "mistral-7b")
++LARGE_MODEL_KEY = os.environ.get("OQ_LARGE_MODEL", "falcon-40b")
++
++
++class ModelClient:
++    """
++    Lightweight interface to a model backend. In production this could be a gRPC client,
++    an HTTP client to a vLLM/TGI server, or an in-process HF model instance.
++    This stub provides a consistent .generate(prompt, **kwargs) -> str API.
++    """
++
++    def __init__(self, name: str, backend: str = "local", config: Optional[Dict[str, Any]] = None):
++        self.name = name
++        self.backend = backend
++        self.config = config or {}
++
++    def generate(self, prompt: str, **kwargs) -> str:
++        # in-process quick stub: call HF models if backend == "local"
++        if self.backend == "local":
++            from transformers import AutoTokenizer, AutoModelForCausalLM
++            import torch
++
++            tok = AutoTokenizer.from_pretrained(self.name, use_fast=True)
++            model = AutoModelForCausalLM.from_pretrained(self.name).to("cpu")
++            ids = tok(prompt, return_tensors="pt").input_ids
++            out = model.generate(ids, max_new_tokens=kwargs.get("max_new_tokens", 128))
++            return tok.decode(out[0], skip_special_tokens=True)
++        # otherwise, call remote endpoint (not implemented)
++        raise NotImplementedError("Remote backend not implemented in stub")
++
++
++class Router:
++    def __init__(self):
++        self.small = ModelClient(SMALL_MODEL_KEY, backend="local")
++        self.large = ModelClient(LARGE_MODEL_KEY, backend="local")
++
++    def choose(self, prompt: str, prefer_quality: Optional[bool] = None) -> ModelClient:
++        """
++        Heuristic:
++         - If prefer_quality True, use large
++         - If prompt length small and prefer_quality False, use small
++         - Else choose small by default for cost savings
++        """
++        if prefer_quality:
++            return self.large
++        if len(prompt) < 200:
++            return self.small
++        return self.small
++
++    def generate(self, prompt: str, prefer_quality: Optional[bool] = None, **kwargs) -> Dict[str, Any]:
++        client = self.choose(prompt, prefer_quality=prefer_quality)
++        start = time.time()
++        text = client.generate(prompt, **kwargs)
++        latency = time.time() - start
++        logger.info("Routed to %s in %.3fs", client.name, latency)
++        return {"model": client.name, "text": text, "latency": latency}
+--- /dev/null
++++ b/openquill/tools/executor.py
+@@ -0,0 +1,96 @@
++"""
++Sandboxed executor stub for tool invocation.
++
++This module provides a single interface run_tool(tool_spec, input) that
++dispatches to either a safe local implementation or a sandboxed container.
++For production, replace the sandbox stub with Firecracker, gVisor, or managed container runtime.
++"""
++from typing import Dict, Any, Optional
++import subprocess
++import tempfile
++import os
++import shutil
++import uuid
++import logging
++
++logger = logging.getLogger("openquill.executor")
++
++
++class SandboxExecutionError(Exception):
++    pass
++
++
++def run_tool_in_subprocess(cmd: str, timeout: int = 10) -> Dict[str, Any]:
++    """
++    Very small, unsafe example: run a subprocess (NOT sandboxed).
++    Replace with proper container/sandbox in production.
++    """
++    try:
++        proc = subprocess.run(cmd, shell=True, capture_output=True, timeout=timeout, check=False)
++        return {"returncode": proc.returncode, "stdout": proc.stdout.decode("utf-8", errors="replace"), "stderr": proc.stderr.decode("utf-8", errors="replace")}
++    except subprocess.TimeoutExpired:
++        raise SandboxExecutionError("Tool execution timed out")
++
++
++def run_tool(tool_spec: Dict[str, Any], input_data: Optional[str] = None, timeout: int = 10) -> Dict[str, Any]:
++    """
++    tool_spec: {"type": "python"|"shell"|"sql"|"http", "code": "...", ...}
++    """
++    t = tool_spec.get("type", "shell")
++    if t == "shell":
++        return run_tool_in_subprocess(tool_spec.get("code", ""), timeout=timeout)
++    if t == "python":
++        # unsafe: executing python code strings is dangerous; this is a placeholder
++        tmpdir = tempfile.mkdtemp(prefix="oq-tool-")
++        try:
++            fname = os.path.join(tmpdir, "script.py")
++            with open(fname, "w") as f:
++                f.write(tool_spec.get("code", ""))
++            return run_tool_in_subprocess(f"python {fname}", timeout=timeout)
++        finally:
++            shutil.rmtree(tmpdir)
++    if t == "http":
++        import requests
++        url = tool_spec.get("url")
++        try:
++            r = requests.post(url, json={"input": input_data}, timeout=timeout)
++            return {"status_code": r.status_code, "text": r.text}
++        except Exception as e:
++            return {"error": str(e)}
++    raise NotImplementedError(f"Tool type {t} not supported in stub")
+--- /dev/null
++++ b/openquill/tools/tool_api.py
+@@ -0,0 +1,74 @@
++"""
++Simple tool-invocation HTTP API (FastAPI router intended to be mounted into the server).
++Logs tool usage for auditing.
++"""
++from fastapi import APIRouter, HTTPException, Request
++from pydantic import BaseModel
++from typing import Any, Dict
++import logging
++import time
++
++from openquill.tools.executor import run_tool, SandboxExecutionError
++
++router = APIRouter()
++logger = logging.getLogger("openquill.tools")
++
++
++class ToolInvokeRequest(BaseModel):
++    tool_spec: Dict[str, Any]
++    input: Any = None
++
++
++@router.post("/invoke")
++async def invoke_tool(req: ToolInvokeRequest, request: Request):
++    start = time.time()
++    try:
++        # In production, check permissions, rate-limits, and sanitize input
++        result = run_tool(req.tool_spec, input_data=req.input)
++    except SandboxExecutionError as e:
++        raise HTTPException(status_code=500, detail=str(e))
++    except Exception as e:
++        logger.exception("Tool invocation failed")
++        raise HTTPException(status_code=500, detail=str(e))
++    elapsed = time.time() - start
++    logger.info("Tool invoked by %s in %.3fs: tool=%s", request.client.host if request.client else "unknown", elapsed, req.tool_spec.get("type"))
++    # Audit log (structured)
++    logger.info("TOOL_AUDIT: tool=%s duration=%.3f result_summary=%s", req.tool_spec.get("type"), elapsed, str(result)[:200])
++    return {"result": result, "duration_seconds": elapsed}
+--- /dev/null
++++ b/openquill/training/multilingual_config.json
+@@ -0,0 +1,32 @@
++{
++  "model_name_or_path": "mistral-7b",
++  "dataset_mix": {
++    "mC4_multilingual": 0.6,
++    "CCAligned": 0.2,
++    "translation_pairs": 0.1,
++    "instruction_multilingual": 0.1
++  },
++  "tokenizer": {
++    "type": "sentencepiece",
++    "vocab_size": 64000
++  },
++  "training": {
++    "per_device_train_batch_size": 1,
++    "gradient_accumulation_steps": 32,
++    "learning_rate": 2e-4,
++    "max_steps": 20000
++  },
++  "evaluation": {
++    "flores": true,
++    "mmlu_multilingual": true
++  }
++}
+--- /dev/null
++++ b/scripts/convert_to_gguf.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++# Wrapper script to call conversion utilities (user must install converter tools).
++set -e
++SNAPSHOT_DIR="$1"
++OUT_PATH="${2:-${SNAPSHOT_DIR}/model.gguf}"
++BACKEND="${3:-ggml}"
++
++if [ -z "$SNAPSHOT_DIR" ]; then
++  echo "Usage: $0 <snapshot_dir> [out_path] [backend]"
++  exit 1
++fi
++
++echo "Converting $SNAPSHOT_DIR to $OUT_PATH with backend=$BACKEND"
++# Placeholder: call actual converter here
++python -m openquill.quantize.convert_to_gguf --snapshot_dir "$SNAPSHOT_DIR" --out_path "$OUT_PATH" --backend "$BACKEND"
++echo "Conversion (stub) finished"
++
+-- 
+2.40.1
