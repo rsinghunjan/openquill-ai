@@ -1,0 +1,311 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Copilot <copilot@example.com>
+Date: Wed, 04 Feb 2026 00:00:00 +0000
+Subject: [PATCH] scaffold: add project structure, QLoRA example, and FastAPI server
+
+---
+ README.md                                  |  18 ++++++++++++++++++
+ docs/deployment.md                          |  25 +++++++++++++++++++++++++
+ docs/model_card.md                          |  19 +++++++++++++++++++
+ docs/safety.md                              |  12 ++++++++++
+ examples/multimodal_demo.py                 |  16 ++++++++++++++++
+ examples/train_qlora.sh                     |  17 +++++++++++++++++
+ openquill/adapters/__init__.py              |   2 ++
+ openquill/inference/server.py               |  36 ++++++++++++++++++++++++++++++++++++
+ openquill/retrieval/faiss_index.py          |  15 +++++++++++++++
+ openquill/safety/moderation.py              |  20 ++++++++++++++++++++
+ openquill/training/finetune.py              |  22 +++++++++++++++++++++
+ openquill/training/qlora_config.json        |  28 ++++++++++++++++++++++++++++
+ ci/benchmarks/run_benchmarks.sh             |   6 ++++++
+ docker/Dockerfile                           |  10 ++++++++++
+ 14 files changed, 266 insertions(+)
+ create mode 100644 README.md
+ create mode 100644 docs/deployment.md
+ create mode 100644 docs/model_card.md
+ create mode 100644 docs/safety.md
+ create mode 100644 examples/multimodal_demo.py
+ create mode 100755 examples/train_qlora.sh
+ create mode 100644 openquill/adapters/__init__.py
+ create mode 100644 openquill/inference/server.py
+ create mode 100644 openquill/retrieval/faiss_index.py
+ create mode 100644 openquill/safety/moderation.py
+ create mode 100644 openquill/training/finetune.py
+ create mode 100644 openquill/training/qlora_config.json
+ create mode 100755 ci/benchmarks/run_benchmarks.sh
+ create mode 100644 docker/Dockerfile
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,18 @@
++# OpenQuill AI
++
++OpenQuill AI — compact, safety-first toolkit for building and self-hosting multimodal LLMs.
++
++This scaffold adds:
++- project layout for adapters, training, retrieval, and serving
++- a QLoRA training starter script
++- a minimal FastAPI inference server scaffold
++- documentation templates (model card, safety checklist, deployment notes)
++
++Next steps:
++- pick a base model (e.g. Mistral-7B / RedPajama / Falcon)
++- implement model loading + adapters
++- add CI benchmarks and RLHF pipeline
++
++License: This repo uses Apache-2.0 (adapt as needed).
++
+--- /dev/null
++++ b/docs/deployment.md
+@@ -0,0 +1,25 @@
++# Deployment notes
++
++Inference options:
++- Local quantized CPU: ggml / GGUF (for small footprint)
++- GPU (low-latency): vLLM or text-generation-inference (TGI) + bitsandbytes quantized weights
++- Serving: FastAPI (this scaffold), or wrap model in TGI/vLLM for production
++
++Quantization tips:
++- For QLoRA training: use bitsandbytes 4-bit/8-bit config
++- For CPU: convert to GGUF/ggml for CPU inference (edge)
++
++Authentication & Observability:
++- Add API key / JWT protection for endpoints
++- Export metrics: latency, p95, p99, refusal rate, safety flags
++
++Notes:
++- This document is a starting point. Tailor deployment choices to model size, latency, and cost requirements.
++
+--- /dev/null
++++ b/docs/model_card.md
+@@ -0,0 +1,19 @@
++# Model Card (template)
++
++Model name: TODO (e.g., openquill/Mistral-7B-finetuned)
++License: TODO (e.g., Apache License 2.0)
++
++Overview
++- Short description of capabilities, limitations, and intended uses.
++
++Intended uses and limitations
++- Safe and allowed use-cases
++- Known limitations and failure modes
++
++Safety
++- Summary of safety mitigations (filters, abstain rules, RLHF)
++- Contact / takedown process
++
++Evaluation
++- Benchmarks performed (MMLU, GSM8K, HumanEval, VQA)
++
+--- /dev/null
++++ b/docs/safety.md
+@@ -0,0 +1,12 @@
++# Safety checklist and release requirements
++
++- Verify licenses for base model and training data.
++- Run automated moderation tests (toxin, privacy leakage).
++- Red-team tests for adversarial prompting.
++- Document abstention rules and refusal wording.
++- Create human-in-the-loop review pipeline for flagged outputs.
++- Produce model card and dataset card prior to release.
++
+--- /dev/null
++++ b/examples/multimodal_demo.py
+@@ -0,0 +1,16 @@
++"""
++Minimal multimodal demo stub:
++ - Loads an LLM (placeholder)
++ - Loads an image encoder adapter (placeholder)
++ - Shows how to pass image embeddings + text prompt to the model
++
++This is a demo skeleton — replace placeholders with real model loading code.
++"""
++def run_demo():
++    MODEL_NAME = "mistral-7b"  # replace with real model name & loader
++    print(f"Demo stub: load model {MODEL_NAME} and image adapter (implement)")
++
++if __name__ == "__main__":
++    run_demo()
++
+--- /dev/null
++++ b/examples/train_qlora.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env bash
++# QLoRA / PEFT starter script (example). Edit MODEL and DATASET.
++set -e
++
++MODEL="mistral-7b"  # replace with chosen base model
++DATASET="data/instructions.jsonl"
++OUTPUT_DIR="outputs/qlora-${MODEL##*/}"
++
++python openquill/training/finetune.py \
++  --model_name_or_path "$MODEL" \
++  --dataset_path "$DATASET" \
++  --output_dir "$OUTPUT_DIR" \
++  --per_device_train_batch_size 1 \
++  --gradient_accumulation_steps 32 \
++  --learning_rate 2e-4 \
++  --max_steps 20000 \
++  --bf16 True \
++  --use_peft True \
++  --peft_type lora \
++  --bitsandbytes_4bit True
++
++echo "Finished (example). Customize hyperparams and dataset as appropriate."
++
+--- /dev/null
++++ b/openquill/adapters/__init__.py
+@@ -0,0 +1,2 @@
++# Adapters package (BLIP-2 / Q-Former / audio adapters)
++# Add adapter implementations here.
++
+--- /dev/null
++++ b/openquill/inference/server.py
+@@ -0,0 +1,36 @@
++from fastapi import FastAPI, HTTPException, File, UploadFile, Form
++from pydantic import BaseModel
++from typing import Optional
++import base64
++
++app = FastAPI(title="OpenQuill Inference (scaffold)")
++
++class GenerationRequest(BaseModel):
++    prompt: str
++    max_new_tokens: Optional[int] = 256
++    # If sending image as base64 string:
++    image_b64: Optional[str] = None
++
++@app.post("/generate")
++async def generate(req: GenerationRequest):
++    # Placeholder: Replace with actual model + adapter inference code.
++    prompt = req.prompt
++    if req.image_b64:
++        # decode and pass to adapter
++        try:
++            img_bytes = base64.b64decode(req.image_b64)
++        except Exception as e:
++            raise HTTPException(status_code=400, detail="invalid base64 image")
++        # TODO: run image encoder -> embeddings -> condition model
++    # TODO: call model.generate(...) and stream or return completion
++    completion = f"[stubbed completion for prompt: {prompt}]"
++    return {"generated_text": completion}
++
+--- /dev/null
++++ b/openquill/retrieval/faiss_index.py
+@@ -0,0 +1,15 @@
++"""
++FAISS connector stub.
++Implement indexing and searching functions here for RAG.
++"""
++import numpy as np
++
++def build_index(embeddings: np.ndarray):
++    # Example stub: create FAISS index and add vectors
++    # import faiss
++    # index = faiss.IndexFlatL2(embeddings.shape[1])
++    # index.add(embeddings)
++    # return index
++    raise NotImplementedError("Implement FAISS index building using faiss.IndexFlatL2 or IVF indices.")
++
++def search_index(index, query_emb: np.ndarray, k=8):
++    # return top-k results (ids + distances)
++    raise NotImplementedError("Implement FAISS search and return ids + scores.")
++
+--- /dev/null
++++ b/openquill/safety/moderation.py
+@@ -0,0 +1,20 @@
++import re
++from typing import List
++
++# Simple rule-based moderation example
++BLOCKED_PATTERNS = [
++    re.compile(r"\\b(?:suicide|kill myself|harm myself)\\b", re.I),
++    re.compile(r"\\b(?:terror|bomb|explosive)\\b", re.I),
++]
++
++def is_safe(text: str) -> (bool, List[str]):
++    matches = []
++    for pat in BLOCKED_PATTERNS:
++        if pat.search(text):
++            matches.append(pat.pattern)
++    return (len(matches) == 0, matches)
++
++# Hook for external moderation APIs (Perspective, custom models)
++def external_moderation(text: str) -> dict:
++    # Implement call to external moderation API here if needed
++    return {"status": "not-implemented"}
++
+--- /dev/null
++++ b/openquill/training/finetune.py
+@@ -0,0 +1,22 @@
++"""
++Placeholder finetune entrypoint.
++Replace comments with actual training logic using:
++- Hugging Face Transformers + Accelerate
++- PEFT (LoRA/QLoRA)
++- bitsandbytes for quantization
++"""
++import argparse
++
++def main():
++    parser = argparse.ArgumentParser(description="OpenQuill finetune stub")
++    parser.add_argument("--model_name_or_path", required=True)
++    parser.add_argument("--dataset_path", required=True)
++    parser.add_argument("--output_dir", required=True)
++    # Add other args: batch size, lr, peft flags, quantization flags...
++    args = parser.parse_args()
++
++    print("This is a starter script. Implement training flow using HF Accelerate + PEFT + bitsandbytes.")
++    print(f"model: {args.model_name_or_path}, dataset: {args.dataset_path}, output: {args.output_dir}")
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null
++++ b/openquill/training/qlora_config.json
+@@ -0,0 +1,28 @@
++{
++  "model_name_or_path": "mistral-7b",
++  "dataset_path": "data/instructions.jsonl",
++  "output_dir": "outputs/qlora-mistral-7b",
++  "per_device_train_batch_size": 1,
++  "gradient_accumulation_steps": 32,
++  "learning_rate": 2e-4,
++  "max_steps": 20000,
++  "bf16": true,
++  "peft": {
++    "use_peft": true,
++    "peft_type": "lora",
++    "r": 8,
++    "alpha": 32,
++    "dropout": 0.05
++  },
++  "bitsandbytes": {
++    "load_in_4bit": true,
++    "bnb_4bit_compute_dtype": "bfloat16"
++  }
++}
++
+--- /dev/null
++++ b/ci/benchmarks/run_benchmarks.sh
+@@ -0,0 +1,6 @@
++#!/usr/bin/env bash
++# Stub script to run evaluation benchmarks (MMLU/GSM8K/HumanEval/VQA)
++# Implement dataset download and evaluation harness here.
++
++echo "Run benchmarks: implement MMLU, GSM8K, HumanEval, VQA integration"
++
+--- /dev/null
++++ b/docker/Dockerfile
+@@ -0,0 +1,10 @@
++FROM python:3.11-slim
++WORKDIR /app
++
++COPY requirements.txt . || true
++# Install essential deps; expand as needed in requirements.txt
++RUN pip install --no-cache-dir fastapi uvicorn
++
++COPY openquill/ ./openquill/
++CMD ["uvicorn", "openquill.inference.server:app", "--host", "0.0.0.0", "--port", "8080"]
++
+-- 
+2.40.1
