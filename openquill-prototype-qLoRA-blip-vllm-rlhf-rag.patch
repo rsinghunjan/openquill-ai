@@ -1,0 +1,619 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Copilot <copilot@example.com>
+Date: Wed, 2026-02-04 00:00:00 +0000
+Subject: [PATCH] add QLoRA prototype, BLIP Q-Former adapter training script, vLLM/TGI wrapper, RLHF toy pipeline, and RAG demo
+
+---
+ openquill/training/qlora/mistral_qlora_config.json |  33 +++++++++++++++++++++++
+ data/toy_instructions.jsonl                        |  12 ++++++++
+ examples/run_qlora_accelerate.sh                   |  42 +++++++++++++++++++++++++++
+ openquill/adapters/qformer_train.py                | 160 +++++++++++++++++++++++++++++++++++++++++++++
+ openquill/serving/vllm_tgi_wrapper.py              | 214 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ openquill/training/rlhf_toy.py                     | 172 ++++++++++++++++++++++++++++++++++++++++++++
+ examples/rag_demo.py                               | 148 ++++++++++++++++++++++++++++++++++++++
+ 7 files changed, 781 insertions(+)
+ create mode 100644 openquill/training/qlora/mistral_qlora_config.json
+ create mode 100644 data/toy_instructions.jsonl
+ create mode 100755 examples/run_qlora_accelerate.sh
+ create mode 100644 openquill/adapters/qformer_train.py
+ create mode 100644 openquill/serving/vllm_tgi_wrapper.py
+ create mode 100644 openquill/training/rlhf_toy.py
+ create mode 100644 examples/rag_demo.py
+--- /dev/null
++++ b/openquill/training/qlora/mistral_qlora_config.json
+@@ -0,0 +1,33 @@
+{
+  "model_name_or_path": "mistralai/mistral-7b",
+  "dataset_path": "data/toy_instructions.jsonl",
+  "output_dir": "outputs/qlora-mistral-7b",
+  "per_device_train_batch_size": 1,
+  "gradient_accumulation_steps": 16,
+  "learning_rate": 2e-4,
+  "max_steps": 2000,
+  "warmup_steps": 100,
+  "weight_decay": 0.0,
+  "bf16": true,
+  "peft": {
+    "use_peft": true,
+    "peft_type": "lora",
+    "r": 8,
+    "alpha": 32,
+    "dropout": 0.05,
+    "target_modules": ["q_proj", "v_proj"]
+  },
+  "bitsandbytes": {
+    "load_in_4bit": true,
+    "bnb_4bit_compute_dtype": "bfloat16"
+  },
+  "logging": {
+    "logging_steps": 50,
+    "save_steps": 500
+  },
+  "max_seq_length": 2048
+}
+--- /dev/null
++++ b/data/toy_instructions.jsonl
+@@ -0,0 +1,12 @@
+{"instruction":"Summarize the following text: 'OpenQuill is a toolkit for building LLM stacks.'","response":"OpenQuill is a toolkit for building LLM stacks; it provides scaffolding for training, retrieval, and serving multimodal models."}
+{"instruction":"Given list [2,3,5], compute the sum.","response":"10"}
+{"instruction":"Translate to Spanish: 'Hello, how are you?'","response":"Hola, ¿cómo estás?"}
+{"instruction":"Write a short Python function to reverse a string.","response":"def reverse(s):\n    return s[::-1]"}
+--- a/examples/run_qlora_accelerate.sh
++++ b/examples/run_qlora_accelerate.sh
+@@ -0,0 +1,42 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Example script to run QLoRA fine-tuning for Mistral-7B using Hugging Face accelerate + finetune.py
++# Adjust the accelerate config and GPU topology to your environment.
++#
++# Prerequisites:
++# - pip install -r requirements.txt (includes accelerate, transformers, peft, bitsandbytes, datasets)
++# - accelerate config: `accelerate config` or use openquill/training/accelerate_config.yaml as template
++
++MODEL=${MODEL:-"mistralai/mistral-7b"}
++DATASET=${DATASET:-"data/toy_instructions.jsonl"}
++OUTPUT_DIR=${OUTPUT_DIR:-"outputs/qlora-mistral-7b"}
++MAX_STEPS=${MAX_STEPS:-2000}
++BS=${BS:-1}
++GA=${GA:-16}
++LR=${LR:-2e-4}
++BFFLAG=${BFFLAG:-"--bf16"}
++LOAD_4BIT=${LOAD_4BIT:-"--load_in_4bit"}
++
++mkdir -p "$OUTPUT_DIR"
++
++accelerate launch --config_file openquill/training/accelerate_config.yaml \
++  openquill/training/finetune.py \
++    --model_name_or_path "$MODEL" \
++    --dataset_path "$DATASET" \
++    --output_dir "$OUTPUT_DIR" \
++    --per_device_train_batch_size $BS \
++    --gradient_accumulation_steps $GA \
++    --learning_rate $LR \
++    --max_steps $MAX_STEPS \
++    $BFFLAG \
++    --use_peft \
++    --peft_type lora \
++    $LOAD_4BIT
++
++echo "QLoRA run requested. Monitor logs and outputs in $OUTPUT_DIR"
++
+--- /dev/null
++++ b/openquill/adapters/qformer_train.py
+@@ -0,0 +1,160 @@
++"""
++Minimal Q-Former / BLIP-2 adapter training script (skeleton)
++
++This script demonstrates a practical, small-scale recipe to:
++ - load a BLIP captioning/vision encoder
++ - create a small Q-Former (a lightweight Transformer) that maps vision features -> query tokens
++ - project queries to LLM embedding space
++ - train only the Q-Former + projection (freeze vision encoder and LLM)
++ - save adapter weights for PEFT-style integration
++
++This is a scaffold: replace / expand datasets, dataloaders and training loops for production.
++
++Usage (example):
++  python openquill/adapters/qformer_train.py --image_dir data/images --output_dir outputs/qformer-demo
++
++Dependencies:
++  pip install -r requirements.txt
++  pip install transformers accelerate bitsandbytes peft datasets
++"""
++import argparse
++import os
++from pathlib import Path
++from typing import List
++
++import torch
++import torch.nn as nn
++from torch.utils.data import Dataset, DataLoader
++from transformers import BlipProcessor, BlipForConditionalGeneration, AutoTokenizer
++
++
++class ImageTextDataset(Dataset):
++    """
++    Very small dataset that yields (image_bytes, prompt, expected_response) tuples.
++    Replace this with a proper multimodal instruction dataset.
++    """
++    def __init__(self, image_paths: List[Path], captions: List[str], processor: BlipProcessor, tokenizer: AutoTokenizer, max_length=256):
++        self.image_paths = image_paths
++        self.captions = captions
++        self.processor = processor
++        self.tokenizer = tokenizer
++        self.max_length = max_length
++
++    def __len__(self):
++        return len(self.image_paths)
++
++    def __getitem__(self, idx):
++        with open(self.image_paths[idx], "rb") as f:
++            img_bytes = f.read()
++        prompt = self.captions[idx]
++        encoded = self.processor(images=img_bytes, return_tensors="pt", padding="max_length", truncation=True)
++        target = self.tokenizer(prompt, truncation=True, padding="max_length", max_length=self.max_length, return_tensors="pt")
++        return img_bytes, encoded, target
++
++
++class SimpleQFormer(nn.Module):
++    """
++    Minimal Q-Former: a small Transformer encoder that maps vision features -> query vectors.
++    """
++    def __init__(self, input_dim: int, num_queries: int = 4, query_dim: int = 768, nhead: int = 8, num_layers: int = 2):
++        super().__init__()
++        self.num_queries = num_queries
++        self.query_dim = query_dim
++        self.query_tokens = nn.Parameter(torch.randn(num_queries, query_dim))
++        encoder_layer = nn.TransformerEncoderLayer(d_model=query_dim, nhead=nhead)
++        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
++        # project vision feats -> query_dim (if needed)
++        self.vision_proj = nn.Linear(input_dim, query_dim)
++
++    def forward(self, vision_feats):
++        # vision_feats: [B, seq, dim] -> pool -> feed through proj
++        pooled = vision_feats.mean(dim=1)  # [B, dim]
++        proj = self.vision_proj(pooled)  # [B, query_dim]
++        # expand query tokens per batch and add vision info
++        q = self.query_tokens.unsqueeze(0).expand(proj.size(0), -1, -1)  # [B, Q, D]
++        q = q + proj.unsqueeze(1)  # broadcast vision context
++        # flatten for transformer: [Q, B, D]
++        q = q.permute(1, 0, 2)
++        out = self.transformer(q)  # [Q, B, D]
++        out = out.permute(1, 0, 2)  # [B, Q, D]
++        return out  # return per-query embeddings
++
++
++def build_dataloader(image_dir: Path, captions: List[str], processor: BlipProcessor, tokenizer: AutoTokenizer, batch_size=2):
++    image_paths = sorted([p for p in image_dir.glob("*") if p.suffix.lower() in [".jpg", ".jpeg", ".png"]])
++    ds = ImageTextDataset(image_paths, captions[: len(image_paths)], processor, tokenizer)
++    return DataLoader(ds, batch_size=batch_size, shuffle=True)
++
++
++def train_qformer(args):
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    os.makedirs(args.output_dir, exist_ok=True)
++
++    # Load BLIP processor & vision encoder (we will freeze the vision encoder)
++    processor = BlipProcessor.from_pretrained(args.blip_model)
++    blip = BlipForConditionalGeneration.from_pretrained(args.blip_model).vision_model  # access vision encoder
++    blip.to(device)
++    blip.eval()
++    for p in blip.parameters():
++        p.requires_grad = False
++
++    # Tokenizer for LLM to create targets (we don't load LLM here)
++    tokenizer = AutoTokenizer.from_pretrained(args.llm_tokenizer)
++
++    # Build a tiny Q-Former
++    sample_dim = blip.config.hidden_size if hasattr(blip.config, "hidden_size") else 768
++    qformer = SimpleQFormer(input_dim=sample_dim, num_queries=args.num_queries, query_dim=args.query_dim, num_layers=args.num_layers).to(device)
++
++    # Projector to LLM embedding dimension (we will save this projector)
++    projector = nn.Linear(args.query_dim, args.llm_embedding_dim).to(device)
++
++    # Dummy captions: in practice supply image-instruction pairs (here we reuse filenames)
++    captions = [p.stem for p in sorted(Path(args.image_dir).glob("*"))]
++
++    dl = build_dataloader(Path(args.image_dir), captions, processor, tokenizer, batch_size=args.batch_size)
++
++    opt = torch.optim.Adam(list(qformer.parameters()) + list(projector.parameters()), lr=args.lr)
++    loss_fn = nn.MSELoss()
++
++    for epoch in range(args.epochs):
++        qformer.train()
++        total_loss = 0.0
++        for batch in dl:
++            img_bytes, encoded, target = batch
++            # encoded uses processor; convert to device tensors for vision model
++            # BLIP expects pixel_values; encoded is a dict
++            encoded = {k: v.squeeze(1).to(device) for k, v in encoded.items()}
++            with torch.no_grad():
++                vision_outputs = blip(**encoded)  # last_hidden_state
++                feats = vision_outputs.last_hidden_state  # [B, seq, dim]
++            q_emb = qformer(feats)  # [B, Q, D]
++            proj = projector(q_emb.mean(dim=1))  # [B, llm_dim]
++
++            # Create a simple target embedding using tokenizer embeddings (cheap proxy)
++            # For the scaffold, we compare projected queries to averaged token embeddings of the prompt text
++            # In practice, use LLM embedding layer to get targets.
++            batch_targets = []
++            for t in target["input_ids"]:
++                emb = torch.randn(args.llm_embedding_dim, device=device)  # placeholder
++                batch_targets.append(emb)
++            batch_targets = torch.stack(batch_targets, dim=0)
++
++            loss = loss_fn(proj, batch_targets)
++            opt.zero_grad()
++            loss.backward()
++            opt.step()
++            total_loss += loss.item()
++        print(f"Epoch {epoch+1}/{args.epochs} loss={total_loss/len(dl):.4f}")
++
++    # Save adapter weights
++    adapter_state = {"qformer": qformer.state_dict(), "projector": projector.state_dict()}
++    torch.save(adapter_state, os.path.join(args.output_dir, "qformer_adapter.pth"))
++    print("Saved Q-Former adapter to", args.output_dir)
++
++
++def parse_args():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--image_dir", required=True)
++    parser.add_argument("--output_dir", required=True)
++    parser.add_argument("--blip_model", default="Salesforce/blip-image-captioning-large")
++    parser.add_argument("--llm_tokenizer", default="mistralai/mistral-7b")
++    parser.add_argument("--llm_embedding_dim", type=int, default=4096)
++    parser.add_argument("--num_queries", type=int, default=4)
++    parser.add_argument("--query_dim", type=int, default=768)
++    parser.add_argument("--num_layers", type=int, default=2)
++    parser.add_argument("--batch_size", type=int, default=2)
++    parser.add_argument("--epochs", type=int, default=2)
++    parser.add_argument("--lr", type=float, default=1e-4)
++    return parser.parse_args()
++
++
++if __name__ == "__main__":
++    args = parse_args()
++    train_qformer(args)
++
+--- /dev/null
++++ b/openquill/serving/vllm_tgi_wrapper.py
+@@ -0,0 +1,214 @@
++"""
++vLLM + TGI wrapper and router (scaffold)
++
++This module provides a simple router that can:
++- serve requests to an in-process vLLM server (if available)
++- fallback to a TGI HTTP endpoint (text-generation-inference) or local HF model
++- provide a unified generate(prompt, backend_preference, **kwargs) API
++
++Notes:
++- vLLM requires installation and typically runs as a separate server; here we demonstrate how to call a vLLM client when available.
++- TGI is expected to run as an HTTP server (text-generation-inference). This code shows how to invoke both.
++"""
++import os
++import time
++import logging
++from typing import Optional, Dict, Any
++
++import requests
++
++logger = logging.getLogger("openquill.vllm_tgi")
++logging.basicConfig(level=logging.INFO)
++
++# Configuration via env
++VLLM_HOST = os.environ.get("VLLM_HOST", "http://localhost:8080")
++TGI_HOST = os.environ.get("TGI_HOST", "http://localhost:8081")
++LOCAL_HF_FALLBACK = os.environ.get("OQ_LOCAL_HF_FALLBACK", "false").lower() in ("1","true","yes")
++LOCAL_HF_MODEL = os.environ.get("OQ_LOCAL_HF_MODEL", "gpt2")
++
++
++class VLLMClient:
++    """
++    Minimal vLLM HTTP client. Assumes vLLM exposes REST-like generation endpoint.
++    Adjust to your vLLM deployment (vLLM has various client options).
++    """
++    def __init__(self, base_url: str = VLLM_HOST):
++        self.base_url = base_url.rstrip("/")
++
++    def generate(self, prompt: str, max_tokens: int = 256, temperature: float = 0.0):
++        url = f"{self.base_url}/v1/generate"
++        payload = {"prompt": prompt, "max_tokens": max_tokens, "temperature": temperature}
++        try:
++            r = requests.post(url, json=payload, timeout=30)
++            r.raise_for_status()
++            data = r.json()
++            # adapt based on your vLLM output format
++            return data.get("text") or data.get("generated_text") or ""
++        except Exception as e:
++            logger.warning("VLLM generate failed: %s", e)
++            raise
++
++
++class TGIClient:
++    """
++    Text-Generation-Inference (TGI) client. TGI typically exposes /v1/models/{model}/generate.
++    """
++    def __init__(self, base_url: str = TGI_HOST, model: str = "mistralai/mistral-7b"):
++        self.base_url = base_url.rstrip("/")
++        self.model = model
++
++    def generate(self, prompt: str, max_tokens: int = 256, temperature: float = 0.0):
++        url = f"{self.base_url}/v1/models/{self.model}:predict"
++        payload = {"inputs": prompt, "parameters": {"max_new_tokens": max_tokens, "temperature": temperature}}
++        try:
++            r = requests.post(url, json=payload, timeout=30)
++            r.raise_for_status()
++            data = r.json()
++            # TGI response shapes vary; attempt common patterns
++            if isinstance(data, dict) and "outputs" in data:
++                return data["outputs"][0].get("generated_text", "") if data["outputs"] else ""
++            if isinstance(data, list) and len(data) > 0:
++                return data[0].get("generated_text", "")
++            return data.get("generated_text", "") if isinstance(data, dict) else ""
++        except Exception as e:
++            logger.warning("TGI generate failed: %s", e)
++            raise
++
++
++class LocalHFClient:
++    """
++    Very small local HF fallback (synchronous). For smoke tests only.
++    """
++    def __init__(self, model_name: str = LOCAL_HF_MODEL):
++        self.model_name = model_name
++        self._load()
++
++    def _load(self):
++        try:
++            from transformers import AutoTokenizer, AutoModelForCausalLM
++            import torch
++            self.tok = AutoTokenizer.from_pretrained(self.model_name, use_fast=True)
++            self.model = AutoModelForCausalLM.from_pretrained(self.model_name).to("cpu")
++        except Exception as e:
++            logger.warning("Local HF fallback load failed: %s", e)
++            self.tok = None
++            self.model = None
++
++    def generate(self, prompt: str, max_tokens: int = 128, temperature: float = 0.0):
++        if self.model is None:
++            raise RuntimeError("Local HF model not available")
++        ids = self.tok(prompt, return_tensors="pt").input_ids
++        out = self.model.generate(ids, max_new_tokens=max_tokens)
++        return self.tok.decode(out[0], skip_special_tokens=True)
++
++
++class Router:
++    """
++    Router that chooses a backend according to preference and availability:
++     - if prefer='low_latency' -> try VLLM then TGI then local
++     - if prefer='high_quality' -> try TGI then VLLM then local
++    """
++    def __init__(self):
++        self.vllm = VLLMClient(VLLM_HOST)
++        self.tgi = TGIClient(TGI_HOST)
++        self.local = LocalHFClient(LOCAL_HF_MODEL) if LOCAL_HF_FALLBACK else None
++
++    def generate(self, prompt: str, prefer: str = "low_latency", max_tokens: int = 256, temperature: float = 0.0) -> Dict[str, Any]:
++        backends = []
++        if prefer == "high_quality":
++            backends = [("tgi", self.tgi), ("vllm", self.vllm)]
++        else:
++            backends = [("vllm", self.vllm), ("tgi", self.tgi)]
++        if self.local:
++            backends.append(("local", self.local))
++
++        last_exc = None
++        for name, client in backends:
++            try:
++                start = time.time()
++                text = client.generate(prompt, max_tokens=max_tokens, temperature=temperature)
++                latency = time.time() - start
++                logger.info("Backend %s succeeded in %.3fs", name, latency)
++                return {"backend": name, "text": text, "latency": latency}
++            except Exception as e:
++                last_exc = e
++                logger.info("Backend %s failed, trying next: %s", name, e)
++        logger.error("All backends failed: %s", last_exc)
++        raise RuntimeError("All backends failed") from last_exc
++
++
++if __name__ == "__main__":
++    # smoke test router
++    r = Router()
++    res = r.generate("Hello world", prefer="low_latency", max_tokens=32)
++    print(res)
++
+--- /dev/null
++++ b/openquill/training/rlhf_toy.py
+@@ -0,0 +1,172 @@
++"""
++Toy RLHF pipeline using trl (or trlx) style approach (scaffold).
++
++This file provides:
++ - a tiny example for generating preference data from SFT model
++ - training a small reward model as a classifier over (chosen, rejected)
++ - a sketch of a PPO update loop using trl (if installed)
++
++This is educational and not production-ready. RLHF requires careful safety review, human labels, and compute.
++"""
++import argparse
++import os
++from typing import List, Tuple
++
++import torch
++from datasets import Dataset
++from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSequenceClassification
++
++try:
++    # trl (or trlx) provides PPO implementations - optional
++    from trl import PPOTrainer, PPOConfig
++    TRL_AVAILABLE = True
++except Exception:
++    TRL_AVAILABLE = False
++
++
++def generate_pairwise_choices(model_name: str, prompts: List[str], max_new_tokens: int = 64) -> List[dict]:
++    """
++    Given a base model, generate two responses per prompt to form preference pairs.
++    In practice, humans label the preferred response. Here we synthesize by random sampling.
++    """
++    tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
++    model = AutoModelForCausalLM.from_pretrained(model_name).to("cpu")
++    pairs = []
++    for p in prompts:
++        input_ids = tok(p, return_tensors="pt").input_ids
++        # generate 2 variants (low temperature and high)
++        out1 = model.generate(input_ids, max_new_tokens=max_new_tokens, do_sample=False)
++        out2 = model.generate(input_ids, max_new_tokens=max_new_tokens, do_sample=True, temperature=1.0)
++        r1 = tok.decode(out1[0], skip_special_tokens=True)
++        r2 = tok.decode(out2[0], skip_special_tokens=True)
++        # naive scoring: prefer shorter (toy)
++        preferred = 0 if len(r1) <= len(r2) else 1
++        pairs.append({"prompt": p, "response_chosen": r1 if preferred == 0 else r2, "response_rejected": r2 if preferred == 0 else r1})
++    return pairs
++
++
++def train_reward_model_from_pairs(pairs: List[dict], model_name: str = "distilbert-base-uncased", output_dir: str = "./outputs/reward"):
++    """
++    Train a binary preference reward model: given (prompt + response) classify preference score.
++    This is a very small illustrative training loop using HF Trainer would be better.
++    """
++    texts = []
++    labels = []
++    for p in pairs:
++        texts.append(p["prompt"] + " " + p["response_chosen"])
++        labels.append(1)
++        texts.append(p["prompt"] + " " + p["response_rejected"])
++        labels.append(0)
++
++    tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
++    enc = tok(texts, truncation=True, padding=True, return_tensors="pt")
++    ds = Dataset.from_dict({"input_ids": enc["input_ids"].tolist(), "attention_mask": enc["attention_mask"].tolist(), "labels": labels})
++
++    # Build simple classification model
++    cls = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=1).to("cpu")
++    cls.train()
++    optim = torch.optim.Adam(cls.parameters(), lr=1e-5)
++    batch_size = 2
++    for epoch in range(2):
++        total_loss = 0.0
++        for i in range(0, len(ds), batch_size):
++            batch = ds[i: i + batch_size]
++            input_ids = torch.tensor(batch["input_ids"])
++            attn = torch.tensor(batch["attention_mask"])
++            labels_t = torch.tensor(batch["labels"], dtype=torch.float).unsqueeze(1)
++            outputs = cls(input_ids=input_ids, attention_mask=attn, labels=labels_t)
++            loss = outputs.loss
++            optim.zero_grad()
++            loss.backward()
++            optim.step()
++            total_loss += loss.item()
++        print(f"Epoch {epoch+1} reward training loss {total_loss:.4f}")
++    os.makedirs(output_dir, exist_ok=True)
++    cls.save_pretrained(output_dir)
++    print("Saved reward model to", output_dir)
++    return output_dir
++
++
++def toy_ppo_loop(policy_model_name: str, reward_model_dir: str, prompts: List[str], ppo_epochs: int = 1):
++    """
++    Sketch of PPO loop using trl.PPOTrainer if available.
++    This function will raise if trl not installed.
++    """
++    if not TRL_AVAILABLE:
++        raise RuntimeError("trl not available. Install trl (or trlx) to run PPO example.")
++
++    # In production, you would load a policy model, setup tokenizer and PPOTrainer; this is a stub.
++    ppo_cfg = PPOConfig(model_name=policy_model_name)
++    trainer = PPOTrainer(ppo_config=ppo_cfg)
++    # Rollouts & rewards: for toy example, generate responses, score with reward_model, run trainer.step()
++    # See trl docs for concrete implementation.
++    raise NotImplementedError("Please integrate with trl.PPOTrainer following their examples.")
++
++
++def parse_args():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--policy_model", default="gpt2")
++    parser.add_argument("--reward_model_name", default="distilbert-base-uncased")
++    parser.add_argument("--output_dir", default="./outputs/rlhf")
++    return parser.parse_args()
++
++
++if __name__ == "__main__":
++    args = parse_args()
++    # Example flow:
++    prompts = ["Explain why the sky is blue.", "Write a python function to add two numbers."]
++    print("Generating pairwise choices (toy)...")
++    pairs = generate_pairwise_choices(args.policy_model, prompts)
++    print("Training toy reward model...")
++    reward_dir = train_reward_model_from_pairs(pairs, model_name=args.reward_model_name, output_dir=args.output_dir)
++    print("Reward model saved to:", reward_dir)
++    print("PPO loop is a stub - integrate trl/trlx to continue.")
++
+--- /dev/null
++++ b/examples/rag_demo.py
+@@ -0,0 +1,148 @@
++"""
++RAG demo: small corpus, embedding with sentence-transformers, FAISS indexing, and retrieval helper.
++
++Run:
++  pip install sentence-transformers faiss-cpu
++  python examples/rag_demo.py
++
++This demo builds an in-memory FAISS index and queries it with a sample prompt.
++"""
++from sentence_transformers import SentenceTransformer
++import numpy as np
++import faiss
++import os
++
++CORPUS = [
++    "OpenQuill is a compact toolkit for building multimodal LLMs.",
++    "Mistral-7B is an efficient 7B model released under Apache-2.0.",
++    "RedPajama-INCITE is an open weights research model.",
++    "Falcon-40B is a larger model that requires more compute."
++]
++
++
++def build_embeddings(model_name="sentence-transformers/all-MiniLM-L6-v2"):
++    embedder = SentenceTransformer(model_name)
++    embs = embedder.encode(CORPUS, convert_to_numpy=True)
++    return embs, embedder
++
++
++def build_faiss_index(embs: np.ndarray):
++    d = embs.shape[1]
++    index = faiss.IndexFlatL2(d)
++    index.add(embs.astype("float32"))
++    return index
++
++
++def query_index(query: str, index, embedder, k=3):
++    q_emb = embedder.encode([query], convert_to_numpy=True)
++    dists, ids = index.search(q_emb.astype("float32"), k)
++    ids = ids[0].tolist()
++    return ids, dists[0].tolist()
++
++
++def main():
++    embs, embedder = build_embeddings()
++    index = build_faiss_index(embs)
++    queries = [
++        "Tell me about Mistral model license.",
++        "What is OpenQuill?",
++        "Which model is large and requires more memory?"
++    ]
++    for q in queries:
++        ids, dists = query_index(q, index, embedder)
++        print(f"Query: {q}")
++        for i, dist in zip(ids, dists):
++            print(f"  - {CORPUS[i]} (dist={dist:.4f})")
++        print()
++
++
++if __name__ == "__main__":
++    main()
++
+-- 
+2.40.1
