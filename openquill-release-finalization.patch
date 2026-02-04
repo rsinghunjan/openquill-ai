@@ -1,0 +1,761 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Ops <ops@example.com>
+Date: 2026-02-15 00:00:00 +0000
+Subject: [PATCH] finalization tools: release finalization orchestration, annotator management, reward validation, ops hardening checks, quantize/long-context bench, firecracker-containerd values, release signoff docs
+
+---
+ scripts/finalize_release_pipeline.py                  | 345 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ tools/annotator_management.py                         | 221 +++++++++++++++++++++++++++++++
+ openquill/safety/reward_validation.py                 | 232 ++++++++++++++++++++++++++++++++
+ scripts/ops_hardening_checklist.py                    | 176 +++++++++++++++++++++++++
+ scripts/quantize_benchmark.py                         | 142 ++++++++++++++
+ scripts/long_context_attention_bench.py               | 168 +++++++++++++++++++++
+ k8s/firecracker_containerd_values.yaml                |  92 +++++++++
+ docs/release_signoff_instructions.md                  |  98 ++++++++++
+ 8 files changed, 1474 insertions(+)
+ create mode 100644 scripts/finalize_release_pipeline.py
+ create mode 100644 tools/annotator_management.py
+ create mode 100644 openquill/safety/reward_validation.py
+ create mode 100644 scripts/ops_hardening_checklist.py
+ create mode 100644 scripts/quantize_benchmark.py
+ create mode 100644 scripts/long_context_attention_bench.py
+ create mode 100644 k8s/firecracker_containerd_values.yaml
+ create mode 100644 docs/release_signoff_instructions.md
+--- /dev/null
++++ b/scripts/finalize_release_pipeline.py
+@@ -0,0 +1,345 @@
++#!/usr/bin/env python3
++"""
++scripts/finalize_release_pipeline.py
++
++Orchestrate final release checks before publishing merged checkpoints.
++Performs:
++ - check for merged checkpoints
++ - annotation QC (gold tests)
++ - reward model validation on held-out set
++ - quantized artifact validation
++ - long-context benchmark (hierarchical + native if available)
++ - ops hardening checklist (k8s manifest quick checks)
++ - Assemble release_signoff.json (for legal/safety signoff)
++
++Usage:
++  python scripts/finalize_release_pipeline.py --merged_dir outputs/sft-mistral/merged \
++      --annotations annotations/annotations.csv --gold annotations/gold_tests.json \
++      --quantized models/mistral.gguf --long_doc data/long_doc.txt --manifest release_snapshots_manifest.json \
++      --out release_signoff.json
++
++This script runs conservative checks and prints a human-readable summary. Final publish must still be approved by legal & safety leads.
++"""
++from __future__ import annotations
++import argparse
++import json
++import os
++import subprocess
++from pathlib import Path
++from typing import Dict, Any
++import sys
++
++ROOT = Path(__file__).resolve().parents[1]
++
++def run_cmd(cmd: str):
++    print("RUN:", cmd)
++    res = subprocess.run(cmd, shell=True)
++    if res.returncode != 0:
++        raise RuntimeError(f"Command failed: {cmd}")
++
++def check_merged(merged_dir: Path) -> Dict[str, Any]:
++    if not merged_dir.exists():
++        return {"ok": False, "reason": "merged_dir_missing"}
++    # quick heuristic: check for pytorch model file or adapter marker
++    found = any(merged_dir.rglob(pattern) for pattern in ("pytorch_model.bin", "*.bin", "config.json"))
++    return {"ok": found, "path": str(merged_dir)}
++
++def run_annotation_qc(annotations_csv: Path, gold_json: Path) -> Dict[str, Any]:
++    # call tools/annotation_qc.py
++    cmd = f"python {ROOT}/tools/annotation_qc.py --annotations {annotations_csv} --gold {gold_json}"
++    try:
++        run_cmd(cmd)
++        return {"ok": True}
++    except Exception as e:
++        return {"ok": False, "error": str(e)}
++
++def run_reward_validation(pairs_jsonl: Path, reward_model_dir: Path) -> Dict[str, Any]:
++    # call reward_validation module
++    try:
++        from openquill.safety.reward_validation import validate_reward_model
++    except Exception:
++        return {"ok": False, "error": "reward_validation import failed"}
++    try:
++        report = validate_reward_model(str(pairs_jsonl), str(reward_model_dir))
++        return {"ok": report.get("auc", 0) >= 0.6, "report": report}
++    except Exception as e:
++        return {"ok": False, "error": str(e)}
++
++def run_quant_validate(merged_dir: Path, quantized_path: Path, prompts_path: Path) -> Dict[str, Any]:
++    cmd = f"python {ROOT}/scripts/quantize_validate.py --model {merged_dir} --quantized {quantized_path} --test_prompts {prompts_path} --tolerance 0.80"
++    try:
++        run_cmd(cmd)
++        return {"ok": True}
++    except Exception as e:
++        return {"ok": False, "error": str(e)}
++
++def run_long_context_bench(model_path: str, doc_path: str) -> Dict[str, Any]:
++    cmd = f"python {ROOT}/scripts/long_context_benchmark.py --model {model_path} --doc {doc_path}"
++    try:
++        run_cmd(cmd)
++        return {"ok": True}
++    except Exception as e:
++        return {"ok": False, "error": str(e)}
++
++def run_ops_hardening_check(manifest_path: Path) -> Dict[str, Any]:
++    cmd = f"python {ROOT}/scripts/ops_hardening_checklist.py --manifests {manifest_path}"
++    try:
++        run_cmd(cmd)
++        return {"ok": True}
++    except Exception as e:
++        return {"ok": False, "error": str(e)}
++
++def collect_snapshot_manifest(manifest_path: Path) -> Dict[str, Any]:
++    if not manifest_path.exists():
++        return {"ok": False, "error": "manifest_missing"}
++    try:
++        data = json.loads(manifest_path.read_text())
++        return {"ok": True, "manifest": data}
++    except Exception as e:
++        return {"ok": False, "error": str(e)}
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--merged_dir", required=True)
++    parser.add_argument("--annotations", required=True)
++    parser.add_argument("--gold", required=True)
++    parser.add_argument("--pairs_jsonl", required=False, default="data/reward_pairs.jsonl")
++    parser.add_argument("--reward_model", required=False, default="outputs/reward")
++    parser.add_argument("--quantized", required=False, default="./models/mistral.gguf")
++    parser.add_argument("--prompts", required=False, default="tests/prompts.txt")
++    parser.add_argument("--long_doc", required=False, default="data/long_doc.txt")
++    parser.add_argument("--manifest", required=False, default="release_snapshots_manifest.json")
++    parser.add_argument("--out", required=False, default="release_signoff.json")
++    args = parser.parse_args()
++
++    merged_dir = Path(args.merged_dir)
++    annotations = Path(args.annotations)
++    gold = Path(args.gold)
++    pairs = Path(args.pairs_jsonl)
++    reward_model = Path(args.reward_model)
++    quantized = Path(args.quantized)
++    prompts = Path(args.prompts)
++    long_doc = Path(args.long_doc)
++    manifest = Path(args.manifest)
++    out = Path(args.out)
++
++    summary = {}
++    print("Checking merged checkpoint...")
++    summary["merged_check"] = check_merged(merged_dir)
++
++    print("Running annotation QC...")
++    summary["annotation_qc"] = run_annotation_qc(annotations, gold)
++
++    print("Validating reward model (holdout)...")
++    summary["reward_validation"] = run_reward_validation(pairs, reward_model)
++
++    print("Validating quantized artifact ...")
++    summary["quant_validation"] = run_quant_validate(merged_dir, quantized, prompts)
++
++    print("Running long-context benchmark (if doc provided)...")
++    if long_doc.exists():
++        summary["long_context"] = run_long_context_bench(str(merged_dir), str(long_doc))
++    else:
++        summary["long_context"] = {"ok": False, "reason": "no_long_doc"}
++
++    print("Ops hardening checks (manifests)...")
++    summary["ops_hardening"] = run_ops_hardening_check(manifest)
++
++    print("Collecting snapshot manifest...")
++    summary["snapshot_manifest"] = collect_snapshot_manifest(manifest)
++
++    # Aggregate decision heuristic (conservative)
++    overall_ok = all([
++        summary["merged_check"].get("ok", False),
++        summary["annotation_qc"].get("ok", False) if isinstance(summary["annotation_qc"], dict) else summary["annotation_qc"],
++        summary["reward_validation"].get("ok", False),
++        summary["quant_validation"].get("ok", False),
++        summary["ops_hardening"].get("ok", False),
++    ])
++
++    signoff = {
++        "summary": summary,
++        "release_candidate": str(merged_dir),
++        "overall_ok": bool(overall_ok),
++    }
++
++    out.write_text(json.dumps(signoff, indent=2))
++    print("Wrote release signoff candidate to", out)
++    if not overall_ok:
++        print("Some checks failed; do NOT publish. Inspect release_signoff.json for details.")
++        sys.exit(2)
++    print("All checks passed (preliminary). Obtain legal and safety human signoff before publishing.")
++    sys.exit(0)
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null
++++ b/tools/annotator_management.py
+@@ -0,0 +1,221 @@
++#!/usr/bin/env python3
++"""
++tools/annotator_management.py
++
++Utilities to manage annotators, onboarding CSV generation, token provisioning, and basic metrics.
++This is a lightweight helper; integrate with your org auth system for production.
++
++Features:
++ - generate onboarding CSV with annotator id and one-time token
++ - compute per-annotator metrics from annotations CSV
++ - export gold tests entries for the annotation service
++
++Usage:
++  python tools/annotator_management.py --generate-onboard 10 --out annotators.csv
++  python tools/annotator_management.py --metrics annotations.csv --out metrics.json
++  python tools/annotator_management.py --export-gold gold_input.json --out gold_tests.json
++"""
++from __future__ import annotations
++import argparse
++import csv
++import json
++import os
++import secrets
++from typing import Dict, List
++from collections import defaultdict
++
++def generate_onboarding(n: int, out: str):
++    fieldnames = ["annotator_id", "token", "email_placeholder"]
++    rows = []
++    for i in range(n):
++        aid = f"annotator_{secrets.token_hex(4)}"
++        token = secrets.token_urlsafe(16)
++        rows.append({"annotator_id": aid, "token": token, "email_placeholder": f"{aid}@example.com"})
++    with open(out, "w", newline="", encoding="utf-8") as f:
++        writer = csv.DictWriter(f, fieldnames=fieldnames)
++        writer.writeheader()
++        writer.writerows(rows)
++    print(f"Wrote {n} annotator onboarding rows to {out}")
++
++def compute_metrics(annotations_csv: str) -> Dict[str, Dict]:
++    """
++    Compute simple metrics per annotator: count, avg_confidence, gold_pass (if gold presence).
++    Input annotations CSV assumed to have fields: annotator, preferred, confidence, prompt, response_a, response_b
++    """
++    metrics = defaultdict(lambda: {"count": 0, "sum_conf": 0.0, "gold_correct": 0, "gold_total": 0})
++    with open(annotations_csv, "r", encoding="utf-8") as f:
++        reader = csv.DictReader(f)
++        for r in reader:
++            a = r.get("annotator", "unknown")
++            metrics[a]["count"] += 1
++            try:
++                metrics[a]["sum_conf"] += float(r.get("confidence") or 3)
++            except Exception:
++                metrics[a]["sum_conf"] += 3
++            # gold flag: assume metadata or notes contains "gold:true" or prompt in gold set handled elsewhere
++            if r.get("notes","").lower().find("gold:true") >= 0:
++                metrics[a]["gold_total"] += 1
++                if r.get("notes","").lower().find("gold:pass") >= 0:
++                    metrics[a]["gold_correct"] += 1
++    out = {}
++    for k, v in metrics.items():
++        out[k] = {
++            "count": v["count"],
++            "avg_confidence": v["sum_conf"] / v["count"] if v["count"] else None,
++            "gold_total": v["gold_total"],
++            "gold_correct": v["gold_correct"],
++            "gold_pass_rate": (v["gold_correct"]/v["gold_total"]) if v["gold_total"] else None
++        }
++    return out
++
++def export_gold_tests(gold_in: str, out: str):
++    """
++    Convert an input JSONL or JSON gold spec into the gold_tests.json format used by QC.
++    Input expected as list of {"prompt":..., "preferred":"A"|"B"}
++    """
++    with open(gold_in, "r", encoding="utf-8") as f:
++        data = json.load(f)
++    # normalize to list of prompt/preferred
++    out_list = []
++    for it in data:
++        p = it.get("prompt")
++        pref = it.get("preferred")
++        if p and pref:
++            out_list.append({"prompt": p, "preferred": pref})
++    with open(out, "w", encoding="utf-8") as f:
++        json.dump(out_list, f, indent=2)
++    print(f"Wrote gold tests {len(out_list)} -> {out}")
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--generate-onboard", type=int, default=0, help="Generate onboarding CSV rows")
++    parser.add_argument("--out", default="annotators.csv")
++    parser.add_argument("--metrics", default="", help="Compute metrics from annotations CSV")
++    parser.add_argument("--metrics_out", default="annotator_metrics.json")
++    parser.add_argument("--export-gold", default="", help="Export gold tests to file")
++    parser.add_argument("--gold_out", default="gold_tests.json")
++    args = parser.parse_args()
++
++    if args.generate_onboard:
++        generate_onboarding(args.generate_onboard, args.out)
++        return
++    if args.metrics:
++        m = compute_metrics(args.metrics)
++        with open(args.metrics_out, "w", encoding="utf-8") as f:
++            json.dump(m, f, indent=2)
++        print("Wrote metrics to", args.metrics_out)
++        return
++    if args.export_gold:
++        export_gold_tests(args.export_gold, args.gold_out)
++        return
++    parser.print_help()
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null
++++ b/openquill/safety/reward_validation.py
+@@ -0,0 +1,232 @@
++"""
++openquill/safety/reward_validation.py
++
++Utilities to validate reward models using a held-out labeled dataset.
++Exports simple metrics (ROC-AUC, accuracy vs threshold, calibration).
++
++This module assumes reward model is a HF sequence classification head producing a single logit.
++"""
++from __future__ import annotations
++import json
++from pathlib import Path
++from typing import Dict, Any, List
++
++import numpy as np
++from sklearn.metrics import roc_auc_score, accuracy_score, brier_score_loss
++import torch
++from transformers import AutoTokenizer, AutoModelForSequenceClassification
++
++
++def load_pairwise_jsonl(path: str) -> List[Dict]:
++    out = []
++    with open(path, "r", encoding="utf-8") as f:
++        for ln in f:
++            try:
++                j = json.loads(ln)
++                out.append(j)
++            except Exception:
++                continue
++    return out
++
++
++def build_eval_dataset(pairwise: List[Dict]) -> List[Dict]:
++    """
++    Convert pairwise data into (example_text, label) where label is 1 for chosen, 0 for rejected.
++    """
++    examples = []
++    for p in pairwise:
++        examples.append({"text": p["prompt"] + " " + p["response_chosen"], "label": 1})
++        examples.append({"text": p["prompt"] + " " + p["response_rejected"], "label": 0})
++    return examples
++
++
++def score_reward_model(reward_model_dir: str, examples: List[Dict], batch_size: int = 16, device: str = None) -> Dict[str, Any]:
++    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
++    tok = AutoTokenizer.from_pretrained(reward_model_dir, use_fast=True)
++    model = AutoModelForSequenceClassification.from_pretrained(reward_model_dir)
++    model.to(device)
++    model.eval()
++
++    scores = []
++    labels = []
++    for i in range(0, len(examples), batch_size):
++        batch = examples[i:i+batch_size]
++        texts = [b["text"] for b in batch]
++        with torch.no_grad():
++            toks = tok(texts, truncation=True, padding=True, return_tensors="pt", max_length=256).to(device)
++            out = model(**toks)
++            logits = out.logits.squeeze(-1).cpu().numpy()
++        scores.extend(logits.tolist())
++        labels.extend([b["label"] for b in batch])
++
++    arr_scores = np.array(scores)
++    arr_labels = np.array(labels)
++    # Normalize via sigmoid
++    probs = 1 / (1 + np.exp(-arr_scores))
++    auc = roc_auc_score(arr_labels, probs) if len(np.unique(arr_labels)) > 1 else None
++    # choose 0.5 threshold for accuracy
++    preds = (probs >= 0.5).astype(int)
++    acc = accuracy_score(arr_labels, preds)
++    brier = brier_score_loss(arr_labels, probs)
++    return {"roc_auc": auc, "accuracy": float(acc), "brier": float(brier), "n": len(arr_labels)}
++
++
++def validate_reward_model(pairwise_jsonl: str, reward_model_dir: str) -> Dict[str, Any]:
++    pairs = load_pairwise_jsonl(pairwise_jsonl)
++    # split into train/holdout ideally; here assume pairs contain holdout or caller passes holdout path
++    # For validation, we treat the entire file as evaluation; in practice use holdout splits.
++    examples = build_eval_dataset(pairs)
++    report = score_reward_model(reward_model_dir, examples)
++    return report
++
++
++if __name__ == "__main__":
++    import argparse
++    p = argparse.ArgumentParser()
++    p.add_argument("--pairs", default="data/reward_pairs.jsonl")
++    p.add_argument("--reward_model", default="outputs/reward")
++    args = p.parse_args()
++    r = validate_reward_model(args.pairs, args.reward_model)
++    print(json.dumps(r, indent=2))
++
+--- /dev/null
++++ b/scripts/ops_hardening_checklist.py
+@@ -0,0 +1,176 @@
++#!/usr/bin/env python3
++"""
++scripts/ops_hardening_checklist.py
++
++Performs quick checks over k8s manifest directory or a single manifest to ensure common hardening items:
++ - NodeSelectors / tolerations present for GPU workloads
++ - PersistentVolumeClaim usage for model storage
++ - Secrets referenced for tokens
++ - TLS secret present
++ - RuntimeClass presence for runsc if tool sandboxing planned
++
++This is a lightweight lint; operators must perform full security audits.
++"""
++from __future__ import annotations
++import argparse
++import yaml
++from pathlib import Path
++from typing import List
++import sys
++
++def load_manifests(path: Path) -> List[dict]:
++    docs = []
++    if path.is_dir():
++        files = list(path.glob("**/*.yaml")) + list(path.glob("**/*.yml"))
++    else:
++        files = [path]
++    for f in files:
++        try:
++            with open(f, "r", encoding="utf-8") as fh:
++                for doc in yaml.safe_load_all(fh):
++                    if doc:
++                        docs.append({"file": str(f), "doc": doc})
++        except Exception as e:
++            print("Failed to parse", f, ":", e)
++    return docs
++
++def check_node_selector(doc: dict) -> bool:
++    pod = doc.get("spec", {}).get("template", {}).get("spec", {})
++    return "nodeSelector" in pod or "tolerations" in pod
++
++def check_pvc(doc: dict) -> bool:
++    # look for volumes referencing persistentVolumeClaim
++    vols = doc.get("spec", {}).get("template", {}).get("spec", {}).get("volumes", [])
++    for v in vols or []:
++        if v.get("persistentVolumeClaim"):
++            return True
++    return False
++
++def check_secrets(doc: dict) -> bool:
++    text = str(doc)
++    return "secret" in text.lower() or "secrets" in (doc.get("spec", {}) or {})
++
++def check_runtimeclass(doc: dict) -> bool:
++    pod = doc.get("spec", {}).get("template", {}).get("spec", {})
++    return "runtimeClassName" in pod if pod else False
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--manifests", required=True, help="Path to manifest file or directory")
++    args = parser.parse_args()
++    p = Path(args.manifests)
++    if not p.exists():
++        print("Path not found:", p); sys.exit(2)
++    docs = load_manifests(p)
++    report = {"checked_files": [], "issues": []}
++    for d in docs:
++        doc = d["doc"]
++        kind = doc.get("kind")
++        fname = d["file"]
++        if kind in ("Deployment", "StatefulSet", "DaemonSet", "Job"):
++            ok_ns = check_node_selector(doc)
++            ok_pvc = check_pvc(doc)
++            ok_secret = check_secrets(doc)
++            ok_runtime = check_runtimeclass(doc)
++            report["checked_files"].append({"file": fname, "kind": kind, "node_selector": ok_ns, "pvc": ok_pvc, "secret_references": ok_secret, "runtimeclass": ok_runtime})
++            if not ok_ns:
++                report["issues"].append({"file": fname, "issue": "missing nodeSelector/tolerations for GPU workloads"})
++            if not ok_pvc:
++                report["issues"].append({"file": fname, "issue": "missing PVC reference for model storage"})
++            if not ok_secret:
++                report["issues"].append({"file": fname, "issue": "no secrets referenced (check HF tokens, Sentry, etc.)"})
++            if not ok_runtime:
++                report["issues"].append({"file": fname, "issue": "no runtimeClassName set (consider runsc for sandboxed jobs)"})
++    import json
++    print(json.dumps(report, indent=2))
++    if report["issues"]:
++        print("Ops hardening checks found issues. Fix before production.")
++        sys.exit(3)
++    print("Ops hardening quick-check passed (no issues found).")
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null
++++ b/scripts/quantize_benchmark.py
+@@ -0,0 +1,142 @@
++#!/usr/bin/env python3
++"""
++scripts/quantize_benchmark.py
++
++High-level driver to:
++ - Run AutoGPTQ or converter to produce quantized artifact
++ - Validate via quantize_validate.py
++ - Produce JSON report for release signoff
++
++Usage:
++  python scripts/quantize_benchmark.py --snapshot outputs/sft-mistral/merged --out report.json
++"""
++from __future__ import annotations
++import argparse
++import json
++import os
++import subprocess
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++
++def run_command(cmd):
++    print("RUN:", cmd)
++    res = subprocess.run(cmd, shell=True)
++    return res.returncode
++
++def autoquant(snapshot: str, out_dir: str, bits: int = 4):
++    # wrapper to call auto_gptq or other quantizer; falling back if not installed
++    if shutil_which("auto_gptq"):
++        cmd = f"auto_gptq build-quant-ptq --model {snapshot} --out {out_dir} --bits {bits}"
++        return run_command(cmd) == 0
++    # fallback: try external converter; not implemented here
++    print("AutoGPTQ not available; skip quantization (operator must run manually).")
++    return False
++
++def shutil_which(name: str) -> bool:
++    from shutil import which
++    return which(name) is not None
++
++def validate_quant(snapshot: str, quant: str):
++    cmd = f"python {ROOT}/scripts/quantize_validate.py --model {snapshot} --quantized {quant} --test_prompts {ROOT}/tests/prompts.txt --tolerance 0.80"
++    return run_command(cmd) == 0
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--snapshot", required=True)
++    parser.add_argument("--quant", default="")
++    parser.add_argument("--out", default="quantize_report.json")
++    parser.add_argument("--bits", type=int, default=4)
++    args = parser.parse_args()
++
++    snapshot = args.snapshot
++    quant = args.quant or f"{snapshot}.gguf"
++    out = Path(args.out)
++    report = {"snapshot": snapshot, "quant": quant, "success": False}
++
++    # attempt quantization
++    ok = autoquant(snapshot, os.path.dirname(quant), bits=args.bits)
++    report["quant_step_ok"] = ok
++
++    # validate
++    if ok or os.path.exists(quant):
++        v = validate_quant(snapshot, quant)
++        report["validate_ok"] = v
++        report["success"] = v
++    else:
++        report["validate_ok"] = False
++        report["success"] = False
++
++    out.write_text(json.dumps(report, indent=2))
++    print("Wrote quant report to", out)
++    if not report["success"]:
++        raise SystemExit(2)
++    print("Quantize benchmark complete and within tolerance.")
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null
++++ b/scripts/long_context_attention_bench.py
+@@ -0,0 +1,168 @@
++#!/usr/bin/env python3
++"""
++scripts/long_context_attention_bench.py
++
++Benchmarks attention kernel performance for long-context workloads and reports memory/time.
++It can test FlashAttention / xFormers availability and compare a naive sliding-window approach
++against a reference generate call on a native long-context model (if available).
++
++Usage:
++  python scripts/long_context_attention_bench.py --model <hf-id-or-path> --tokens 32768
++"""
++from __future__ import annotations
++import argparse
++import time
++import torch
++from transformers import AutoTokenizer, AutoModelForCausalLM
++
++def check_flash_attn():
++    try:
++        import flash_attn
++        return True
++    except Exception:
++        return False
++
++def check_xformers():
++    try:
++        import xformers
++        return True
++    except Exception:
++        return False
++
++def native_long_generate(model_name: str, prompt: str, max_new_tokens: int = 64):
++    tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
++    model = AutoModelForCausalLM.from_pretrained(model_name).to("cuda" if torch.cuda.is_available() else "cpu")
++    ids = tok(prompt, return_tensors="pt").input_ids.to(model.device)
++    t0 = time.time()
++    out = model.generate(ids, max_new_tokens=max_new_tokens)
++    dur = time.time() - t0
++    return {"duration": dur, "output_len": out.shape[-1]}
++
++def sliding_window_generate_sim(prompt: str, window_size: int = 2048, stride: int = 512):
++    # Simulate sliding window strategy runtime cost roughly by tokenization time and chunk count
++    toklen = len(prompt.split())
++    chunks = max(1, (toklen + window_size - 1) // (window_size - stride))
++    t_est = chunks * 0.05  # heuristic per-chunk summarize/generation time (s)
++    return {"chunks": chunks, "estimated_duration": t_est}
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--model", required=True)
++    parser.add_argument("--tokens", type=int, default=32768)
++    parser.add_argument("--prompt_seed", default=" ".join(["This is a test sentence."]*2000))
++    args = parser.parse_args()
++
++    print("Checking attention kernel availability...")
++    fa = check_flash_attn()
++    xf = check_xformers()
++    print(f"FlashAttention available: {fa}; xFormers available: {xf}")
++
++    print("Running native long generate (if model supports it)...")
++    try:
++        res_native = native_long_generate(args.model, args.prompt_seed, max_new_tokens=64)
++        print("Native generate:", res_native)
++    except Exception as e:
++        print("Native generate failed:", e)
++        res_native = {"error": str(e)}
++
++    print("Estimating sliding-window + hierarchical strategy cost...")
++    res_slide = sliding_window_generate_sim(args.prompt_seed, window_size=4096, stride=512)
++    print("Sliding window estimate:", res_slide)
++
++    report = {"flash_attn": fa, "xformers": xf, "native": res_native, "sliding_estimate": res_slide}
++    print("Long-context attention benchmark report:")
++    import json
++    print(json.dumps(report, indent=2))
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null
++++ b/k8s/firecracker_containerd_values.yaml
+@@ -0,0 +1,92 @@
++# Example helm-like values for a firecracker-containerd controller deployment
++# Operator must build/secure the controller image and populate secrets.
++
++replicaCount: 1
++image:
++  repository: ghcr.io/yourorg/firecracker-manager
++  tag: latest
++resources:
++  requests:
++    cpu: "500m"
++    memory: "512Mi"
++  limits:
++    cpu: "1"
++    memory: "1Gi"
++service:
++  port: 9000
++nodeSelector:
++  dedicated: firecracker
++tolerations:
++  - key: "dedicated"
++    operator: "Equal"
++    value: "firecracker"
++    effect: "NoSchedule"
++securityContext:
++  runAsNonRoot: true
++  runAsUser: 1000
++# Secrets and tokens
++secrets:
++  manager_token_secret_name: openquill-firecracker-token
++  image_registry_secret: ""
++# Workdir PV for ephemeral payload staging (emptyDir recommended)
++workdir:
++  emptyDir: true
++
++# Network policy recommendations:
++# - Only allow traffic from the inference controller / internal operator networks.
++# - Block external access unless behind authenticated gateway.
++
+--- /dev/null
++++ b/docs/release_signoff_instructions.md
+@@ -0,0 +1,98 @@
++# Release signoff instructions
++
++This document explains the human workflow for final signoff and publishing a vetted model checkpoint.
++
++1) Pre-requirements
++- Release candidate merged checkpoint present in guarded storage (PVC or S3).
++- release_snapshots_manifest.json produced and pinned.
++- release_signoff.json produced by scripts/finalize_release_pipeline.py showing passing pre-checks.
++- Annotations, reward validation, quantize reports and long-context benchmarks attached.
++
++2) Safety & legal review
++- Safety lead reviews the release_signoff.json and attached reports (annotation QC, reward validation, quantize validation, long-context).
++- Run a red-team campaign and review HIL queue items; ensure critical failure modes are mitigated.
++- Legal reviews the release manifest and dataset cards. If any dataset or base model license has restrictions, document them in release notes.
++- Fill docs/legal_signoff_template.json with reviewers and date, attach audit artifacts.
++
++3) Publish decision matrix
++- If any of the following fail, do NOT publish:
++  - annotation gold pass < 90%
++  - reward model AUC lower than expected (organization-specific threshold)
++  - quantized validation below tolerance (e.g., < 0.80)
++  - critical red-team items unresolved
++- If minor issues exist, consider internal-only release and schedule remediation.
++
++4) Publishing steps (operator)
++- Merge and finalize artifacts in guarded storage (S3 or internal registry).
++- Run scripts/publish_checkpoint.py to push to HF Hub (internal repo) or to S3 with restricted ACL.
++- Publish model_card.md and dataset_card.md in docs/ describing limitations, safety mitigations, and contact/takedown info.
++
++5) Post-release
++- Monitor telemetry: safety flags, HIL queue growth, abuse reports.
++- Schedule periodic red-team runs and retraining cadence.
++- Maintain an incident response & takedown contact in docs/.
++
++6) Contacts
++- Model owner: @ml-team
++- Safety lead: safety@example.com
++- Legal: legal@example.com
++- Ops: infra@example.com
++
++Use this doc when performing manual signoff. Automate parts with CI only after human reviews are integrated into your process.
++
+--- 
+2.40.1
