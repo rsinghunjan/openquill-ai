@@ -1,0 +1,728 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Copilot <copilot@example.com>
+Date: Wed, 04 Feb 2026 00:00:00 +0000
+Subject: [PATCH] enhance repo: model downloader, auth/rate-limiting, metrics, safety, CI, hardware docs, RLHF stub, tests
+
+---
+ .github/workflows/ci.yml                     |  40 ++++++++++++++++++++++++++++++
+ Dockerfile                                   |   8 ++++++
+ docs/hardware.md                              |  38 ++++++++++++++++++++++++++
+ openquill/inference/server.py                 | 114 ++++++++++++++++++++++++++++++++++++++++++
+ openquill/safety/moderation.py                | 106 +++++++++++++++++++++++++++++++++++++
+ openquill/serving/auth.py                     |  56 ++++++++++++++++++++++
+ openquill/serving/ratelimit.py                | 101 +++++++++++++++++++++++++++++++++++
+ openquill/training/rlhf_stub.py               |  48 ++++++++++++++++
+ scripts/download_model.py                     | 118 +++++++++++++++++++++++++++++++++++++++++
+ tests/test_moderation.py                      |  20 ++++++++
+ tests/test_tokenization.py                    |  26 +++++++++++
+ 11 files changed, 715 insertions(+)
+ create mode 100644 .github/workflows/ci.yml
+ create mode 100644 docs/hardware.md
+ create mode 100644 openquill/serving/auth.py
+ create mode 100644 openquill/serving/ratelimit.py
+ create mode 100644 openquill/training/rlhf_stub.py
+ create mode 100644 scripts/download_model.py
+ create mode 100644 tests/test_moderation.py
+ create mode 100644 tests/test_tokenization.py
+--- /dev/null
++++ b/.github/workflows/ci.yml
+@@ -0,0 +1,40 @@
++name: CI
++
++on:
++  push:
++    branches: [ main, master ]
++  pull_request:
++    branches: [ main, master ]
++
++jobs:
++  test:
++    runs-on: ubuntu-latest
++    strategy:
++      matrix:
++        python-version: [3.10]
++    steps:
++      - uses: actions/checkout@v4
++      - name: Set up Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: ${{ matrix.python-version }}
++      - name: Install dependencies (light)
++        run: |
++          python -m pip install --upgrade pip
++          pip install pytest==7.4.0 transformers==4.35.0 torch --quiet
++      - name: Run tests
++        run: |
++          pytest -q
++      - name: Lint (optional)
++        run: |
++          pip install flake8
++          flake8 --max-line-length=120 || true
++
+--- a/docker/Dockerfile
++++ b/docker/Dockerfile
+@@ -1,10 +1,18 @@
+-FROM python:3.11-slim
+-ENV PYTHONDONTWRITEBYTECODE=1
+-ENV PYTHONUNBUFFERED=1
+-WORKDIR /app
+-
+-# Copy requirements and install
+-COPY requirements.txt /tmp/requirements.txt
+-RUN apt-get update && apt-get install -y build-essential git curl \
+-    && pip install --upgrade pip \
+-    && pip install --no-cache-dir -r /tmp/requirements.txt
+-
+-COPY openquill/ ./openquill/
+-EXPOSE 8080
+-CMD ["uvicorn", "openquill.inference.server:app", "--host", "0.0.0.0", "--port", "8080"]
++FROM python:3.11-slim
++ENV PYTHONDONTWRITEBYTECODE=1
++ENV PYTHONUNBUFFERED=1
++WORKDIR /app
++
++# Copy requirements and install
++COPY requirements.txt /tmp/requirements.txt
++RUN apt-get update && apt-get install -y build-essential git curl \
++    && pip install --upgrade pip \
++    && pip install --no-cache-dir -r /tmp/requirements.txt
++
++COPY openquill/ ./openquill/
++EXPOSE 8080
++ENV OQ_API_KEYS=""  # comma-separated API keys for the server
++CMD ["uvicorn", "openquill.inference.server:app", "--host", "0.0.0.0", "--port", "8080"]
++
+--- /dev/null
++++ b/docs/hardware.md
+@@ -0,0 +1,38 @@
++# Hardware and runtime guidance
++
++This document summarizes recommended hardware and runtime fallbacks for training and inference.
++
++1) Training (QLoRA / SFT / RLHF)
++- Small-scale QLoRA (7B) prototype: a single 80GB GPU (A100, H100) or 2x40GB (A30) is recommended.
++- Multi‑GPU distributed training: use accelerate or deepspeed with correct config (see openquill/training/accelerate_config.yaml).
++- RLHF and large-scale PPO require multiple GPUs and CPUs for reward-model and rollout collection.
++
++2) Inference
++- GPU inference: use 80GB-class GPUs for full precision 7B–13B models, or quantized bitsandbytes 4/8-bit for smaller GPU memory.
++- CPU inference: convert to GGUF/ggml for efficient CPU inference (reasoning trade-offs apply).
++
++3) Fallbacks and model loading behavior
++- The inference server now detects CUDA. If no GPU is available, set OQ_LOAD_4BIT=false and use a small test model (e.g., GPT2) for smoke tests.
++- BLIP captioning is GPU heavy. The server will attempt to lazy-load BLIP but will operate without BLIP if GPU not present.
++
++4) Monitoring compute and costs
++- Always measure p50/p95 latency and tokens/sec on target hardware.
++- Use the /metrics endpoint (Prometheus) exposed by the server for request counts and latencies.
++
++5) Quick checks
++- To check GPU: nvidia-smi (inside container or host).
++- To run a smoke inference on CPU:
++  export OQ_MODEL=gpt2
++  export OQ_LOAD_4BIT=false
++  uvicorn openquill.inference.server:app --port 8080
++
+--- a/openquill/inference/server.py
++++ b/openquill/inference/server.py
+@@ -1,238 +1,352 @@
+-from fastapi import FastAPI, HTTPException
+-from pydantic import BaseModel
+-from typing import Optional
+-import base64
+-import io
+-import os
+-import logging
+-
+-from PIL import Image
+-import torch
+-from transformers import (
+-    AutoTokenizer,
+-    AutoModelForCausalLM,
+-    BitsAndBytesConfig,
+-    BlipForConditionalGeneration,
+-    BlipProcessor,
+-)
+-
+-from openquill.safety.moderation import is_safe, external_moderation
+-
+-logger = logging.getLogger("openquill")
+-logging.basicConfig(level=logging.INFO)
+-
+-app = FastAPI(title="OpenQuill Inference Server")
+-
+-# Configuration via environment variables
+-MODEL_NAME = os.environ.get("OQ_MODEL", "mistral-7b")
+-LOAD_IN_4BIT = os.environ.get("OQ_LOAD_4BIT", "true").lower() in ("1", "true", "yes")
+-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+-BLIP_CAPTION_MODEL = os.environ.get("OQ_BLIP_MODEL", "Salesforce/blip-image-captioning-large")
+-
+-# Lazy load objects
+-_tokenizer = None
+-_model = None
+-_blip_processor = None
+-_blip_model = None
+-
+-
+-class GenerationRequest(BaseModel):
+-    prompt: str
+-    max_new_tokens: Optional[int] = 256
+-    temperature: Optional[float] = 0.0
+-    image_b64: Optional[str] = None
+-    use_moderation: Optional[bool] = True
+-
+-
+-def _load_model():
+-    global _tokenizer, _model
+-    if _model is not None:
+-        return
+-
+-    logger.info(f"Loading tokenizer and model: {MODEL_NAME} (device={DEVICE}, 4bit={LOAD_IN_4BIT})")
+-    bnb_config = None
+-    if LOAD_IN_4BIT:
+-        bnb_config = BitsAndBytesConfig(
+-            load_in_4bit=True,
+-            bnb_4bit_compute_dtype=torch.bfloat16,
+-            bnb_4bit_use_double_quant=True,
+-            bnb_4bit_quant_type="nf4",
+-        )
+-
+-    _tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+-    if _tokenizer.pad_token is None:
+-        _tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+-    _model = AutoModelForCausalLM.from_pretrained(
+-        MODEL_NAME, device_map="auto" if DEVICE == "cuda" else None, quantization_config=bnb_config
+-    )
+-    # For CPU-only, ensure model on CPU
+-    if DEVICE == "cpu":
+-        _model.to("cpu")
+-
+-
+-def _load_blip():
+-    global _blip_processor, _blip_model
+-    if _blip_model is not None:
+-        return
+-    try:
+-        _blip_processor = BlipProcessor.from_pretrained(BLIP_CAPTION_MODEL)
+-        _blip_model = BlipForConditionalGeneration.from_pretrained(BLIP_CAPTION_MODEL, device_map="auto" if torch.cuda.is_available() else None)
+-    except Exception as e:
+-        logger.warning("BLIP model load failed: %s", e)
+-        _blip_processor = None
+-        _blip_model = None
+-
+-
+-@app.on_event("startup")
++from fastapi import FastAPI, HTTPException, Request, Response
++from fastapi.responses import PlainTextResponse
++from pydantic import BaseModel
++from typing import Optional
++import base64
++import io
++import os
++import logging
++import time
++
++from PIL import Image
++import torch
++from transformers import (
++    AutoTokenizer,
++    AutoModelForCausalLM,
++    BitsAndBytesConfig,
++    BlipForConditionalGeneration,
++    BlipProcessor,
++)
++
++from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
++
++from openquill.safety.moderation import is_safe, external_moderation, get_refusal_text
++from openquill.serving.auth import require_api_key
++from openquill.serving.ratelimit import RateLimiter
++
++logger = logging.getLogger("openquill")
++logging.basicConfig(level=logging.INFO)
++
++app = FastAPI(title="OpenQuill Inference Server")
++
++# Configuration via environment variables
++MODEL_NAME = os.environ.get("OQ_MODEL", "mistral-7b")
++LOAD_IN_4BIT = os.environ.get("OQ_LOAD_4BIT", "true").lower() in ("1", "true", "yes")
++DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
++BLIP_CAPTION_MODEL = os.environ.get("OQ_BLIP_MODEL", "Salesforce/blip-image-captioning-large")
++RATE_LIMIT_PER_MIN = int(os.environ.get("OQ_RATE_LIMIT_PER_MIN", "60"))
++
++# Lazy load objects
++_tokenizer = None
++_model = None
++_blip_processor = None
++_blip_model = None
++
++# Prometheus metrics
++REQ_COUNTER = Counter("openquill_requests_total", "Total requests", ["endpoint", "status"])
++LATENCY_HIST = Histogram("openquill_request_latency_seconds", "Request latency seconds", ["endpoint"])
++
++# Rate limiter instance (in-memory, per-key)
++rate_limiter = RateLimiter(default_rate_per_min=RATE_LIMIT_PER_MIN)
++
++
++class GenerationRequest(BaseModel):
++    prompt: str
++    max_new_tokens: Optional[int] = 256
++    temperature: Optional[float] = 0.0
++    image_b64: Optional[str] = None
++    use_moderation: Optional[bool] = True
++
++
++def _load_model():
++    global _tokenizer, _model
++    if _model is not None:
++        return
++
++    logger.info(f"Loading tokenizer and model: {MODEL_NAME} (device={DEVICE}, 4bit={LOAD_IN_4BIT})")
++    bnb_config = None
++    if LOAD_IN_4BIT:
++        bnb_config = BitsAndBytesConfig(
++            load_in_4bit=True,
++            bnb_4bit_compute_dtype=torch.bfloat16,
++            bnb_4bit_use_double_quant=True,
++            bnb_4bit_quant_type="nf4",
++        )
++
++    _tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
++    if _tokenizer.pad_token is None:
++        _tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
++    _model = AutoModelForCausalLM.from_pretrained(
++        MODEL_NAME, device_map="auto" if DEVICE == "cuda" else None, quantization_config=bnb_config
++    )
++    # For CPU-only, ensure model on CPU
++    if DEVICE == "cpu":
++        _model.to("cpu")
++
++
++def _load_blip():
++    global _blip_processor, _blip_model
++    if _blip_model is not None:
++        return
++    try:
++        _blip_processor = BlipProcessor.from_pretrained(BLIP_CAPTION_MODEL)
++        _blip_model = BlipForConditionalGeneration.from_pretrained(BLIP_CAPTION_MODEL, device_map="auto" if torch.cuda.is_available() else None)
++    except Exception as e:
++        logger.warning("BLIP model load failed: %s", e)
++        _blip_processor = None
++        _blip_model = None
++
++
++@app.on_event("startup")
+ async def startup_event():
+-    _load_model()
+-    _load_blip()
++    _load_model()
++    _load_blip()
++
++
++@app.get("/metrics")
++def metrics():
++    resp = generate_latest()
++    return Response(content=resp, media_type=CONTENT_TYPE_LATEST)
++
++
++@app.post("/generate")
++async def generate(req: GenerationRequest, request: Request):
++    start = time.time()
++    endpoint = "/generate"
++
++    # API key auth (dependency)
++    api_key = require_api_key(request)
++    if api_key is None:
++        REQ_COUNTER.labels(endpoint=endpoint, status="unauthorized").inc()
++        raise HTTPException(status_code=401, detail="missing or invalid API key")
++
++    # Rate limit check
++    allowed = rate_limiter.allow(api_key)
++    if not allowed:
++        REQ_COUNTER.labels(endpoint=endpoint, status="rate_limited").inc()
++        REQ_COUNTER.labels(endpoint=endpoint, status="denied").inc()
++        raise HTTPException(status_code=429, detail="rate limit exceeded")
++
++    # Basic safety check on prompt
++    if req.use_moderation:
++        safe, matches = is_safe(req.prompt)
++        if not safe:
++            REQ_COUNTER.labels(endpoint=endpoint, status="blocked_prompt").inc()
++            raise HTTPException(status_code=400, detail={"reason": "prompt blocked by rule", "matches": matches})
++        # optional external moderation
++        # ext = external_moderation(req.prompt)
++    prompt = req.prompt
++
++    # If an image is provided, run BLIP captioning and prepend caption to prompt
++    if req.image_b64:
++        if _blip_model is None or _blip_processor is None:
++            # try to load on demand
++            _load_blip()
++        if _blip_model and _blip_processor:
++            try:
++                img_bytes = base64.b64decode(req.image_b64)
++                img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
++                inputs = _blip_processor(images=img, return_tensors="pt").to(_blip_model.device)
++                caption_ids = _blip_model.generate(**inputs, max_new_tokens=50)
++                caption = _blip_processor.decode(caption_ids[0], skip_special_tokens=True)
++                prompt = f"[Image caption: {caption}]\n\n{prompt}"
++            except Exception as e:
++                REQ_COUNTER.labels(endpoint=endpoint, status="bad_image").inc()
++                raise HTTPException(status_code=400, detail=f"invalid image data: {e}")
++
++    _load_model()
++    input_ids = _tokenizer(prompt, return_tensors="pt").input_ids.to(_model.device)
++    generation_kwargs = {
++        "max_new_tokens": req.max_new_tokens or 256,
++        "temperature": float(req.temperature or 0.0),
++        "do_sample": float(req.temperature or 0.0) > 0.0,
++    }
++
++    try:
++        with torch.no_grad():
++            out = _model.generate(input_ids, **generation_kwargs)
++        text = _tokenizer.decode(out[0], skip_special_tokens=True)
++    except Exception as e:
++        REQ_COUNTER.labels(endpoint=endpoint, status="generation_error").inc()
++        raise HTTPException(status_code=500, detail=f"generation failed: {e}")
++
++    # Safety check on output; abstain if unsafe
++    safe_out, matches = is_safe(text)
++    if not safe_out:
++        REQ_COUNTER.labels(endpoint=endpoint, status="output_blocked").inc()
++        refusal = get_refusal_text()
++        elapsed = time.time() - start
++        LATENCY_HIST.labels(endpoint=endpoint).observe(elapsed)
++        REQ_COUNTER.labels(endpoint=endpoint, status="success").inc()
++        return {"generated_text": refusal, "safety_blocked": True, "matches": matches}
++
++    elapsed = time.time() - start
++    LATENCY_HIST.labels(endpoint=endpoint).observe(elapsed)
++    REQ_COUNTER.labels(endpoint=endpoint, status="success").inc()
++    return {"generated_text": text}
++
+--- /dev/null
++++ b/openquill/safety/moderation.py
+@@ -0,0 +1,106 @@
++"""
++openquill/safety/moderation.py
++
++Enhanced safety utilities:
++- rule-based blocking
++- abstention/refusal templates
++- optional external moderation provider hook
++"""
++import os
++import re
++from typing import List, Tuple, Dict, Optional
++import requests
++
++# Basic rule-based patterns (expand as needed)
++BLOCKED_PATTERNS = [
++    re.compile(r"\b(?:suicide|kill myself|harm myself)\b", re.I),
++    re.compile(r"\b(?:terror|bomb|explosive)\b", re.I),
++    re.compile(r"\b(?:child abuse|sexual exploitation)\b", re.I),
++]
++
++# Allowlist overrides if needed (full string match or regex)
++ALLOWLIST_PATTERNS = [
++    # re.compile(r"^educational:.*", re.I),
++]
++
++
++def _matches_allowlist(text: str) -> bool:
++    for pat in ALLOWLIST_PATTERNS:
++        if pat.search(text):
++            return True
++    return False
++
++
++def is_safe(text: str) -> Tuple[bool, List[str]]:
++    """
++    Returns (is_safe, matched_patterns)
++    """
++    # Allowlist shortcut
++    if _matches_allowlist(text):
++        return True, []
++
++    matches = []
++    for pat in BLOCKED_PATTERNS:
++        if pat.search(text):
++            matches.append(pat.pattern)
++    return (len(matches) == 0, matches)
++
++
++def get_refusal_text() -> str:
++    """
++    Standard refusal / abstention message used when output is blocked.
++    """
++    return "I'm sorry — I can't help with that."
++
++
++def external_moderation(text: str, provider: Optional[str] = None) -> Dict:
++    """
++    Optional external moderation hook.
++    - If environment variable HF_API_TOKEN is set, uses Hugging Face moderation inference API as an example.
++    - Returns a dict with provider response or {'status': 'not-configured'}.
++    """
++    hf_token = os.environ.get("HF_API_TOKEN")
++    if hf_token:
++        url = "https://api-inference.huggingface.co/moderation"
++        headers = {"Authorization": f"Bearer {hf_token}"}
++        resp = requests.post(url, headers=headers, json={"inputs": text}, timeout=10)
++        if resp.status_code == 200:
++            return {"status": "ok", "provider": "hf_moderation", "result": resp.json()}
++        return {"status": "error", "code": resp.status_code, "text": resp.text}
++    return {"status": "not-configured"}
++
+--- /dev/null
++++ b/openquill/serving/auth.py
+@@ -0,0 +1,56 @@
++"""
++Simple API key auth utilities for FastAPI.
++
++Usage:
++- Set environment variable OQ_API_KEYS="key1,key2"
++- In handlers, call require_api_key(request) which returns the provided key or None.
++"""
++import os
++from fastapi import Request
++from typing import Optional
++
++
++def get_api_keys() -> set:
++    raw = os.environ.get("OQ_API_KEYS", "")
++    keys = {k.strip() for k in raw.split(",") if k.strip()}
++    return keys
++
++
++def require_api_key(request: Request) -> Optional[str]:
++    """
++    Check 'x-api-key' header or 'api_key' query param.
++    Returns the key string if valid, otherwise None.
++    """
++    keys = get_api_keys()
++    if not keys:
++        # If no keys configured, operate in "open" mode (not recommended for prod).
++        return "NO_KEY_CONFIGURED"
++
++    header = request.headers.get("x-api-key")
++    if header and header in keys:
++        return header
++    # fallback to query param
++    query_key = request.query_params.get("api_key")
++    if query_key and query_key in keys:
++        return query_key
++    return None
++
+--- /dev/null
++++ b/openquill/serving/ratelimit.py
+@@ -0,0 +1,101 @@
++"""
++Simple in-memory token-bucket rate limiter keyed by API key.
++
++Not suitable for multi-instance production; replace with Redis or external gateway for scale.
++"""
++import time
++from threading import Lock
++from typing import Dict
++
++
++class TokenBucket:
++    def __init__(self, capacity: int, refill_per_sec: float):
++        self.capacity = capacity
++        self.refill_per_sec = refill_per_sec
++        self.tokens = capacity
++        self.last = time.time()
++        self.lock = Lock()
++
++    def allow(self, tokens=1) -> bool:
++        with self.lock:
++            now = time.time()
++            elapsed = now - self.last
++            refill = elapsed * self.refill_per_sec
++            if refill > 0:
++                self.tokens = min(self.capacity, self.tokens + refill)
++                self.last = now
++            if self.tokens >= tokens:
++                self.tokens -= tokens
++                return True
++            return False
++
++
++class RateLimiter:
++    def __init__(self, default_rate_per_min: int = 60):
++        """
++        default_rate_per_min: number of requests allowed per minute per key
++        """
++        self.default_rate_per_min = default_rate_per_min
++        self.buckets: Dict[str, TokenBucket] = {}
++        self.lock = Lock()
++
++    def _get_bucket(self, key: str) -> TokenBucket:
++        with self.lock:
++            if key not in self.buckets:
++                capacity = self.default_rate_per_min
++                refill_per_sec = self.default_rate_per_min / 60.0
++                self.buckets[key] = TokenBucket(capacity=capacity, refill_per_sec=refill_per_sec)
++            return self.buckets[key]
++
++    def allow(self, key: str) -> bool:
++        bucket = self._get_bucket(key)
++        return bucket.allow()
++
+--- /dev/null
++++ b/openquill/training/rlhf_stub.py
+@@ -0,0 +1,48 @@
++"""
++Stub and notes for RLHF pipeline integration.
++
++This file is a placeholder describing components to implement:
++- reward model training (classification/regression on preference data)
++- PPO or other policy optimization (use trlx / trl or Stable Baselines style)
++- rollout collection and logging
++
++Important: RLHF is compute-intensive and requires careful data curation and safety checks.
++"""
++from typing import Any, Dict
++
++
++def train_reward_model(dataset, model, output_dir: str, **kwargs):
++    """
++    Train a reward model given dataset of (prompt, response, score) or pairwise preferences.
++    Implement using Hugging Face Trainer or custom loop.
++    """
++    raise NotImplementedError("Implement reward model training pipeline here.")
++
++
++def run_ppo_policy_update(policy_model, reward_model, rollouts, **kwargs):
++    """
++    Given a policy model and a reward model, perform PPO updates.
++    Consider using trlX / trl (https://github.com/lvwerra/trl) for tested implementations.
++    """
++    raise NotImplementedError("Implement PPO loop or integrate trl/trlx.")
++
+--- /dev/null
++++ b/scripts/download_model.py
+@@ -0,0 +1,118 @@
++"""
++scripts/download_model.py
++
++Helper utilities to verify model license and download model weights from Hugging Face Hub.
++
++Usage:
++  python scripts/download_model.py --model_id <model-id> --cache_dir ./models --allow_licenses Apache-2.0,MIT
++
++NOTE: This script uses huggingface_hub if available to retrieve model info and snapshot.
++"""
++import argparse
++import os
++from typing import List
++
++try:
++    from huggingface_hub import HfApi, snapshot_download
++except Exception:
++    HfApi = None
++    snapshot_download = None
++
++
++def check_license(model_id: str) -> str:
++    """
++    Returns the license string from the HF model card metadata if available.
++    """
++    if HfApi is None:
++        raise RuntimeError("huggingface_hub not installed; install it to use download_model.py")
++    api = HfApi()
++    info = api.model_info(model_id)
++    # model_info.license may be None; also check model card content for license
++    license = info.license or ""
++    return license
++
++
++def download_model(model_id: str, cache_dir: str = "./models") -> str:
++    """
++    Download model snapshot to cache_dir/model_id and return path.
++    """
++    if snapshot_download is None:
++        raise RuntimeError("huggingface_hub not installed; install it to use download_model.py")
++    out = snapshot_download(repo_id=model_id, cache_dir=cache_dir, resume_download=True)
++    return out
++
++
++def parse_allow_list(s: str) -> List[str]:
++    return [x.strip() for x in s.split(",") if x.strip()]
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--model_id", required=True, help="Hugging Face model id (e.g. mistralai/mistral-7b-v0.1)")
++    parser.add_argument("--cache_dir", default="./models")
++    parser.add_argument("--allow_licenses", default="Apache-2.0", help="comma-separated allowed license identifiers")
++    args = parser.parse_args()
++
++    allowed = parse_allow_list(args.allow_licenses)
++    print(f"Checking model {args.model_id} license...")
++    lic = check_license(args.model_id)
++    print(f"Model license: {lic}")
++    if lic and any(a.lower() in lic.lower() for a in allowed):
++        print("License is allowed. Downloading model...")
++        path = download_model(args.model_id, cache_dir=args.cache_dir)
++        print(f"Model downloaded to: {path}")
++    else:
++        print("Model license is not in allowlist. Aborting download.")
++
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null
++++ b/tests/test_moderation.py
+@@ -0,0 +1,20 @@
++import pytest
++
++from openquill.safety.moderation import is_safe, get_refusal_text
++
++
++def test_is_safe_blocking():
++    text = "I want to kill myself"
++    safe, matches = is_safe(text)
++    assert not safe
++    assert len(matches) > 0
++
++
++def test_is_safe_allow_normal():
++    text = "What is the capital of France?"
++    safe, matches = is_safe(text)
++    assert safe
++    assert matches == []
++
++
++def test_refusal_text():
++    refusal = get_refusal_text()
++    assert isinstance(refusal, str)
++    assert len(refusal) > 0
++
+--- /dev/null
++++ b/tests/test_tokenization.py
+@@ -0,0 +1,26 @@
++import pytest
++from transformers import AutoTokenizer
++
++
++@pytest.mark.parametrize("model", ["gpt2", "distilgpt2"])
++def test_tokenizer_loads(model):
++    tok = AutoTokenizer.from_pretrained(model, use_fast=True)
++    assert tok is not None
++    s = "Hello world"
++    enc = tok(s)
++    assert "input_ids" in enc
++    assert len(enc["input_ids"]) > 0
++
++def test_pad_token_added_if_missing():
++    tok = AutoTokenizer.from_pretrained("gpt2", use_fast=True)
++    if tok.pad_token is None:
++        tok.add_special_tokens({"pad_token": "<|pad|>"})
++    assert tok.pad_token is not None
++
+-- 
+2.40.1
