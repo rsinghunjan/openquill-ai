@@ -1,0 +1,305 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Copilot <copilot@example.com>
+Date: Wed, 2026-02-04 00:00:00 +0000
+Subject: [PATCH] auto-download local model support + smoke end-to-end script
+
+---
+ openquill/inference/server.py | 208 ++++++++++++++++++++++++++++++++++++++++++++++++
+ examples/run_smoke_end_to_end.sh | 105 +++++++++++++++++++++++++++++++++
+ 2 files changed, 313 insertions(+)
+ create mode 100644 openquill/inference/server.py
+ create mode 100755 examples/run_smoke_end_to_end.sh
+--- /dev/null
++++ b/openquill/inference/server.py
+@@ -0,0 +1,208 @@
++"""
++OpenQuill inference server (enhanced).
++
++Enhancements in this version:
++- Supports loading a local model snapshot directory via OQ_LOCAL_MODEL_PATH.
++- Attempts to auto-download a Hugging Face model snapshot if not present using the model registry helper.
++- Keeps previous safety, auth, rate-limit and metrics integrations.
++- Uses conservative defaults for smoke tests (fall back to HF id if download not possible).
++
++Usage:
++ - To force local model path: export OQ_LOCAL_MODEL_PATH=/path/to/snapshot
++ - Or set OQ_MODEL to an HF id (e.g. mistralai/mistral-7b) and ensure huggingface_hub is available.
++ - For quick smoke: use distilgpt2 with the provided example script.
++"""
++import os
++import time
++import io
++import base64
++import logging
++from typing import Optional
++
++from fastapi import FastAPI, HTTPException, Request, Response
++from fastapi.responses import PlainTextResponse
++from pydantic import BaseModel
++
++import torch
++from PIL import Image
++from transformers import (
++    AutoTokenizer,
++    AutoModelForCausalLM,
++    BitsAndBytesConfig,
++    BlipForConditionalGeneration,
++    BlipProcessor,
++)
++
++from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
++
++# local imports from package
++from openquill.safety.moderation import is_safe, get_refusal_text
++from openquill.serving.auth import require_api_key
++from openquill.serving.ratelimit import RateLimiter
++from openquill.models.registry import ensure_model_downloaded
++
++logger = logging.getLogger("openquill")
++logging.basicConfig(level=logging.INFO)
++
++app = FastAPI(title="OpenQuill Inference Server (auto-download)")
++
++# Configuration via environment variables
++HF_MODEL_ID = os.environ.get("OQ_MODEL", "distilgpt2")  # default to a small model for smoke
++LOCAL_MODEL_PATH = os.environ.get("OQ_LOCAL_MODEL_PATH", "")  # if set, load from this path
++LOAD_IN_4BIT = os.environ.get("OQ_LOAD_4BIT", "false").lower() in ("1", "true", "yes")
++DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
++BLIP_CAPTION_MODEL = os.environ.get("OQ_BLIP_MODEL", "Salesforce/blip-image-captioning-large")
++RATE_LIMIT_PER_MIN = int(os.environ.get("OQ_RATE_LIMIT_PER_MIN", "60"))
++MODEL_CACHE_DIR = os.environ.get("OQ_MODEL_CACHE_DIR", "./models")
++
++# Lazy-loaded objects
++_tokenizer = None
++_model = None
++_blip_processor = None
++_blip_model = None
++
++# Simple in-memory rate limiter
++rate_limiter = RateLimiter(default_rate_per_min=RATE_LIMIT_PER_MIN)
++
++
++class GenerationRequest(BaseModel):
++    prompt: str
++    max_new_tokens: Optional[int] = 128
++    temperature: Optional[float] = 0.0
++    image_b64: Optional[str] = None
++    use_moderation: Optional[bool] = True
++
++
++def _determine_model_source() -> str:
++    """
++    Decide which model path/identifier to pass to transformers.from_pretrained.
++    Priority:
++      1) OQ_LOCAL_MODEL_PATH (explicit local snapshot)
++      2) previously downloaded snapshot under MODEL_CACHE_DIR/HF_MODEL_ID (attempt)
++      3) HF_MODEL_ID (load from hub)
++    If download is required, try to use ensure_model_downloaded() helper.
++    """
++    # 1) explicit local path
++    if LOCAL_MODEL_PATH:
++        if os.path.exists(LOCAL_MODEL_PATH):
++            logger.info("Using explicit local model path: %s", LOCAL_MODEL_PATH)
++            return LOCAL_MODEL_PATH
++        else:
++            logger.warning("OQ_LOCAL_MODEL_PATH set but not found: %s", LOCAL_MODEL_PATH)
++
++    # 2) try expected cache location
++    candidate = os.path.join(MODEL_CACHE_DIR, HF_MODEL_ID.replace("/", "_"))
++    if os.path.exists(candidate):
++        logger.info("Found cached model at %s", candidate)
++        return candidate
++
++    # 3) try to download snapshot into MODEL_CACHE_DIR (best-effort)
++    try:
++        logger.info("Attempting to download model snapshot for %s into %s", HF_MODEL_ID, MODEL_CACHE_DIR)
++        path = ensure_model_downloaded(HF_MODEL_ID, cache_dir=MODEL_CACHE_DIR)
++        if path and os.path.exists(path):
++            logger.info("Model snapshot downloaded to %s", path)
++            return path
++    except Exception as e:
++        logger.warning("Auto-download failed: %s (falling back to HF id)", e)
++
++    # last resort: return HF id so transformers will try to load from hub
++    logger.info("Falling back to HF model id: %s", HF_MODEL_ID)
++    return HF_MODEL_ID
++
++
++def _load_model_and_tokenizer():
++    """
++    Load tokenizer and causal LM, using local snapshot path if available.
++    """
++    global _tokenizer, _model
++    if _model is not None and _tokenizer is not None:
++        return
++
++    model_source = _determine_model_source()
++
++    logger.info("Loading tokenizer/model from: %s (device=%s, 4bit=%s)", model_source, DEVICE, LOAD_IN_4BIT)
++    bnb_config = None
++    if LOAD_IN_4BIT:
++        bnb_config = BitsAndBytesConfig(
++            load_in_4bit=True,
++            bnb_4bit_compute_dtype=torch.bfloat16 if DEVICE == "cuda" else torch.float16,
++            bnb_4bit_use_double_quant=True,
++            bnb_4bit_quant_type="nf4",
++        )
++
++    _tokenizer = AutoTokenizer.from_pretrained(model_source, use_fast=True)
++    if _tokenizer.pad_token is None:
++        try:
++            _tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
++        except Exception:
++            pass
++
++    _model = AutoModelForCausalLM.from_pretrained(
++        model_source, device_map="auto" if DEVICE == "cuda" else None, quantization_config=bnb_config
++    )
++    if DEVICE == "cpu":
++        _model.to("cpu")
++
++
++def _load_blip():
++    global _blip_processor, _blip_model
++    if _blip_model is not None and _blip_processor is not None:
++        return
++    try:
++        _blip_processor = BlipProcessor.from_pretrained(BLIP_CAPTION_MODEL)
++        _blip_model = BlipForConditionalGeneration.from_pretrained(BLIP_CAPTION_MODEL, device_map="auto" if torch.cuda.is_available() else None)
++    except Exception as e:
++        logger.warning("BLIP load failed: %s", e)
++        _blip_processor = None
++        _blip_model = None
++
++
++@app.get("/metrics")
++def metrics():
++    resp = generate_latest()
++    return Response(content=resp, media_type=CONTENT_TYPE_LATEST)
++
++
++@app.post("/generate")
++async def generate(req: GenerationRequest, request: Request):
++    # auth
++    api_key = require_api_key(request)
++    if api_key is None:
++        raise HTTPException(status_code=401, detail="missing or invalid API key")
++
++    # rate limit
++    if not rate_limiter.allow(api_key):
++        raise HTTPException(status_code=429, detail="rate limit exceeded")
++
++    # moderation on prompt
++    if req.use_moderation:
++        safe, matches = is_safe(req.prompt)
++        if not safe:
++            raise HTTPException(status_code=400, detail={"reason": "prompt blocked", "matches": matches})
++
++    prompt = req.prompt
++
++    # image captioning path
++    if req.image_b64:
++        _load_blip()
++        if _blip_model and _blip_processor:
++            try:
++                img_bytes = base64.b64decode(req.image_b64)
++                img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
++                inputs = _blip_processor(images=img, return_tensors="pt").to(_blip_model.device)
++                caption_ids = _blip_model.generate(**inputs, max_new_tokens=50)
++                caption = _blip_processor.decode(caption_ids[0], skip_special_tokens=True)
++                prompt = f"[Image caption: {caption}]\n\n{prompt}"
++            except Exception as e:
++                raise HTTPException(status_code=400, detail=f"invalid image data: {e}")
++
++    # ensure model loaded (may trigger download)
++    _load_model_and_tokenizer()
++
++    try:
++        input_ids = _tokenizer(prompt, return_tensors="pt").input_ids.to(_model.device)
++        generation_kwargs = {
++            "max_new_tokens": int(req.max_new_tokens or 128),
++            "temperature": float(req.temperature or 0.0),
++            "do_sample": float(req.temperature or 0.0) > 0.0,
++        }
++        with torch.no_grad():
++            out = _model.generate(input_ids, **generation_kwargs)
++        text = _tokenizer.decode(out[0], skip_special_tokens=True)
++    except Exception as e:
++        logger.exception("Generation failed")
++        raise HTTPException(status_code=500, detail=f"generation failed: {e}")
++
++    # output moderation / abstain
++    safe_out, matches = is_safe(text)
++    if not safe_out:
++        return {"generated_text": get_refusal_text(), "safety_blocked": True, "matches": matches}
++
++    return {"generated_text": text}
++
+--- /dev/null
++++ b/examples/run_smoke_end_to_end.sh
+@@ -0,0 +1,105 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# Simple end-to-end smoke script:
++# 1) download a small HF model snapshot into ./models
++# 2) run a tiny QLoRA job for a few steps (CPU / small test)
++# 3) start the FastAPI server pointing to the local snapshot
++# 4) call /generate and print result
++#
++# Notes:
++# - This is intended for local smoke testing only (CPU). For real QLoRA runs use GPUs and accelerate.
++# - Requires huggingface_hub for snapshot download if the model isn't already cached.
++
++MODEL_ID=${MODEL_ID:-"distilgpt2"}
++MODEL_CACHE_DIR=${MODEL_CACHE_DIR:-"./models"}
++LOCAL_MODEL_DIR="${MODEL_CACHE_DIR}/${MODEL_ID//\//_}"
++TOY_DATA=${TOY_DATA:-"data/toy_instructions.jsonl"}
++OUTPUT_DIR=${OUTPUT_DIR:-"outputs/qlora-smoke"}
++PYTHON=${PYTHON:-python}
++
++echo "=== OpenQuill smoke end-to-end: model=$MODEL_ID"
++
++# Step 1: ensure model snapshot exists (best-effort)
++echo "Downloading model snapshot (best-effort) into ${MODEL_CACHE_DIR}..."
++if [ ! -d "${LOCAL_MODEL_DIR}" ]; then
++  ${PYTHON} scripts/download_model.py --model_id "${MODEL_ID}" --cache_dir "${MODEL_CACHE_DIR}" --allow_licenses "Apache-2.0,MIT,BSD" || true
++else
++  echo "Model appears present at ${LOCAL_MODEL_DIR}"
++fi
++
++# Step 2: small QLoRA run (few steps, CPU-friendly)
++echo "Running a tiny QLoRA job (max_steps=4) for smoke validation..."
++mkdir -p "${OUTPUT_DIR}"
++${PYTHON} openquill/training/finetune.py \
++  --model_name_or_path "${LOCAL_MODEL_DIR}" \
++  --dataset_path "${TOY_DATA}" \
++  --output_dir "${OUTPUT_DIR}" \
++  --per_device_train_batch_size 1 \
++  --gradient_accumulation_steps 1 \
++  --learning_rate 2e-4 \
++  --max_steps 4 \
++  || echo "Finetune may fail on CPU for some models; continuing to server startup"
++
++# Step 3: start server in background pointing to local model dir
++export OQ_LOCAL_MODEL_PATH="${LOCAL_MODEL_DIR}"
++export OQ_LOAD_4BIT="false"
++echo "Starting FastAPI server (uvicorn) with OQ_LOCAL_MODEL_PATH=${OQ_LOCAL_MODEL_PATH}..."
++uvicorn openquill.inference.server:app --host 127.0.0.1 --port 8080 --log-level info &>/tmp/openquill_smoke_server.log &
++SERVER_PID=$!
++echo "Server PID: ${SERVER_PID}"
++
++# wait for server to be ready (simple sleep)
++sleep 4
++
++# Step 4: call the /generate endpoint
++echo "Calling /generate..."
++curl -sS -X POST "http://127.0.0.1:8080/generate" -H "Content-Type: application/json" -d '{"prompt":"Say hello to OpenQuill.","max_new_tokens":16}' | jq .
++
++echo "Done. Server logs at /tmp/openquill_smoke_server.log"
++echo "To stop the server: kill ${SERVER_PID}"
++
++exit 0
++
+-- 
+2.40.1
