@@ -1,0 +1,13 @@
+version: "3.8"
+services:
+  openquill:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - OPENQUILL_BASE_MODEL=meta-llama/Llama-2-7b-chat
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: "16G"
