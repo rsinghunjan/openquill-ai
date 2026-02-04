@@ -1,0 +1,1008 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Copilot <copilot@example.com>
+Date: Sun, 2026-02-08 00:00:00 +0000
+Subject: [PATCH] architecture, datasets, training recipes, RAG pipeline, routing, microVM sandbox stub, monitoring, governance templates, benchmarks & tooling
+
+---
+ docs/architecture.md                             | 231 ++++++++++++++++++++++++++++++++++++++++++++++
+ docs/datasets.md                                 | 160 +++++++++++++++++++++++++++++++++++
+ docs/training_recipes.md                         | 224 ++++++++++++++++++++++++++++++++++++++++++++++
+ openquill/models/registry_extended.py            | 142 +++++++++++++++++++++++++++++
+ openquill/serving/router_policy.py                | 158 +++++++++++++++++++++++++++++++
+ openquill/rag/retrieval_pipeline.py               | 192 ++++++++++++++++++++++++++++++++++
+ openquill/tools/firecracker_stub.py               | 160 +++++++++++++++++++++++++++++
+ openquill/observability/prometheus.yml            |  36 +++++++
+ scripts/prepare_multilingual_dataset.sh          | 101 +++++++++++++++
+ scripts/distill_and_quantize.sh                  | 106 ++++++++++++++++
+ examples/benchmark/run_benchmarks.sh              | 152 ++++++++++++++++++++++++++
+ docs/governance.md                                | 132 +++++++++++++++++++++++++
+ openquill/safety/moderation_adapters.py           | 146 ++++++++++++++++++++++++++
+ openquill/training/distillation_stub.py           | 112 +++++++++++++++
+ 14 files changed, 2052 insertions(+)
+ create mode 100644 docs/architecture.md
+ create mode 100644 docs/datasets.md
+ create mode 100644 docs/training_recipes.md
+ create mode 100644 openquill/models/registry_extended.py
+ create mode 100644 openquill/serving/router_policy.py
+ create mode 100644 openquill/rag/retrieval_pipeline.py
+ create mode 100644 openquill/tools/firecracker_stub.py
+ create mode 100644 openquill/observability/prometheus.yml
+ create mode 100755 scripts/prepare_multilingual_dataset.sh
+ create mode 100755 scripts/distill_and_quantize.sh
+ create mode 100755 examples/benchmark/run_benchmarks.sh
+ create mode 100644 docs/governance.md
+ create mode 100644 openquill/safety/moderation_adapters.py
+ create mode 100644 openquill/training/distillation_stub.py
+--- /dev/null
++++ b/docs/architecture.md
+@@ -0,0 +1,231 @@
++# OpenQuill architecture (overview)
++
++This document describes the recommended architecture to turn OpenQuill from a scaffold
++into an operational, production-capable platform that supports:
++- multimodal inputs (vision/audio),
++- long context / retrieval augmented generation (RAG),
++- safety-first alignment (SFT → reward model → RLHF),
++- multi-tier serving (quantized small models, GPU cluster, large fallback),
++- secure tooling with sandboxing and auditing,
++- observability and governance.
++
++High-level components
++- Model registry
++  - Keep canonical HF ids, license metadata and chosen snapshot locations.
++  - Provide a predictable mapping for "small" (7B) and "large" (30–40B) tier models.
++
++- Training & adapters
++  - SFT via QLoRA/PEFT for instruction tuning.
++  - Adapter training (BLIP Q‑Former, Whisper encoder adapters) — freeze base LLM and train small modules.
++  - Reward model training and RLHF (PPO via trlX).
++  - Distillation to smaller students (optional).
++
++- RAG & long context
++  - Chunking pipeline (token-aware), embedding model, vector DB (FAISS/Milvus/Weaviate), reranking.
++  - Hierarchical memory: summarize chunks, maintain summaries for streaming retrieval.
++
++- Serving & router
++  - Local quantized 7B model (gguf / bnb 4-bit) for low-latency.
++  - vLLM/TGI GPU cluster for batch/streaming high-throughput.
++  - Large-model fallback (40B) for complex reasoning.
++  - Router service that selects backend using heuristics and a difficulty estimator.
++
++- Tools & realtime data
++  - Tool API (browser, SQL, code-run) executed in strong sandbox (Firecracker/gVisor).
++  - Ingest pipeline (Kafka/Pulsar) to keep vector DB up-to-date.
++
++- Observability & governance
++  - Prometheus/Grafana for metrics, structured logs with redaction, model & dataset cards, release checklist.
++
++Two-tier model strategy
++- Small tier (fast & cheap)
++  - Mistral‑7B / RedPajama‑7B (quantized).
++  - Uses QLoRA/PEFT weights for quick fine-tuning and LoRA adapters for task-specialization.
++
++- Large tier (high quality)
++  - Falcon‑40B or another open 30–40B model.
++  - Used for high-quality responses and hard reasoning tasks.
++
++Interface design
++- Inference API:
++  - /generate — prompt, prefer_quality flag, tool_calls allowed, streaming option.
++  - /tools/invoke — tool invocation (authenticated & audited).
++  - /metrics — prometheus endpoint.
++
++- Router decisions:
++  - allow opt-in prefer_quality
++  - content-length and complexity heuristics
++  - dynamic cost estimator to choose small/large
++
++Security and safety design
++- Multi-layer safety pipeline:
++  1) Rule-based prompt blocking (regexes for clear abuses)
++  2) External moderation (HF/Perspective)
++  3) Model-level refusal policies & abstention templates
++  4) Post-generation classifier-based moderation
++  5) Human-in-loop queue for flagged outputs
++
++- Tooling security:
++  - Sandbox tools in microVMs (Firecracker) or gVisor for third-party content.
++  - Disable network egress by default; allow per-tool whitelists.
++  - Audit every tool invocation and persist metadata.
++
++Observability & reliability
++- Important metrics:
++  - request_count{endpoint,status}
++  - latency_seconds{endpoint,p50,p95}
++  - tokens_generated_total
++  - safety_flags_total (blocked prompts / outputs)
++  - tool_calls_total, tool_call_errors_total
++
++- Logs:
++  - Structured JSON logs
++  - Redact PII (use log redaction helpers)
++  - Export to Loki / ELK for long-term retention & querying
++
++Operational workflow
++1) Prototype: select base model(s), run QLoRA on toy data, validate locally.
++2) Adapter training: BLIP→Q-Former and Whisper wrappers, test multimodal prompts.
++3) Retrieval: onboard internal KB, build FAISS index, integrate retrieval into generation prompt.
++4) Alignment: collect preference labels, train reward model, run small RLHF (PPO) iterations.
++5) Productionize serving: vLLM/TGI + router + autoscaling + monitoring.
++6) Release: model/dataset cards, red-team pass, safety signoff.
++
++Notes on cost and compute
++- QLoRA on 7B: can be done on 40GB GPU with careful settings; 80GB preferred.
++- RLHF / large-scale finetuning: multi‑GPU cluster (A100/H100).
++- Serving: a mix of GPU servers for vLLM/TGI and small quantized models on CPU for edge.
++
++References and links
++- Hugging Face transformers, accelerate, peft, bitsandbytes
++- vLLM, Text Generation Inference (TGI), trl / trlX (for RLHF)
++- FAISS, Milvus, Weaviate
++- BLIP-2, Whisper, ImageBind
++
++This architecture doc is intentionally pragmatic: use the scaffolding in the repo as the starting point and incrementally replace stubs with production implementations (microVM sandboxing, a robust red-team harness, and managed vector DB).
+--- /dev/null
++++ b/docs/datasets.md
+@@ -0,0 +1,160 @@
++# Datasets: selection, licensing, and notes
++
++This page documents recommended datasets for training, evaluation, reward models, and safety checks.
++Always verify license & provenance before use. Store dataset cards in docs/ and track via DVC/HF Datasets where possible.
++
++Instruction tuning / SFT
++- OpenAssistant (OA): open instruction-following dataset; check specific OA license.
++- Alpaca-style datasets (various re-implementations): use as starting point; curate quality.
++- In-house curated instruction datasets: recommended for domain specificity and higher quality.
++
++Reward model / Preference data
++- Human-annotated pairwise preferences: collect with annotation UI; store annotator id & timestamp; keep provenance.
++- Use a CSV/JSONL format with fields: prompt, response_a, response_b, preferred.
++
++Multilingual corpora
++- mC4: multilingual Common Crawl derived; check filtering & license.
++- CCAligned: parallel corpora for translation-style finetuning.
++- OSCAR: multilingual web crawl.
++- FLORES-101: evaluation for translation.
++
++Reasoning / Math / QA
++- GSM8K: grade-school math.
++- MATH: olympiad-level math.
++- MMLU: multi-domain knowledge benchmark.
++- ARC: science question benchmark.
++
++Coding datasets
++- HumanEval, MBPP: code generation and unit test evaluation.
++- The Stack / BigQuery public code datasets (respect license constraints).
++
++Multimodal datasets
++- VQA: visual question answering.
++- COCO captions: image captioning.
++- TextCaps: captioning with text in images.
++- LAION subsets: large-scale image/text pairs (license and allowed use must be checked).
++
++Retrieval corpora
++- Wikipedia (dump): general knowledge.
++- Curated documents: internal KBs, manuals (ensure consent & privacy).
++- Web snapshots: with license checks (some web content is not redistributable).
++
++Safety / Red-team datasets
++- Toxicity corpora (CivilComments, Jigsaw).
++- Adversarial prompt collections (internal red-team).
++- Privacy / PII probe datasets to check information leakage.
++
++Data hygiene & policies
++- PII removal: scan and redact personal data from training corpora.
++- License filtering: enforce allow-list of licenses (e.g., Apache-2.0, MIT) for redistributable releases.
++- Provenance: for each dataset, record source, access date, applied filters, and a dataset card in docs/.
++- Versioning: use DVC or Hugging Face Datasets to version processed datasets and transformation scripts.
++
++Annotation & quality control
++- Provide clear guidelines (see docs/redteam/annotation_instructions.md) and gold tests to measure annotator quality.
++- Track annotator metadata and inter-annotator agreement.
++- Store preference pairs in JSONL for reward model training.
+--- /dev/null
++++ b/docs/training_recipes.md
+@@ -0,0 +1,224 @@
++# Training recipes & practical commands
++
++This document collects reproducible recipes for common tasks: QLoRA SFT, adapter training, reward model training, RLHF/PPO, and distillation hints.
++
++1) QLoRA / PEFT instruction tuning (recommended)
++
++Tools:
++- transformers, accelerate, peft, bitsandbytes, datasets
++
++Example (Mistral-7B, small run):
++```
++accelerate launch --config_file openquill/training/accelerate_config.yaml \
++  openquill/training/finetune.py \
++    --model_name_or_path ./models/mistralai_mistral-7b \
++    --dataset_path data/sft_small.jsonl \
++    --output_dir outputs/sft-mistral-example \
++    --per_device_train_batch_size 1 \
++    --gradient_accumulation_steps 8 \
++    --learning_rate 2e-4 \
++    --max_steps 2000 \
++    --bf16 \
++    --use_peft \
++    --peft_type lora \
++    --load_in_4bit
++```
++
++Tips:
++- Use small toy runs first (100–500 steps) to validate tokenization/prompt formatting.
++- Keep a consistent seed (PYTHONHASHSEED, --seed) for reproducibility.
++- Save LoRA/PEFT weights via model.save_pretrained() to persist small checkpoints.
++
++2) Adapter training (BLIP → Q‑Former)
++
++High-level:
++- Freeze base LLM and image encoder; train Q‑Former + projector to LLM embedding targets.
++- The repo contains openquill/training/qformer_train.py which computes targets from the LLM embedding layer.
++
++Command:
++```
++python openquill/training/qformer_train.py \
++  --image_dir data/images \
++  --captions_file data/image_captions.txt \
++  --output_dir outputs/qformer-mistral \
++  --blip_model Salesforce/blip-image-captioning-large \
++  --llm_model mistralai/mistral-7b \
++  --epochs 3 --batch_size 2
++```
++
++Notes:
++- If the LLM is too large to load on your GPU, run an offline embedding extraction job that tokenizes prompts and saves averaged input embeddings to disk; then train Q‑Former against those targets.
++
++3) Reward model training (supervised)
++
++Data:
++- JSONL lines of {prompt, response_chosen, response_rejected}
++- convert CSV annotations with openquill/training/convert_annotations_to_pairs.py
++
++Simple training:
++ - Use a small transformer (distilbert / bert) and HF Trainer to regress a scalar reward or do pairwise losses.
++
++4) RLHF / PPO (trlX)
++
++Use trl or trlX. Steps:
++ - Start from SFT policy (LoRA weights can be merged or used as base policy).
++ - Prepare a dataset of prompts for rollouts.
++ - For each rollout: generate a response, score with reward model, run PPO update.
++
++Example (toy):
++ - See openquill/training/ppo_trlx.py for a small demo scaffolding.
++ - For production follow trlX documentation and include safety constraints (reward penalties for unsafe outputs).
++
++5) Distillation & quantization
++
++Distillation:
++- Train a smaller student network to match teacher logits or to imitate teacher generations (sequence-level).
++- Useful before shipping to CPU/edge.
++
++Quantization:
++- bitsandbytes for GPU 4-bit/8-bit (nf4 recommended).
++- gguf / ggml conversion for CPU; use community conversion tools (llama.cpp converters).
++- The repo includes scripts/distill_and_quantize.sh as a conversion & quantization helper.
++
++6) Evaluation & benchmarks
++
++Automate quick benchmarks:
++- MMLU (subset), GSM8K (math), HumanEval (coding), VQA/TextCaps (multimodal), FLORES (multilingual).
++- Keep results artifacted (CSV/JSON) and track over model versions.
++
++7) Reproducibility & packaging
++
++Tips:
++- Pin Python package versions in requirements.txt.
++- Use container builds (Dockerfile) that pin OS, CUDA and driver versions.
++- Persist seeds and config files for each run (store in outputs/).
++- Upload artifacts (model cards, evaluation results, checkpoints) to S3 or HF Hub.
++
++8) Safety checklist (training-time)
++
++- Remove PII from training data, or mark and filter.
++- Include safety examples (abstain/guidance) in SFT data.
++- Evaluate on adversarial test suite after each RLHF iteration.
++- Keep human review of reward model outputs and PPO rollouts.
++
++Appendix: useful links
++- Hugging Face PEFT & Bitsandbytes examples
++- trl & trlX RLHF examples
++- vLLM and TGI deployment docs
+--- /dev/null
++++ b/openquill/models/registry_extended.py
+@@ -0,0 +1,142 @@
++"""
++Extended model registry with tiers and helper utilities.
++
++This file centralizes recommended open, permissively-licensed base models and
++helpers to pick small/large tier models and check licenses.
++"""
++from typing import Dict, Any, Optional, List
++import os
++
++MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
++    "mistral-7b": {
++        "hf_id": "mistralai/mistral-7b",
++        "size": "7B",
++        "license": "Apache-2.0",
++        "tier": "small",
++        "notes": "Efficient 7B model recommended for prototype and quantized deployment",
++    },
++    "mistral-7b-instruct": {
++        "hf_id": "mistralai/mistral-7b-instruct",
++        "size": "7B",
++        "license": "Apache-2.0",
++        "tier": "small",
++        "notes": "Instruction tuned variant",
++    },
++    "redpajama-7b": {
++        "hf_id": "togethercomputer/RedPajama-INCITE-7B-v1",
++        "size": "7B",
++        "license": "Apache-2.0",
++        "tier": "small",
++        "notes": "Open weights research model",
++    },
++    "falcon-40b": {
++        "hf_id": "tiiuae/falcon-40b",
++        "size": "40B",
++        "license": "Apache-2.0",
++        "tier": "large",
++        "notes": "High-quality reasoning model; heavy compute required",
++    },
++}
++
++
++def list_models(tier: Optional[str] = None) -> List[str]:
++    if tier:
++        return [k for k, v in MODEL_REGISTRY.items() if v.get("tier") == tier]
++    return list(MODEL_REGISTRY.keys())
++
++
++def get_model_info(key_or_id: str) -> Optional[Dict[str, Any]]:
++    # allow direct HF id lookup
++    if key_or_id in MODEL_REGISTRY:
++        return MODEL_REGISTRY[key_or_id]
++    for k, v in MODEL_REGISTRY.items():
++        if v.get("hf_id") == key_or_id:
++            return v
++    return None
++
++
++def choose_by_budget(max_gpu_mem_gb: int = 24) -> str:
++    """
++    Heuristic to pick a model key by available GPU memory.
++    """
++    if max_gpu_mem_gb < 32:
++        return "mistral-7b"
++    if max_gpu_mem_gb < 64:
++        return "redpajama-7b"
++    return "falcon-40b"
++
++
++def get_tier_pair() -> Dict[str, str]:
++    """
++    Default tier mapping (small, large)
++    """
++    return {"small": MODEL_REGISTRY["mistral-7b"]["hf_id"], "large": MODEL_REGISTRY["falcon-40b"]["hf_id"]}
++
++
++def ensure_license_allowed(license_str: str, allowlist: List[str]) -> bool:
++    """
++    Check whether the model license string matches any allowlist entry (case-insensitive substring match).
++    """
++    if not license_str:
++        return False
++    lic = license_str.lower()
++    for a in allowlist:
++        if a.lower() in lic:
++            return True
++    return False
++
++if __name__ == "__main__":
++    print("Available models by tier:")
++    for t in ["small", "large"]:
++        print(t, list_models(t))
++    print("Default tier pair:", get_tier_pair())
+--- /dev/null
++++ b/openquill/serving/router_policy.py
+@@ -0,0 +1,158 @@
++"""
++Routing policy for multi-tier model serving.
++
++This module provides heuristics to route a generation request to:
++ - small quantized local model (fast, cheap)
++ - vLLM/TGI cluster (GPU-backed)
++ - large fallback model (40B)
++
++The router uses:
++- explicit prefer_quality flag
++- prompt complexity heuristics (length, tokens, presence of code/math)
++- cost & latency budget
++"""
++from typing import Dict, Any
++import re
++
++# Simple heuristics and patterns
++CODE_PATTERN = re.compile(r"```|def |class |import |print\(|\bSQL\b", re.I)
++MATH_PATTERN = re.compile(r"\b\d+\s*[\+\-\*\/=]\s*\d+|\bsolve\b|\bproof\b", re.I)
++
++
++class RouterPolicy:
++    def __init__(self, small_key: str = "mistral-7b", large_key: str = "falcon-40b", token_threshold: int = 512):
++        self.small_key = small_key
++        self.large_key = large_key
++        self.token_threshold = token_threshold
++
++    def estimate_complexity(self, prompt: str) -> int:
++        # naive complexity estimator: tokens ~ words
++        tokens = max(1, len(prompt.split()))
++        score = tokens
++        # boost complexity if code or math present
++        if CODE_PATTERN.search(prompt):
++            score += 100
++        if MATH_PATTERN.search(prompt):
++            score += 50
++        return score
++
++    def choose_backend(self, prompt: str, prefer_quality: bool = False, max_latency_ms: int = 500) -> Dict[str, Any]:
++        """
++        Returns a dict describing chosen backend: {"tier": "small"|"gpu"|"large", "model_key": "<hf-id-or-key>", "reason": "..."}
++        """
++        complexity = self.estimate_complexity(prompt)
++        # explicit quality preference
++        if prefer_quality:
++            return {"tier": "large", "model_key": self.large_key, "reason": "prefer_quality flag set"}
++
++        # short prompts -> small
++        if complexity < self.token_threshold:
++            return {"tier": "small", "model_key": self.small_key, "reason": f"complexity {complexity} < threshold"}
++
++        # heuristics: code or heavy math -> large
++        if CODE_PATTERN.search(prompt) or MATH_PATTERN.search(prompt):
++            return {"tier": "large", "model_key": self.large_key, "reason": "code or math detected"}
++
++        # fallback to GPU cluster for medium complexity
++        return {"tier": "gpu", "model_key": "vllm_cluster", "reason": f"complexity {complexity} moderate"}
++
++
++if __name__ == "__main__":
++    r = RouterPolicy()
++    tests = [
++        "Summarize the following paragraph about climate change.",
++        "Write a python function to merge two sorted arrays.",
++        "Prove that the sum of two even numbers is even.",
++        "Translate: 'Hello, how are you?' into Spanish."
++    ]
++    for t in tests:
++        print(t, "->", r.choose_backend(t))
+--- /dev/null
++++ b/openquill/rag/retrieval_pipeline.py
+@@ -0,0 +1,192 @@
++"""
++Retrieval pipeline: chunking, embedding, FAISS index build, search, rerank, and streaming retriever.
++
++This module provides a practical, modular pipeline you can reuse or adapt to external vector DBs.
++It uses sentence-transformers by default for embeddings but accepts any embedder with an .encode API.
++"""
++from typing import List, Tuple, Optional, Any, Iterable
++import numpy as np
++import os
++import math
++
++try:
++    import faiss
++except Exception:
++    faiss = None
++
++from sentence_transformers import SentenceTransformer
++
++
++def chunk_text_token_aware(text: str, tokenizer, max_tokens: int = 1024, overlap: int = 128) -> List[str]:
++    """
++    Token-aware chunking using tokenizer.encode (HF tokenizer).
++    Falls back to simple character chunking if tokenizer is None.
++    """
++    if tokenizer is None:
++        # naive char slicing
++        chunks = []
++        i = 0
++        while i < len(text):
++            chunks.append(text[i:i+max_tokens])
++            if i + max_tokens >= len(text):
++                break
++            i = max(0, i + max_tokens - overlap)
++        return chunks
++    toks = tokenizer.encode(text)
++    chunks = []
++    i = 0
++    while i < len(toks):
++        chunk = tokenizer.decode(toks[i: i + max_tokens])
++        chunks.append(chunk)
++        if i + max_tokens >= len(toks):
++            break
++        i = max(0, i + max_tokens - overlap)
++    return chunks
++
++
++class Embedder:
++    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
++        self.model_name = model_name
++        self.model = SentenceTransformer(model_name)
++
++    def encode(self, texts: List[str]) -> np.ndarray:
++        return self.model.encode(texts, convert_to_numpy=True)
++
++
++class FaissIndex:
++    def __init__(self, dim: int, index_type: str = "flat"):
++        if faiss is None:
++            raise ImportError("faiss is required for FaissIndex")
++        self.dim = dim
++        if index_type == "flat":
++            self.index = faiss.IndexFlatL2(dim)
++        else:
++            quantizer = faiss.IndexFlatL2(dim)
++            nlist = 100
++            self.index = faiss.IndexIVFFlat(quantizer, dim, nlist, faiss.METRIC_L2)
++        self.id_to_doc = {}
++        self.next_id = 0
++
++    def add_texts(self, texts: List[str], embeddings: np.ndarray):
++        ids = np.arange(self.next_id, self.next_id + len(texts)).astype("int64")
++        if isinstance(self.index, faiss.IndexIVFFlat):
++            if not self.index.is_trained:
++                self.index.train(embeddings.astype("float32"))
++        self.index.add_with_ids(embeddings.astype("float32"), ids)
++        for i, t in zip(ids.tolist(), texts):
++            self.id_to_doc[i] = t
++        self.next_id += len(texts)
++
++    def search(self, query_emb: np.ndarray, k: int = 8) -> List[Tuple[int, float]]:
++        if query_emb.ndim == 1:
++            query_emb = query_emb.reshape(1, -1)
++        dists, ids = self.index.search(query_emb.astype("float32"), k)
++        return list(zip(ids[0].tolist(), dists[0].tolist()))
++
++    def get_doc(self, doc_id: int) -> Optional[str]:
++        return self.id_to_doc.get(doc_id)
++
++
++def build_index_from_texts(texts: List[str], embedder: Embedder, index_type: str = "flat") -> FaissIndex:
++    embs = embedder.encode(texts)
++    dim = embs.shape[1]
++    idx = FaissIndex(dim, index_type=index_type)
++    idx.add_texts(texts, embs)
++    return idx
++
++
++def rerank_with_cross_encoder(query: str, candidate_texts: List[str], cross_encoder=None) -> List[int]:
++    """
++    Optionally rerank candidate_texts using a cross-encoder that returns scores.
++    cross_encoder.should expose .predict([ (query, doc) ... ]) -> scores
++    """
++    if cross_encoder is None:
++        return list(range(len(candidate_texts)))
++    pairs = [(query, d) for d in candidate_texts]
++    scores = cross_encoder.predict(pairs)
++    idxs = sorted(range(len(scores)), key=lambda i: -scores[i])
++    return idxs
++
++
++def streaming_retriever(query: str, index: FaissIndex, embedder: Embedder, top_k: int = 5, cross_encoder=None) -> Iterable[dict]:
++    """
++    Yields summaries of the knowledge base progressively:
++     1) a short summary of top-k docs (if summarizer available)
++     2) then yields doc chunks
++    """
++    q_emb = embedder.encode([query])[0]
++    hits = index.search(q_emb, k=top_k)
++    candidate_texts = [index.get_doc(h[0]) for h in hits if h[0] != -1]
++    # optionally rerank
++    order = rerank_with_cross_encoder(query, candidate_texts, cross_encoder=cross_encoder)
++    for i in order:
++        yield {"type": "doc", "text": candidate_texts[i]}
++
++
++if __name__ == "__main__":
++    # quick demo (requires sentence-transformers and faiss)
++    docs = [
++        "OpenQuill is a toolkit for building LLM stacks.",
++        "Mistral-7B is an efficient model with Apache-2.0 license.",
++        "RAG combines retrieval with generation to reduce hallucination.",
++    ]
++    embedder = Embedder()
++    idx = build_index_from_texts(docs, embedder)
++    for r in streaming_retriever("Tell me about Mistral", idx, embedder):
++        print(r)
+--- /dev/null
++++ b/openquill/tools/firecracker_stub.py
+@@ -0,0 +1,160 @@
++"""
++microVM tool execution stub (Firecracker orchestration pattern)
++
++This module provides helpers to:
++ - prepare a tool payload and metadata
++ - call an external Firecracker manager to spawn a microVM and execute the payload
++ - collect outputs and enforce resource limits
++
++IMPORTANT:
++ - This file is a scaffold demonstrating the integration pattern. It does NOT create VMs itself.
++ - Use an established Firecracker orchestration solution (e.g., Firecracker SDKs, lightweight controller, or Kata/FaaS) in production.
++"""
++import json
++import os
++import tempfile
++import uuid
++from typing import Dict, Any
++
++def prepare_payload(tool_spec: Dict[str, Any], input_data: str = "") -> str:
++    """
++    Write payload and metadata to a temp directory and return the path.
++    """
++    tmpdir = tempfile.mkdtemp(prefix="oq-fc-")
++    payload_path = os.path.join(tmpdir, "payload.json")
++    meta = {"id": str(uuid.uuid4()), "tool_spec": tool_spec}
++    with open(payload_path, "w", encoding="utf-8") as f:
++        json.dump({"meta": meta, "input": input_data}, f)
++    return payload_path
++
++def invoke_microvm_manager(payload_path: str, timeout: int = 30) -> Dict[str, Any]:
++    """
++    Invoke an external microVM manager. This is intentionally a stub.
++    Expected behavior of a real manager:
++      - create ephemeral microVM
++      - provision CPU/memory limits and filesystem (read-only base image, rw ephemeral)
++      - disable network or use explicit egress policies
++      - run payload, capture stdout/stderr, and return outputs
++    Here we return a fake success to show the expected return format.
++    """
++    # In practice call: subprocess.run(["/usr/local/bin/fc-manager", "--payload", payload_path, ...])
++    return {
++        "status": "ok",
++        "stdout": "microvm-execution-stdout (stub)",
++        "stderr": "",
++        "exit_code": 0,
++        "meta": {"payload": payload_path}
++    }
++
++def run_tool_in_microvm(tool_spec: Dict[str, Any], input_data: str = "", timeout: int = 30) -> Dict[str, Any]:
++    """
++    High-level helper: prepare payload, call microVM manager, collect outputs.
++    """
++    payload = prepare_payload(tool_spec, input_data=input_data)
++    out = invoke_microvm_manager(payload, timeout=timeout)
++    # cleanup could be implemented by manager or here
++    return out
++
++if __name__ == "__main__":
++    # example usage (stub)
++    spec = {"type": "python", "code": "print('hello from microvm')"}
++    res = run_tool_in_microvm(spec)
++    print(res)
+--- /dev/null
++++ b/openquill/observability/prometheus.yml
+@@ -0,0 +1,36 @@
++# Prometheus basic config for scraping OpenQuill metrics
++global:
++  scrape_interval: 15s
++
++scrape_configs:
++  - job_name: 'openquill'
++    metrics_path: /metrics
++    static_configs:
++      - targets: ['openquill:8000'] # adjust host:port to your deployment
++
++  - job_name: 'vllm'
++    metrics_path: /metrics
++    static_configs:
++      - targets: ['vllm:8080']
++
++  - job_name: 'tgi'
++    metrics_path: /metrics
++    static_configs:
++      - targets: ['tgi:8080']
++
++# Alerting rules should be added in a separate file and referenced via rule_files.
++# See Grafana/Prometheus docs for alert manager integration and dashboard creation.
+--- /dev/null
++++ b/scripts/prepare_multilingual_dataset.sh
+@@ -0,0 +1,101 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Prepare multilingual dataset pipeline (skeleton).
++# This script shows commands and pointers to fetch multilingual corpora and process them.
++# It does not download large corpora by default; modify and run the blocks you need.
++
++OUT_DIR=${OUT_DIR:-"./data/multilingual"}
++mkdir -p "$OUT_DIR"
++
++echo "=== multilingual dataset preparation (skeleton)"
++echo "Note: datasets like mC4 and CCAligned are large. Use HF Datasets or download via your data infra."
++
++cat <<'DOC'
++Suggested steps:
++1) Use Hugging Face Datasets to stream mC4:
++   from datasets import load_dataset
++   ds = load_dataset("mC4", "all", split="train", streaming=True)
++   filter and sample, then save shards to disk
++
++2) For CCAligned:
++   use huggingface datasets or download from the provider and filter for languages you need
++
++3) Run language detection and quality filters:
++   - remove short noise lines
++   - remove PII (use regex scans and named entity detection)
++
++4) Tokenize using sentencepiece or your tokenizer:
++   spm_train --input=corpus.txt --model_prefix=spm --vocab_size=64000
++
++5) Produce final training shards (JSONL) and create dataset card in docs/
++DOC
++
++echo "Created output directory: $OUT_DIR. Edit this script to implement your data ingest steps."
++exit 0
+--- /dev/null
++++ b/scripts/distill_and_quantize.sh
+@@ -0,0 +1,106 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# distill_and_quantize.sh
++# Helper orchestration for distillation and quantization steps (high-level).
++# This script is a guide and wrapper that calls real conversion tools (you must install them).
++
++MODEL_SNAPSHOT=${MODEL_SNAPSHOT:-"./models/mistralai_mistral-7b"}
++OUT_DIR=${OUT_DIR:-"./models/quantized"}
++CONVERT_TOOL=${CONVERT_TOOL:-"convert-to-gguf"} # placeholder for your converter
++GGUF_OUT=${GGUF_OUT:-"$OUT_DIR/mistral-7b.gguf"}
++
++mkdir -p "$OUT_DIR"
++
++echo "=== Distillation & quantization helper (skeleton)"
++
++echo "Step 1: (optional) distill large model to smaller student"
++echo " - Use sequence-level distillation recipes or logits distillation"
++echo " - Example frameworks: Hugging Face Trainer, DeepSpeed, Fairseq"
++echo
++echo "Step 2: quantize model for CPU / edge (GGUF/ggml)"
++echo "If you have a conversion tool, call it here:"
++echo "$CONVERT_TOOL --input $MODEL_SNAPSHOT --output $GGUF_OUT --dtype q4_0"
++
++# Example: call community converter (replace with your converter)
++if command -v $CONVERT_TOOL >/dev/null 2>&1; then
++  echo "Running converter $CONVERT_TOOL ..."
++  $CONVERT_TOOL --input "$MODEL_SNAPSHOT" --output "$GGUF_OUT" --dtype "q4_0" || echo "Conversion tool failed (non-fatal in script)"
++else
++  echo "Converter tool ($CONVERT_TOOL) not found. Please install and rerun."
++fi
++
++echo "Step 3: benchmark quantized artifact (run small local inference tests)"
++echo " - Use examples/benchmark/run_benchmarks.sh to validate inference quality/latency"
++
++echo "Completed (skeleton). Edit the script to call your actual conversion and distillation tools."
++exit 0
+--- /dev/null
++++ b/examples/benchmark/run_benchmarks.sh
+@@ -0,0 +1,152 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# Simple benchmark harness (local, small) for MMLU/GSM8K/HumanEval stubs.
++# Real benchmarks require downloading datasets and running evaluation scripts.
++
++OUT_DIR=${OUT_DIR:-"./benchmarks"}
++mkdir -p "$OUT_DIR"
++
++echo "Running quick benchmarks (stubs). Replace with real evaluation harness for production."
++
++echo "1) GSM8K (toy subset)"
++python - <<'PY'
++from random import randint
++acc = randint(50,80)
++print("GSM8K (toy) accuracy:", acc)
++PY
++echo "Results saved to $OUT_DIR/gsm8k_toy.json"
++
++echo "2) HumanEval (toy)"
++python - <<'PY'
++from random import randint
++pass_at_1 = randint(0,100)/100.0
++print("HumanEval pass@1 (toy):", pass_at_1)
++PY
++
++echo "3) MMLU (toy)"
++python - <<'PY'
++from random import randint
++print("MMLU (toy) score:", randint(30,70))
++PY
++
++echo "Benchmarks (toy) complete. For real runs:"
++cat <<'DOC'
++ - Install benchmark packages and datasets:
++   pip install evaluate datasets
++ - For GSM8K: use evaluation script from the dataset authors to compute exact accuracy.
++ - For HumanEval: run code execution harness and compute pass@k.
++ - Artifact benchmarks into files (CSV/JSON) and upload to CI artifacts or S3.
++DOC
++
++echo "Saved toy results in $OUT_DIR (not actually saved - this is a stub)."
++exit 0
+--- /dev/null
++++ b/docs/governance.md
+@@ -0,0 +1,132 @@
++# Governance, licensing, and release checklist
++
++This document describes required controls to release a model and how to maintain governance.
++
++Model & dataset cards
++- Provide model_card.md and dataset_card.md in docs/ including:
++  - model id & version
++  - training data sources & sampling windows
++  - license text & link
++  - capabilities & limitations
++  - evaluation results (benchmarks)
++  - safety mitigations & instructions for reporting issues
++
++Release gating checklist (must pass)
++1) License verification
++   - All base models and datasets used must be allowed by license allowlist.
++   - CI must perform license check on the chosen MODEL_ID.
++
++2) Safety tests
++   - Run red-team harness and measure refusal rate & toxic output stats.
++   - If safety regressions found, block release and remediate.
++
++3) Privacy & PII
++   - Scan training data for PII; remove or document exceptions.
++   - Have a takedown process documented with contact info.
++
++4) Observability & Ops
++   - Prometheus/Grafana dashboards created and SLOs/SLIs defined.
++   - Alerts configured for safety regressions and high latency p95 breaches.
++
++5) Documentation
++   - Model card and dataset card included.
++   - Release notes describing changes & known issues.
++
++6) Security
++   - Sandbox tool execution verified.
++   - Secrets and keys managed (no secrets in repo).
++
++Post-release responsibilities
++- Periodic audits: run scheduled red-team tests and update model card.
++- Vulnerability response: maintain a channel for reporting issues and a remediation process.
++- Track usage: collect redacted telemetry for research and safety monitoring.
++
++Governance roles & responsibilities
++- Model owner: responsible for release decisions and licensing.
++- Safety lead: evaluates red-team results and approves public releases.
++- Infra lead: deploys and manages serving stack and monitoring.
++- Legal: approves dataset/model licensing for redistribution.
++
++This governance doc is a starting point; adapt to your organization's compliance requirements.
+--- /dev/null
++++ b/openquill/safety/moderation_adapters.py
+@@ -0,0 +1,146 @@
++"""
++External moderation adapters and unified moderation API.
++
++Provides:
++ - local rule-based checks (from openquill/safety/moderation.py)
++ - HF moderation API adapter (if HF_API_TOKEN provided)
++ - Perspective API adapter (if PERSPECTIVE_API_KEY provided)
++ - unified function moderate(text) -> dict with result and reason
++"""
++import os
++import requests
++from typing import Dict, Any
++
++from openquill.safety.moderation import is_safe as rule_is_safe
++
++
++def hf_moderation(text: str) -> Dict[str, Any]:
++    hf_token = os.environ.get("HF_API_TOKEN")
++    if not hf_token:
++        return {"status": "not_configured"}
++    url = "https://api-inference.huggingface.co/moderation"
++    headers = {"Authorization": f"Bearer {hf_token}"}
++    try:
++        resp = requests.post(url, headers=headers, json={"inputs": text}, timeout=10)
++        return {"status": "ok" if resp.status_code == 200 else "error", "response": resp.json() if resp.status_code == 200 else resp.text}
++    except Exception as e:
++        return {"status": "error", "error": str(e)}
++
++
++def perspective_moderation(text: str) -> Dict[str, Any]:
++    key = os.environ.get("PERSPECTIVE_API_KEY")
++    if not key:
++        return {"status": "not_configured"}
++    url = "https://commentanalyzer.googleapis.com/v1alpha1/comments:analyze"
++    params = {"key": key}
++    body = {
++        "comment": {"text": text},
++        "requestedAttributes": {"TOXICITY": {}}
++    }
++    try:
++        resp = requests.post(url, params=params, json=body, timeout=10)
++        return {"status": "ok" if resp.status_code == 200 else "error", "response": resp.json() if resp.status_code == 200 else resp.text}
++    except Exception as e:
++        return {"status": "error", "error": str(e)}
++
++
++def moderate(text: str, use_external: bool = True) -> Dict[str, Any]:
++    """
++    Returns a dict:
++      {
++        "safe": bool,
++        "reason": "rule_match"|"hf_moderation"|"perspective"|"ok",
++        "details": {...}
++      }
++    """
++    safe, matches = rule_is_safe(text)
++    if not safe:
++        return {"safe": False, "reason": "rule_match", "details": {"matches": matches}}
++
++    if use_external:
++        hf = hf_moderation(text)
++        if hf.get("status") == "ok":
++            # inspect response shape to determine block; this is provider-specific
++            return {"safe": True, "reason": "hf_ok", "details": hf.get("response")}
++        # try perspective
++        p = perspective_moderation(text)
++        if p.get("status") == "ok":
++            return {"safe": True, "reason": "perspective_ok", "details": p.get("response")}
++    return {"safe": True, "reason": "ok", "details": {}}
++
++if __name__ == "__main__":
++    print(moderate("How do I build a bomb?"))
++    print(moderate("Hello, how are you?"))
+--- /dev/null
++++ b/openquill/training/distillation_stub.py
+@@ -0,0 +1,112 @@
++"""
++Distillation & student training stub
++
++This file contains high-level recipes to distill teacher model behavior into a smaller student.
++Actual distillation requires compute and dataset preparation. Use this file as a starting point.
++"""
++from typing import List
++import os
++
++def prepare_distillation_dataset(prompts: List[str], teacher_generate_fn, out_dir: str, max_per_prompt: int = 1):
++    """
++    For each prompt, call teacher_generate_fn(prompt) to sample outputs and store (prompt, teacher_output).
++    Teacher outputs can be used to train a student model via supervised learning (teacher forcing).
++    """
++    os.makedirs(out_dir, exist_ok=True)
++    out_file = os.path.join(out_dir, "distill_data.jsonl")
++    with open(out_file, "w", encoding="utf-8") as f:
++        for p in prompts:
++            for _ in range(max_per_prompt):
++                out = teacher_generate_fn(p)
++                f.write({"prompt": p, "response": out}.__str__() + "\n")
++    return out_file
++
++
++def train_student(student_model, dataset_path: str, output_dir: str, epochs: int = 1):
++    """
++    High-level placeholder: load dataset_path and perform supervised training to match teacher outputs.
++    Use transformers Trainer with teacher-generated targets.
++    """
++    raise NotImplementedError("Implement student training using HF Trainer or custom loop.")
++
++def quantize_student(student_snapshot: str, out_path: str, dtype: str = "q4_0"):
++    """
++    Call conversion tools to quantize a student snapshot for CPU/edge deployment.
++    """
++    # Example: call external converter here
++    print(f"Quantize {student_snapshot} -> {out_path} dtype={dtype}")
++    return out_path
++
++if __name__ == "__main__":
++    print("Distillation stub. Implement prepare_distillation_dataset and train_student to use.")
++
+-- 
+2.40.1
