@@ -1,0 +1,343 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Demo <demo@example.com>
+Date: 2026-02-26 00:00:00 +0000
+Subject: [PATCH] demo: short SFT -> publish local model -> dev server (distilgpt2 default)
+---
+ data/demo_sft.jsonl                                  |  14 +++++++
+ scripts/demo_finetune.py                             | 210 ++++++++++++++++++++++++++++++
+ scripts/demo_publish_local.py                        | 154 +++++++++++++++++++
+ scripts/run_demo_server.py                           | 162 ++++++++++++++++++++
+ scripts/run_demo.sh                                   |  36 +++++
+ README_DEMO.md                                       | 103 +++++++++++++
+ 6 files changed, 679 insertions(+)
+ create mode 100644 data/demo_sft.jsonl
+ create mode 100755 scripts/demo_finetune.py
+ create mode 100755 scripts/demo_publish_local.py
+ create mode 100755 scripts/run_demo_server.py
+ create mode 100755 scripts/run_demo.sh
+ create mode 100644 README_DEMO.md
+--- /dev/null
++++ b/data/demo_sft.jsonl
+@@ -0,0 +1,14 @@
++{"text": "Write a friendly one-paragraph blurb introducing OpenQuill and its goals."}
++{"text": "Explain the concept of supervised fine-tuning (SFT) for language models in one sentence."}
++{"text": "Provide a brief summary of how retrieval-augmented generation (RAG) reduces hallucinations."}
++{"text": "Write a short Python function that returns the factorial of a non-negative integer."}
++{"text": "List three best practices for prompt engineering when using a causal LM."}
++{"text": "Translate the sentence 'Hello, how are you?' into Spanish."}
++{"text": "Write a short haiku about coffee and code."}
++
+--- /dev/null
++++ b/scripts/demo_finetune.py
+@@ -0,0 +1,210 @@
++#!/usr/bin/env python3
++"""
++scripts/demo_finetune.py
++
++Lightweight demo SFT (fine-tune) for quick validation.
++Default: fine-tune distilgpt2 on a tiny JSONL dataset (data/demo_sft.jsonl) for a few steps.
++
++Usage (defaults):
++  python scripts/demo_finetune.py
++
++Custom:
++  python scripts/demo_finetune.py --model distilgpt2 --data data/demo_sft.jsonl --out outputs/demo_sft --epochs 1
++
++Notes:
++ - This is a demo helper, not a production training script. For production use your QLoRA/PEFT pipeline.
++"""
++from __future__ import annotations
++import argparse
++from pathlib import Path
++import os
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--model", default="distilgpt2", help="Base model id or path")
++    parser.add_argument("--data", default="data/demo_sft.jsonl", help="JSONL with 'text' field")
++    parser.add_argument("--out", default="outputs/demo_sft", help="Output dir")
++    parser.add_argument("--epochs", type=int, default=1)
++    parser.add_argument("--per_device_train_batch_size", type=int, default=2)
++    parser.add_argument("--max_length", type=int, default=128)
++    parser.add_argument("--learning_rate", type=float, default=5e-5)
++    args = parser.parse_args()
++
++    # lazy imports to keep quick failure messages
++    try:
++        from datasets import load_dataset
++        from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, DataCollatorForLanguageModeling
++    except Exception as e:
++        print("Please install required packages: pip install datasets transformers")
++        raise
++
++    data_path = Path(args.data)
++    if not data_path.exists():
++        raise FileNotFoundError(f"Demo data not found: {data_path}")
++
++    print("Loading dataset from", data_path)
++    ds = load_dataset("json", data_files=str(data_path))["train"]
++
++    print("Loading tokenizer and model:", args.model)
++    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
++    # ensure tokenizer has pad token
++    if tokenizer.pad_token_id is None:
++        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
++
++    def tokenize_fn(examples):
++        texts = examples["text"]
++        return tokenizer(texts, truncation=True, padding="max_length", max_length=args.max_length)
++
++    ds_tok = ds.map(tokenize_fn, batched=True, remove_columns=["text"])
++    ds_tok.set_format(type="torch")
++
++    model = AutoModelForCausalLM.from_pretrained(args.model)
++    # resize token embeddings if tokenizer changed
++    model.resize_token_embeddings(len(tokenizer))
++
++    out_dir = Path(args.out)
++    out_dir.mkdir(parents=True, exist_ok=True)
++
++    training_args = TrainingArguments(
++        output_dir=str(out_dir),
++        overwrite_output_dir=True,
++        num_train_epochs=args.epochs,
++        per_device_train_batch_size=args.per_device_train_batch_size,
++        save_steps=100,
++        save_total_limit=2,
++        fp16=False,
++        learning_rate=args.learning_rate,
++        logging_steps=10,
++        report_to=[],
++    )
++
++    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
++
++    trainer = Trainer(
++        model=model,
++        args=training_args,
++        train_dataset=ds_tok,
++        data_collator=data_collator,
++    )
++
++    print("Starting training (demo)...")
++    trainer.train()
++    print("Saving demo model to", out_dir)
++    trainer.save_model(str(out_dir))
++    print("Demo fine-tune complete.")
++
++    # export tokenizer too
++    tokenizer.save_pretrained(str(out_dir))
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null
++++ b/scripts/demo_publish_local.py
+@@ -0,0 +1,154 @@
++#!/usr/bin/env python3
++"""
++scripts/demo_publish_local.py
++
++Publish a locally-finetuned demo model to a local models path (models/demo_model) and optionally
++upload to a private Hugging Face repo if HF token and repo id are provided.
++
++Usage:
++  python scripts/demo_publish_local.py --checkpoint outputs/demo_sft --out-model-dir models/demo_model
++  python scripts/demo_publish_local.py --checkpoint outputs/demo_sft --hf-repo my-org/demo --hf-token $HF_API_TOKEN
++"""
++from __future__ import annotations
++import argparse
++import shutil
++from pathlib import Path
++import os
++
++try:
++    from huggingface_hub import upload_folder
++except Exception:
++    upload_folder = None
++
++def publish_local(checkpoint: Path, out_dir: Path):
++    if not checkpoint.exists():
++        raise FileNotFoundError(checkpoint)
++    out_dir.parent.mkdir(parents=True, exist_ok=True)
++    if out_dir.exists():
++        shutil.rmtree(out_dir)
++    shutil.copytree(checkpoint, out_dir)
++    print("Copied", checkpoint, "->", out_dir)
++
++def publish_to_hf(checkpoint: Path, repo_id: str, token: str):
++    if upload_folder is None:
++        raise RuntimeError("huggingface_hub not installed (pip install huggingface-hub)")
++    # upload folder to HF repo (private)
++    print(f"Uploading {checkpoint} to HF repo {repo_id} (this may take time)")
++    upload_folder(repo_id=repo_id, folder_path=str(checkpoint), path_in_repo="", token=token)
++    print("Upload complete.")
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--checkpoint", required=True, help="Path to trained model directory")
++    p.add_argument("--out-model-dir", default="models/demo_model", help="Local path to publish model")
++    p.add_argument("--hf-repo", default="", help="Optional HF repo id to push to (e.g., org/demo)")
++    p.add_argument("--hf-token", default=os.environ.get("HF_API_TOKEN", ""), help="Hugging Face token")
++    args = p.parse_args()
++
++    checkpoint = Path(args.checkpoint)
++    out_dir = Path(args.out_model_dir)
++
++    publish_local(checkpoint, out_dir)
++
++    if args.hf_repo:
++        if not args.hf_token:
++            raise RuntimeError("HF token required to upload to HF")
++        publish_to_hf(checkpoint, args.hf_repo, args.hf_token)
++
++    print("Publish step finished. Local model available at", out_dir)
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null
++++ b/scripts/run_demo_server.py
+@@ -0,0 +1,162 @@
++#!/usr/bin/env python3
++"""
++scripts/run_demo_server.py
++
++Small FastAPI server that loads a local demo model (models/demo_model) and serves a /generate endpoint.
++
++Usage:
++  python scripts/run_demo_server.py --model-dir models/demo_model --host 0.0.0.0 --port 8080
++
++This is intended for local demo / testing only.
++"""
++from __future__ import annotations
++import argparse
++from pathlib import Path
++import uvicorn
++from fastapi import FastAPI, HTTPException
++from pydantic import BaseModel
++
++app = FastAPI(title="OpenQuill Demo Server")
++
++class GenRequest(BaseModel):
++    prompt: str
++    max_new_tokens: int = 64
++
++MODEL = None
++TOKENIZER = None
++
++@app.on_event("startup")
++def load_model(model_dir: str = "models/demo_model"):
++    global MODEL, TOKENIZER
++    from transformers import AutoTokenizer, AutoModelForCausalLM
++    md = Path(model_dir)
++    if not md.exists():
++        raise RuntimeError(f"Model dir not found: {md}")
++    TOKENIZER = AutoTokenizer.from_pretrained(str(md), use_fast=True)
++    MODEL = AutoModelForCausalLM.from_pretrained(str(md))
++    # move to CPU/CUDA
++    try:
++        import torch
++        device = "cuda" if torch.cuda.is_available() else "cpu"
++        MODEL.to(device)
++    except Exception:
++        pass
++
++@app.post("/generate")
++def generate(req: GenRequest):
++    if MODEL is None or TOKENIZER is None:
++        raise HTTPException(status_code=503, detail="Model not loaded")
++    try:
++        inputs = TOKENIZER(req.prompt, return_tensors="pt").input_ids
++        out = MODEL.generate(inputs, max_new_tokens=req.max_new_tokens)
++        text = TOKENIZER.decode(out[0], skip_special_tokens=True)
++        return {"generated_text": text}
++    except Exception as e:
++        raise HTTPException(status_code=500, detail=str(e))
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--model-dir", default="models/demo_model")
++    parser.add_argument("--host", default="127.0.0.1")
++    parser.add_argument("--port", type=int, default=8080)
++    args = parser.parse_args()
++
++    # Preload model at startup by passing env var to uvicorn startup event via import hook
++    # Simpler: call load_model here before starting server
++    load_model(args.model_dir)
++    uvicorn.run(app, host=args.host, port=args.port)
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null
++++ b/scripts/run_demo.sh
+@@ -0,0 +1,36 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# scripts/run_demo.sh
++#
++# Quick wrapper to run the demo pipeline with defaults:
++#  1) Fine-tune distilgpt2 on data/demo_sft.jsonl (short)
++#  2) Publish local model to models/demo_model
++#  3) Start demo server (foreground)
++
++ROOT=$(cd "$(dirname "$0")/../" && pwd)
++
++echo "1) Run demo fine-tune (distilgpt2, small dataset)"
++python "$ROOT/scripts/demo_finetune.py" --model distilgpt2 --data "$ROOT/data/demo_sft.jsonl" --out "$ROOT/outputs/demo_sft" --epochs 1
++
++echo "2) Publish locally"
++python "$ROOT/scripts/demo_publish_local.py" --checkpoint "$ROOT/outputs/demo_sft" --out-model-dir "$ROOT/models/demo_model"
++
++echo "3) Start demo server (Ctrl-C to stop)"
++python "$ROOT/scripts/run_demo_server.py" --model-dir "$ROOT/models/demo_model" --host 0.0.0.0 --port 8080
++
++echo "Demo finished."
++
+--- /dev/null
++++ b/README_DEMO.md
+@@ -0,0 +1,103 @@
++# OpenQuill demo: Produce a runnable demo LLM
++
++This patch adds a small demo pipeline to quickly produce a runnable model for local testing and demos.
++It is intentionally minimal and safe — it fine-tunes a small base model for a few steps, publishes it locally,
++and starts a tiny FastAPI server to generate responses.
++
++Files added
++- data/demo_sft.jsonl — tiny example SFT dataset (JSONL with "text" field).
++- scripts/demo_finetune.py — demo fine-tune using Hugging Face Trainer (defaults to distilgpt2).
++- scripts/demo_publish_local.py — copy trained model to models/demo_model and optionally push to HF (if specified).
++- scripts/run_demo_server.py — FastAPI demo server exposing /generate.
++- scripts/run_demo.sh — wrapper to run the three steps sequentially.
++
++Quickstart (defaults)
++1. Install dependencies (recommended in a venv):
++   pip install -U transformers datasets accelerate uvicorn fastapi
++
++2. Run the demo (this trains a tiny model for a short time):
++   ./scripts/run_demo.sh
++
++3. After the server starts, query:
++   curl -X POST http://127.0.0.1:8080/generate -H "Content-Type: application/json" -d '{"prompt":"Write a friendly sentence about OpenQuill","max_new_tokens":40}'
++
++Notes and limitations
++- This demo is NOT production-ready. It is for validating that the training -> publish -> serve loop works end-to-end.
++- For production SFT you MUST use the QLoRA/PEFT pipeline, legal signoffs, annotation/RLHF workflows, and hardened serving infra provided elsewhere in the repo.
++- The demo uses a tiny dataset and runs a short training; adjust hyperparameters and compute resources for real experiments.
++
++Extending the demo
++- To publish to a private Hugging Face repo, run demo_publish_local.py with --hf-repo and HF_API_TOKEN set.
++- To adapt to a GPU, install the appropriate torch & CUDA packages and Trainer will use the GPU if available.
++
++Security
++- Do not expose the demo server publicly. It is intended for local testing only.
++
++If you want, I can:
++- produce a GitHub Actions workflow that runs this demo as a smoke test on PRs (short run),
++- or replace the demo fine-tune with a PEFT/QLoRA small-run so you exercise the same code paths as production.
++
++Which would you like next?
+--- 
+2.40.1
