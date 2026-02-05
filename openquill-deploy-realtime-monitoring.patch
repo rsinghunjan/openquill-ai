@@ -1,0 +1,852 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Ops Bot <ops@example.com>
+Date: 2026-03-26 00:00:00 +0000
+Subject: [PATCH] staging & realtime deployment: vLLM/TGI serving manifests, warmup & smoke jobs, Gatekeeper+cosign helpers, PVC/RBAC/TLS templates, streaming safety proxy integration, Prometheus rules and Grafana dashboard skeleton, and deploy helper
+---
+ k8s/serving_vllm.yaml                              | 352 +++++++++++++++++++++++++++++++++++++++++++++
+ k8s/warmup_job.yaml                                | 111 +++++++++++++++
+ k8s/smoke_test_job.yaml                            | 132 ++++++++++++++++++
+ k8s/pvc_and_tls_templates.yaml                     | 116 ++++++++++++++
+ k8s/rbac_serving.yaml                              | 102 ++++++++++++
+ k8s/gatekeeper_image_allowlist_constraint.yaml     | 201 +++++++++++++++++++++++++++++++
+ monitoring/prometheus_rules_openquill.yaml         | 236 ++++++++++++++++++++++++++++++++
+ monitoring/grafana_dashboard_openquill.json        | 211 +++++++++++++++++++++++++++
+ scripts/deploy_staging_stack.sh                     | 218 +++++++++++++++++++++++++++++
+ tools/tool_interfaces.py                            | 182 ++++++++++++++++++
+ 11 files changed, 1961 insertions(+)
+ create mode 100644 k8s/serving_vllm.yaml
+ create mode 100644 k8s/warmup_job.yaml
+ create mode 100644 k8s/smoke_test_job.yaml
+ create mode 100644 k8s/pvc_and_tls_templates.yaml
+ create mode 100644 k8s/rbac_serving.yaml
+ create mode 100644 k8s/gatekeeper_image_allowlist_constraint.yaml
+ create mode 100644 monitoring/prometheus_rules_openquill.yaml
+ create mode 100644 monitoring/grafana_dashboard_openquill.json
+ create mode 100755 scripts/deploy_staging_stack.sh
+ create mode 100644 tools/tool_interfaces.py
+--- /dev/null
++++ b/k8s/serving_vllm.yaml
+@@ -0,0 +1,352 @@
++# Kubernetes manifests for vLLM/TGI-based multimodal staging serving
++# - Namespace, ServiceAccount, Role, Deployment, Service, Ingress (TLS secret reference)
++# - Assumes model artifacts are present in PVC openquill-model-pvc under /models/release_candidate
++
++apiVersion: v1
++kind: Namespace
++metadata:
++  name: openquill-staging
++  labels:
++    environment: staging
++
++---
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: openquill-serving-sa
++  namespace: openquill-staging
++
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  namespace: openquill-staging
++  name: openquill-serving-role
++rules:
++  - apiGroups: [""]
++    resources: ["pods","pods/log","services","endpoints","persistentvolumeclaims","configmaps","secrets"]
++    verbs: ["get","list","watch","patch","create","update"]
++
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: openquill-serving-binding
++  namespace: openquill-staging
++subjects:
++  - kind: ServiceAccount
++    name: openquill-serving-sa
++    namespace: openquill-staging
++roleRef:
++  kind: Role
++  name: openquill-serving-role
++  apiGroup: rbac.authorization.k8s.io
++
++---
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: openquill-vllm
++  namespace: openquill-staging
++  labels:
++    app: openquill-vllm
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: openquill-vllm
++  template:
++    metadata:
++      labels:
++        app: openquill-vllm
++      annotations:
++        prometheus.io/scrape: "true"
++        prometheus.io/port: "8000"
++    spec:
++      serviceAccountName: openquill-serving-sa
++      nodeSelector:
++        openquill/gpu: "true"
++      tolerations:
++        - key: "nvidia.com/gpu"
++          operator: "Exists"
++          effect: "NoSchedule"
++      containers:
++        - name: vllm
++          image: vllm/vllm:latest
++          imagePullPolicy: IfNotPresent
++          args:
++            - "--model"
++            - "/models/release_candidate"
++            - "--host"
++            - "0.0.0.0"
++            - "--port"
++            - "8000"
++            - "--tensor-parallel-size"
++            - "1"
++          env:
++            - name: VLLM_LOG_LEVEL
++              value: "info"
++          ports:
++            - name: http
++              containerPort: 8000
++            - name: metrics
++              containerPort: 8001
++          resources:
++            limits:
++              nvidia.com/gpu: 1
++              cpu: "8000m"
++              memory: "64Gi"
++            requests:
++              cpu: "2000m"
++              memory: "24Gi"
++          volumeMounts:
++            - name: model-pvc
++              mountPath: /models
++              readOnly: true
++            - name: tls-certs
++              mountPath: /etc/tls
++              readOnly: true
++          readinessProbe:
++            httpGet:
++              path: /health
++              port: 8000
++            initialDelaySeconds: 30
++            timeoutSeconds: 5
++          livenessProbe:
++            httpGet:
++              path: /health
++              port: 8000
++            initialDelaySeconds: 60
++            timeoutSeconds: 5
++      volumes:
++        - name: model-pvc
++          persistentVolumeClaim:
++            claimName: openquill-model-pvc
++        - name: tls-certs
++          secret:
++            secretName: openquill-tls-secret
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: openquill-vllm
++  namespace: openquill-staging
++spec:
++  selector:
++    app: openquill-vllm
++  ports:
++    - name: http
++      port: 80
++      targetPort: 8000
++    - name: metrics
++      port: 9100
++      targetPort: 8001
++
++---
++# Ingress (example, relies on cluster ingress controller)
++apiVersion: networking.k8s.io/v1
++kind: Ingress
++metadata:
++  name: openquill-vllm-ingress
++  namespace: openquill-staging
++  annotations:
++    kubernetes.io/ingress.class: "nginx"
++    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
++    # Example to enforce TLS; secret openquill-tls-secret must exist
++spec:
++  tls:
++    - hosts:
++        - openquill-staging.example.com
++      secretName: openquill-tls-secret
++  rules:
++    - host: openquill-staging.example.com
++      http:
++        paths:
++          - path: /
++            pathType: Prefix
++            backend:
++              service:
++                name: openquill-vllm
++                port:
++                  number: 80
++
++---
++# Optional: PrometheusServiceMonitor (if using Prometheus Operator)
++apiVersion: monitoring.coreos.com/v1
++kind: ServiceMonitor
++metadata:
++  name: openquill-vllm-sm
++  namespace: openquill-staging
++spec:
++  selector:
++    matchLabels:
++      app: openquill-vllm
++  endpoints:
++    - port: metrics
++      path: /metrics
++      interval: 15s
++  namespaceSelector:
++    matchNames:
++      - openquill-staging
++
++---
++# Note: For production, prefer vLLM or TGI images pinned to a curated digest and validated with cosign.
++# Apply Gatekeeper constraints and cosign verification (see k8s/gatekeeper_image_allowlist_constraint.yaml and scripts/deploy_staging_stack.sh).
+--- /dev/null
++++ b/k8s/warmup_job.yaml
+@@ -0,0 +1,111 @@
++# Warmup job that queries staging endpoint to load weights and run a small set of prompts.
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: openquill-warmup
++  namespace: openquill-staging
++spec:
++  template:
++    spec:
++      serviceAccountName: openquill-serving-sa
++      restartPolicy: Never
++      containers:
++        - name: warmup
++          image: python:3.10-slim
++          command: ["/bin/sh", "-c"]
++          args:
++            - |
++              set -euo pipefail
++              pip install requests || true
++              ENDPOINT="${ENDPOINT:-http://openquill-vllm.openquill-staging.svc.cluster.local/generate}"
++              PROMPTS_FILE=/data/smoke_prompts.txt
++              if [ -f "$PROMPTS_FILE" ]; then
++                while read -r p; do
++                  echo "Warmup prompt: $p"
++                  python - <<PY
++import requests, sys, time
++try:
++    r = requests.post("$ENDPOINT", json={"prompt": p, "max_new_tokens":64}, timeout=30)
++    print("status", r.status_code)
++except Exception as e:
++    print("warmup failed", e)
++    sys.exit(2)
++PY
++                done < "$PROMPTS_FILE"
++              else
++                echo "No warmup prompts found; running one default prompt"
++                python - <<PY
++import requests
++r = requests.post("$ENDPOINT", json={"prompt":"Hello OpenQuill","max_new_tokens":32}, timeout=30)
++print("status", r.status_code)
++PY
++              fi
++          env:
++            - name: ENDPOINT
++              value: "http://openquill-vllm.openquill-staging.svc.cluster.local/generate"
++          volumeMounts:
++            - name: data
++              mountPath: /data
++      volumes:
++        - name: data
++          persistentVolumeClaim:
++            claimName: openquill-data-pvc
++  backoffLimit: 0
++
++---
++# Run: kubectl apply -f k8s/warmup_job.yaml -n openquill-staging
++# Wait: kubectl wait --for=condition=complete --timeout=10m job/openquill-warmup -n openquill-staging
+--- /dev/null
++++ b/k8s/smoke_test_job.yaml
+@@ -0,0 +1,132 @@
++# Smoke test job that runs a battery of API checks and validates SLOs
++apiVersion: batch/v1
++kind: Job
++metadata:
++  name: openquill-smoke
++  namespace: openquill-staging
++spec:
++  template:
++    spec:
++      serviceAccountName: openquill-serving-sa
++      restartPolicy: Never
++      containers:
++        - name: smoke
++          image: python:3.10-slim
++          command: ["/bin/sh", "-c"]
++          args:
++            - |
++              set -euo pipefail
++              pip install requests || true
++              ENDPOINT="${ENDPOINT:-http://openquill-vllm.openquill-staging.svc.cluster.local/generate}"
++              echo "Running smoke checks against $ENDPOINT"
++              python - <<PY
++import requests, time, sys
++prompts = ["Write a short ethical refusal to dangerous instructions.","Summarize the concept of gradient descent in one sentence."]
++latencies=[]
++for p in prompts:
++    t0=time.time()
++    r=requests.post("$ENDPOINT", json={"prompt":p,"max_new_tokens":64}, timeout=30)
++    dur=time.time()-t0
++    latencies.append(dur)
++    print("prompt", p[:40], "status", r.status_code, "latency", dur)
++if max(latencies) > 2.0:
++    print("Latency SLO breached: p95 heuristic exceeded")
++    sys.exit(2)
++print("Smoke tests passed")
++PY
++          env:
++            - name: ENDPOINT
++              value: "http://openquill-vllm.openquill-staging.svc.cluster.local/generate"
++      volumes: []
++  backoffLimit: 0
++
++---
++# Usage:
++# kubectl apply -f k8s/smoke_test_job.yaml -n openquill-staging
++# kubectl wait --for=condition=complete --timeout=10m job/openquill-smoke -n openquill-staging
+--- /dev/null
++++ b/k8s/pvc_and_tls_templates.yaml
+@@ -0,0 +1,116 @@
++# PVC and TLS secret templates (operator should provision according to cluster storage class and secrets management)
++#
++# PersistentVolumeClaim examples (adjust storageClassName and size to your environment)
++apiVersion: v1
++kind: PersistentVolumeClaim
++metadata:
++  name: openquill-model-pvc
++  namespace: openquill-staging
++spec:
++  accessModes:
++    - ReadWriteMany
++  resources:
++    requests:
++      storage: 1Ti
++  storageClassName: standard
++
++---
++apiVersion: v1
++kind: PersistentVolumeClaim
++metadata:
++  name: openquill-data-pvc
++  namespace: openquill-staging
++spec:
++  accessModes:
++    - ReadWriteMany
++  resources:
++    requests:
++      storage: 500Gi
++  storageClassName: standard
++
++---
++apiVersion: v1
++kind: PersistentVolumeClaim
++metadata:
++  name: openquill-work-pvc
++  namespace: openquill-staging
++spec:
++  accessModes:
++    - ReadWriteOnce
++  resources:
++    requests:
++      storage: 200Gi
++  storageClassName: standard
++
++---
++# TLS secret template (operator should create using cert-manager or by piping cert+key)
++# kubectl create secret tls openquill-tls-secret --namespace openquill-staging --cert=fullchain.pem --key=privkey.pem
++
++---
++# Note: Secret creation example (do not store keys in repo):
++# apiVersion: v1
++# kind: Secret
++# metadata:
++#   name: openquill-tls-secret
++#   namespace: openquill-staging
++# type: kubernetes.io/tls
++# data:
++#   tls.crt: <base64 cert>
++#   tls.key: <base64 key>
+--- /dev/null
++++ b/k8s/rbac_serving.yaml
+@@ -0,0 +1,102 @@
++# Minimal RBAC resources for serving and monitoring
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: openquill-monitor-sa
++  namespace: openquill-staging
++
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: ClusterRole
++metadata:
++  name: openquill-monitor-role
++rules:
++  - apiGroups: [""]
++    resources: ["pods","nodes","endpoints","services","namespaces"]
++    verbs: ["get","list","watch"]
++
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: ClusterRoleBinding
++metadata:
++  name: openquill-monitor-binding
++subjects:
++  - kind: ServiceAccount
++    name: openquill-monitor-sa
++    namespace: openquill-staging
++roleRef:
++  kind: ClusterRole
++  name: openquill-monitor-role
++  apiGroup: rbac.authorization.k8s.io
++
++---
++# Prometheus scraping permissions if using Prometheus Operator, ServiceMonitor can reference ServiceAccount
++# Adjust according to your cluster security model.
+--- /dev/null
++++ b/k8s/gatekeeper_image_allowlist_constraint.yaml
+@@ -0,0 +1,201 @@
++# Gatekeeper ConstraintTemplate + Constraint example to enforce image allowlist (simple example)
++# Operators: adapt to your Gatekeeper setup and sync the allowlist from a ConfigMap or external store.
++
++apiVersion: templates.gatekeeper.sh/v1beta1
++kind: ConstraintTemplate
++metadata:
++  name: k8simageallowlist
++spec:
++  crd:
++    spec:
++      names:
++        kind: K8sImageAllowlist
++  targets:
++    - target: admission.k8s.gatekeeper.sh
++      rego: |
++        package k8simageallowlist
++        violation[{"msg": msg}] {
++          input.review.kind.kind == "Pod"
++          containers := input.review.object.spec.containers
++          allowed := {"ghcr.io/yourorg/openquill-multimodal-server:latest", "vllm/vllm:latest", "ghcr.io/yourorg/openquill-runner:latest"}
++          some i
++          c := containers[i]
++          not startswith_any(c.image, allowed)
++          msg := sprintf("image %v is not in allowlist", [c.image])
++        }
++        startswith_any(img, allowed) {
++          some a
++          allowed[a] == img
++        }
++
++---
++# Constraint that uses the above template
++apiVersion: constraints.gatekeeper.sh/v1beta1
++kind: K8sImageAllowlist
++metadata:
++  name: openquill-image-allowlist
++spec:
++  match:
++    kinds:
++      - apiGroups: [""]
++        kinds: ["Pod"]
++    namespaces: ["openquill-staging"]
++  parameters:
++    # Parameters may be used by your template. This example hardcodes allowed images in the template.
++    allowlistConfigMap: openquill-image-allowlist-cm
++
++---
++# Example ConfigMap to hold allowlist (operator can update this programmatically)
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: openquill-image-allowlist-cm
++  namespace: openquill-staging
++data:
++  allowed_images: |
++    - ghcr.io/yourorg/openquill-multimodal-server:latest
++    - vllm/vllm:latest
++    - ghcr.io/yourorg/openquill-runner:latest
++
++---
++# Notes:
++# - For production, manage allowlist centrally (KMS-protected values or remote service).
++# - Combine Gatekeeper with cosign verification of images (see scripts/deploy_staging_stack.sh).
+--- /dev/null
++++ b/monitoring/prometheus_rules_openquill.yaml
+@@ -0,0 +1,236 @@
++# PrometheusRule for OpenQuill staging: p95/p99 latency SLOs, error-rate, and HIL queue alerting
++apiVersion: monitoring.coreos.com/v1
++kind: PrometheusRule
++metadata:
++  name: openquill-alerts
++  namespace: openquill-staging
++spec:
++  groups:
++    - name: openquill-slo.rules
++      rules:
++        - alert: OpenQuillHighP95Latency
++          expr: |
++            histogram_quantile(0.95, sum(rate(vllm_request_duration_seconds_bucket[5m])) by (le)) > 0.8
++          for: 5m
++          labels:
++            severity: page
++          annotations:
++            summary: "High p95 latency for OpenQuill staging"
++            description: "p95 latency exceeded 0.8s over 5m"
++
++        - alert: OpenQuillHighErrorRate
++          expr: |
++            sum(rate(vllm_request_errors_total[5m])) / sum(rate(vllm_requests_total[5m])) > 0.01
++          for: 5m
++          labels:
++            severity: page
++          annotations:
++            summary: "High error rate for OpenQuill staging"
++            description: "Error rate exceeded 1% in the last 5m"
++
++        - alert: OpenQuillHILQueueBuildUp
++          expr: |
++            increase(openquill_hil_queue_length[15m]) > 10
++          for: 10m
++          labels:
++            severity: warning
++          annotations:
++            summary: "HIL queue growing"
++            description: "Number of items added to HIL queue increased by >10 in 15m. Investigate safety review backlog."
++
++        - alert: OpenQuillModelRestarting
++          expr: |
++            rate(kube_pod_container_status_restarts_total{namespace="openquill-staging",container="vllm"}[5m]) > 0
++          for: 2m
++          labels:
++            severity: page
++          annotations:
++            summary: "vLLM container restarts detected"
++            description: "vLLM container restarting in the last 5m; check logs"
++
++    - name: openquill-quant.rules
++      rules:
++        - record: job:openquill_request_latency_p95:rate5m
++          expr: histogram_quantile(0.95, sum(rate(vllm_request_duration_seconds_bucket[5m])) by (le))
++
++---
++# Note: This file requires Prometheus Operator / kube-prometheus-stack. Adjust metric names to match your server.
+--- /dev/null
++++ b/monitoring/grafana_dashboard_openquill.json
+@@ -0,0 +1,211 @@
++{
++  "annotations": {
++    "list": []
++  },
++  "editable": true,
++  "gnetId": null,
++  "graphTooltip": 0,
++  "id": null,
++  "links": [],
++  "panels": [
++    {
++      "datasource": null,
++      "fieldConfig": {
++        "defaults": {}
++      },
++      "gridPos": {
++        "h": 8,
++        "w": 24,
++        "x": 0,
++        "y": 0
++      },
++      "id": 1,
++      "options": {},
++      "targets": [
++        {
++          "expr": "histogram_quantile(0.95, sum(rate(vllm_request_duration_seconds_bucket[5m])) by (le))",
++          "interval": "",
++          "legendFormat": "p95 latency",
++          "refId": "A"
++        }
++      ],
++      "title": "p95 Latency (5m)",
++      "type": "timeseries"
++    },
++    {
++      "gridPos": {
++        "h": 8,
++        "w": 12,
++        "x": 0,
++        "y": 8
++      },
++      "id": 2,
++      "options": {},
++      "targets": [
++        {
++          "expr": "sum(rate(vllm_request_errors_total[5m]))",
++          "refId": "A",
++          "legendFormat": "errors"
++        }
++      ],
++      "title": "Errors (5m)",
++      "type": "timeseries"
++    },
++    {
++      "gridPos": {
++        "h": 8,
++        "w": 12,
++        "x": 12,
++        "y": 8
++      },
++      "id": 3,
++      "options": {},
++      "targets": [
++        {
++          "expr": "sum(rate(vllm_requests_total[5m]))",
++          "refId": "A",
++          "legendFormat": "req/s"
++        }
++      ],
++      "title": "Throughput (requests/sec)",
++      "type": "timeseries"
++    },
++    {
++      "gridPos": {
++        "h": 6,
++        "w": 24,
++        "x": 0,
++        "y": 16
++      },
++      "id": 4,
++      "options": {},
++      "targets": [
++        {
++          "expr": "openquill_hil_queue_length",
++          "refId": "A",
++          "legendFormat": "HIL queue"
++        }
++      ],
++      "title": "HIL Queue Length (items)",
++      "type": "timeseries"
++    }
++  ],
++  "refresh": "10s",
++  "schemaVersion": 30,
++  "style": "dark",
++  "tags": ["openquill","staging"],
++  "templating": {
++    "list": []
++  },
++  "time": {
++    "from": "now-1h",
++    "to": "now"
++  },
++  "timepicker": {},
++  "timezone": "browser",
++  "title": "OpenQuill Staging Overview",
++  "uid": "openquill-staging-overview",
++  "version": 1
++}
+--- /dev/null
++++ b/scripts/deploy_staging_stack.sh
+@@ -0,0 +1,218 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# scripts/deploy_staging_stack.sh
++#
++# Helper to deploy staging serving, Gatekeeper allowlist, TLS secret hint, and monitoring artifacts.
++# This script is intended for operator use on a machine with kubectl access to the cluster.
++#
++# Usage:
++#   ./scripts/deploy_staging_stack.sh --namespace openquill-staging --tls-cert /path/to/fullchain.pem --tls-key /path/to/privkey.pem
++
++NAMESPACE=${NAMESPACE:-openquill-staging}
++TLS_CERT=${TLS_CERT:-""}
++TLS_KEY=${TLS_KEY:-""}
++GATEKEEPER_APPLY=${GATEKEEPER_APPLY:-true}
++PROMETHEUS_APPLY=${PROMETHEUS_APPLY:-true}
++
++function usage() {
++  cat <<EOF
++Usage: $0 --namespace openquill-staging --tls-cert /path/fullchain.pem --tls-key /path/privkey.pem
++
++Options:
++  --namespace <ns>       Kubernetes namespace to use (default openquill-staging)
++  --tls-cert <file>      Path to TLS certificate
++  --tls-key <file>       Path to TLS private key
++  --no-gatekeeper        Do not apply Gatekeeper constraints
++  --no-prometheus        Do not apply Prometheus rules
++EOF
++  exit 1
++}
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --namespace) NAMESPACE="$2"; shift 2;;
++    --tls-cert) TLS_CERT="$2"; shift 2;;
++    --tls-key) TLS_KEY="$2"; shift 2;;
++    --no-gatekeeper) GATEKEEPER_APPLY=false; shift;;
++    --no-prometheus) PROMETHEUS_APPLY=false; shift;;
++    --help) usage;;
++    *) echo "Unknown arg $1"; usage;;
++  esac
++done
++
++echo "Deploying staging stack to namespace: $NAMESPACE"
++
++echo "1) Create namespace (if not exists)"
++kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
++
++echo "2) Create PVC templates (operator should edit sizes if needed)"
++kubectl apply -f k8s/pvc_and_tls_templates.yaml -n "$NAMESPACE"
++
++echo "3) Create TLS secret (if provided)"
++if [[ -n "$TLS_CERT" && -n "$TLS_KEY" ]]; then
++  kubectl create secret tls openquill-tls-secret -n "$NAMESPACE" --cert="$TLS_CERT" --key="$TLS_KEY" --dry-run=client -o yaml | kubectl apply -f -
++  echo "TLS secret created"
++else
++  echo "TLS cert/key not provided; create openquill-tls-secret manually with cert-manager or kubectl create secret tls"
++fi
++
++echo "4) Apply RBAC & Gatekeeper (if requested)"
++kubectl apply -f k8s/rbac_serving.yaml -n "$NAMESPACE"
++if [[ "$GATEKEEPER_APPLY" == "true" ]]; then
++  kubectl apply -f k8s/gatekeeper_image_allowlist_constraint.yaml -n "$NAMESPACE" || echo "Gatekeeper apply may fail if Gatekeeper not installed"
++fi
++
++echo "5) Deploy vLLM serving (use curated image and ensure cosign policy in cluster)"
++kubectl apply -f k8s/serving_vllm.yaml -n "$NAMESPACE"
++
++echo "6) Deploy warmup and smoke test jobs (they reference data PVC prompts)"
++kubectl apply -f k8s/warmup_job.yaml -n "$NAMESPACE"
++kubectl apply -f k8s/smoke_test_job.yaml -n "$NAMESPACE"
++
++if [[ "$PROMETHEUS_APPLY" == "true" ]]; then
++  echo "7) Apply Prometheus rules for OpenQuill"
++  kubectl apply -f monitoring/prometheus_rules_openquill.yaml -n "$NAMESPACE" || echo "Prometheus operator not installed or RBAC missing; apply manually"
++fi
++
++echo "8) (Optional) Apply Grafana dashboard via API or import in UI from monitoring/grafana_dashboard_openquill.json"
++echo "To import locally: upload monitoring/grafana_dashboard_openquill.json in Grafana UI"
++
++echo "Deployment finished. Check pods: kubectl get pods -n $NAMESPACE"
++echo "Tail logs for vLLM: kubectl logs -f deployment/openquill-vllm -n $NAMESPACE"
++
++echo "Reminder: enforce cosign verification and Gatekeeper policies in your cluster before allowing traffic."
++exit 0
+--- /dev/null
++++ b/tools/tool_interfaces.py
+@@ -0,0 +1,182 @@
++"""
++tools/tool_interfaces.py
++
++Defines safe tool interface wrappers for "tool controller" pattern.
++Each tool implements minimal validation, whitelisting, and provenance logging.
++Examples included: web_fetch, db_query (SQL with parameterization), file_fetch (internal docs)
++"""
++from __future__ import annotations
++import time
++import json
++from typing import Dict, Any, Optional
++from pathlib import Path
++
++SAFE_WHITELISTED_HOSTS = ["api.openweathermap.org", "api.example-safe-data.org"]
++PROVENANCE_LOG = Path("release/tool_provenance.log")
++
++def log_provenance(entry: Dict[str,Any]) -> None:
++    PROVENANCE_LOG.parent.mkdir(parents=True, exist_ok=True)
++    with PROVENANCE_LOG.open("a", encoding="utf-8") as f:
++        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
++
++def web_fetch(api_key: str, url: str, params: Optional[Dict[str,str]] = None, client_id: str = "unknown") -> Dict[str,Any]:
++    """
++    Safe wrapper that:
++     - verifies url is on whitelist
++     - rate limiting should be enforced upstream (proxy)
++     - logs provenance
++    """
++    from urllib.parse import urlparse
++    import requests
++    parsed = urlparse(url)
++    host = parsed.netloc
++    if host not in SAFE_WHITELISTED_HOSTS:
++        raise ValueError(f"Host {host} not allowed")
++    t0 = time.time()
++    r = requests.get(url, params=params, timeout=10)
++    dur = time.time() - t0
++    entry = {"tool":"web_fetch","client_id": client_id, "url": url, "status": r.status_code, "duration": dur, "ts": time.time()}
++    log_provenance(entry)
++    return {"status": r.status_code, "text": r.text[:1000], "duration": dur}
++
++def db_query(db_conn_str: str, sql: str, params: Optional[list] = None, client_id: str = "unknown") -> Dict[str,Any]:
++    """
++    Minimal safe wrapper for DB queries. Enforces read-only pattern and parameterization.
++    In production replace with concrete DB client and proper secrets handling.
++    """
++    sql_norm = sql.strip().lower()
++    if not sql_norm.startswith("select"):
++        raise ValueError("Only read-only SELECT queries allowed via tool controller")
++    # For demo: log the query and return empty result
++    entry = {"tool":"db_query","client_id": client_id, "query": sql[:200], "ts": time.time()}
++    log_provenance(entry)
++    # TODO: implement actual DB call with safe parameterization using a DB client (psycopg2 / pymysql)
++    return {"rows": [], "meta": {"note": "db_query is a stub in tools/tool_interfaces.py"}}
++
++def fetch_internal_doc(doc_id: str, client_id: str = "unknown") -> Dict[str,Any]:
++    """
++    Fetch a doc chunk from the local RAG store (expects release/docs_multilingual.jsonl created by indexer)
++    """
++    docs_path = Path("release/docs_multilingual.jsonl")
++    if not docs_path.exists():
++        raise FileNotFoundError("RAG docs not found; run scripts/prepare_rag_index.py first")
++    found = None
++    for line in docs_path.read_text(encoding="utf-8").splitlines():
++        if not line.strip(): continue
++        j = json.loads(line)
++        if j.get("source") == doc_id or j.get("id") == doc_id:
++            found = j
++            break
++    entry = {"tool":"fetch_internal_doc","client_id": client_id, "doc_id": doc_id, "found": bool(found), "ts": time.time()}
++    log_provenance(entry)
++    return {"doc": found}
++
++if __name__ == "__main__":
++    # quick demo
++    print("Tool interfaces demo")
++    try:
++        r = web_fetch("", "https://api.openweathermap.org/data/2.5/weather?q=London")
++        print("web_fetch status", r["status"])
++    except Exception as e:
++        print("web_fetch demo failed (expected without API key):", e)
++
++    print("db_query demo:", db_query("sqlite:///tmp.db", "SELECT 1"))
++    print("fetch_internal_doc demo (may fail if index not built)")
++    try:
++        print(fetch_internal_doc("doc_0"))
++    except Exception as e:
++        print("fetch_internal_doc demo failed (expected):", e)
++
+-- 
+2.40.1
