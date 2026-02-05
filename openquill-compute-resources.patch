@@ -1,0 +1,430 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Compute Bot <compute@example.com>
+Date: 2026-03-24 00:00:00 +0000
+Subject: [PATCH] compute & resource guidance: profiles, docs, estimator and preflight checks
+---
+ configs/compute_profiles.yaml                         |  82 ++++++++++++++++++
+ docs/compute_resources.md                             | 482 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ scripts/estimate_compute_costs.py                     | 300 +++++++++++++++++++++++++++++++
+ scripts/gpu_preflight_check.sh                        | 120 +++++++++++++
+ 4 files changed, 984 insertions(+)
+ create mode 100644 configs/compute_profiles.yaml
+ create mode 100644 docs/compute_resources.md
+ create mode 100755 scripts/estimate_compute_costs.py
+ create mode 100755 scripts/gpu_preflight_check.sh
+--- /dev/null
++++ b/configs/compute_profiles.yaml
+@@ -0,0 +1,82 @@
++# Compute profiles and baseline estimates for OpenQuill pipelines.
++# These are conservative guidance values for planning and cost estimation.
++# Use scripts/estimate_compute_costs.py to derive GPU-hour & cost estimates.
++
++profiles:
++  mvp_7b_4xA100:
++    name: "MVP — 7B QLoRA/PEFT + Q‑Former"
++    gpus: 4
++    gpu_type: "A100-40GB"
++    recommended_node: "4x A100 (1 GPU per node or multi-GPU nodes)"
++    description: "Recommended for SFT QLoRA/PEFT multi-day runs; mixed-precision bf16."
++    sft_days_estimate:
++      small_dataset: 1        # days
++      medium_dataset: 3
++      large_dataset: 10
++    reward_training_gpuless: 8   # GPU-hours (reward RM training is small)
++    ppo_pilot_gpu_hours: 24
++    quant_gpu_hours: 8
++    redteam_cpu_hours: 8
++
++  test_1xA100:
++    name: "Test / Dev — 1x A100"
++    gpus: 1
++    gpu_type: "A100-40GB"
++    description: "Fast smoke tests & development. Useful for single‑node experiments."
++    sft_days_estimate:
++      small_dataset: 2
++      medium_dataset: 8
++      large_dataset: 30
++    reward_training_gpuless: 12
++    ppo_pilot_gpu_hours: 48
++    quant_gpu_hours: 8
++    redteam_cpu_hours: 8
++
++  prod_cluster_8xA100:
++    name: "Production scale — 8+ A100/H100"
++    gpus: 8
++    gpu_type: "A100/H100"
++    description: "Full-scale SFT and RLHF across multiple datasets with autoscaling and k8s orchestration."
++    sft_days_estimate:
++      small_dataset: 0.5
++      medium_dataset: 1.5
++      large_dataset: 5
++    reward_training_gpuless: 24
++    ppo_pilot_gpu_hours: 240
++    quant_gpu_hours: 16
++    redteam_cpu_hours: 32
++
++pricing_examples:
++  # Default example prices (edit for your cloud/region). These are only illustrative.
++  A100-40GB: 4.0   # $/GPU-hour (example; replace with your provider price)
++  H100-80GB: 12.0
++  A40-48GB: 2.5
++  cpu_hour: 0.05
++
+--- /dev/null
++++ b/docs/compute_resources.md
+@@ -0,0 +1,482 @@
++# OpenQuill — Compute & Resource Guidance
++
++This document provides concrete, actionable guidance for provisioning compute to run the OpenQuill training, RLHF, quantization and serving pipelines. It covers MVP recommendations (7B QLoRA/PEFT), smaller test/dev profiles, and production scale guidance.
++
++Quick summary
++- MVP (7B QLoRA/PEFT + Q‑Former): recommended 4 × A100 (40GB) GPUs, mixed precision (bf16). Typical SFT runtime: days → 1–2 weeks depending on dataset size and max_steps.
++- Test / Dev: 1 × A100 (or 1–2 × A40) for smoke tests and rapid iteration.
++- Production: cluster (8+ A100 or H100) with k8s, autoscaling, PVCs and monitoring.
++
++Files added in repo
++- configs/compute_profiles.yaml — machine-readable compute profiles and example price map (edit for your environment).
++- scripts/estimate_compute_costs.py — estimate GPU-hours and cost for SFT / RLHF / PPO / quant / red-team using compute_profiles.yaml.
++- scripts/gpu_preflight_check.sh — quick preflight checks for drivers, device plugin, kubectl and common infra.
++
++1) MVP: 7B QLoRA/PEFT + Q‑Former (recommended)
++- Hardware
++  - GPU: 4 × NVIDIA A100 40GB (or cloud equivalent)
++  - CPU: 16–32 vCPUs across coordinating nodes
++  - Memory: 256 GiB total for dataset staging and worker nodes
++  - Storage: 1–4 TiB fast NVMe (for checkpoints and local scratch), plus guarded S3 for release artifacts
++  - Network: 25–100 Gbps between nodes if using multi-node distributed training
++
++- Software & libraries
++  - CUDA 11/12 compatible drivers, NVIDIA container runtime
++  - PyTorch with BF16 support (for A100)
++  - accelerate / deepspeed (configs included in repo)
++  - bitsandbytes / peft / transformers
++
++- Typical run breakdown (approx)
++  - SFT (QLoRA/PEFT): days → 1–7 days depending on dataset size & max_steps (see configs/compute_profiles.yaml for ranges)
++  - Reward model training: small GPU-hours (single GPU for a few hours)
++  - PPO pilot (conservative): low-scale pilot, tens → hundreds GPU-hours depending on rollout count
++  - Quantization & validation: few GPU-hours to a day
++  - Red-team & smoke: CPU-heavy; use CPUs for campaigns or small GPU workers for inference
++
++2) Test / Dev
++- Hardware
++  - 1 × A100 40GB or 1–2 × A40; can use smaller GPUs for lightweight experiments
++  - Use local GPUs or a small cloud instance
++
++- Use cases
++  - Run quick SFT smoke (short max_steps)
++  - Run RLHF pilot (collect ~500–2000 pairs)
++  - Test quantization & quant_eval
++
++3) Production scale
++- Hardware
++  - Cluster of 8+ GPUs (A100 or H100 recommended for throughput)
++  - Kubernetes with GPU nodepool(s), node autoscaling and scheduling (nodeSelectors / tolerations)
++  - Guarded S3 (or private HF repo) for artifacts, and cosign + KMS for signature management
++
++- Operations
++  - Enforce Gatekeeper + cosign image verification
++  - PVCs sized for checkpoints, warmup jobs and RAG storage
++  - Prometheus/Grafana + alerting on SLOs
++  - On-call rotation for incidents
++
++4) Storage & networking
++- Model checkpoints (merged candidate and quant artifacts) should live on guarded S3 with limited access.
++- PVCs required for in-cluster jobs: openquill-model-pvc, openquill-data-pvc, openquill-work-pvc.
++- Use fast NVMe scratch for training nodes if available to speed I/O during SFT merging/quantization.
++
++5) Cost planning & estimation
++Use scripts/estimate_compute_costs.py (included) together with configs/compute_profiles.yaml to estimate GPU-hours and cost. The estimator is a planning tool — replace example prices with your provider's rates.
++
++Example: MVP run estimate (quick)
++1. Update configs/compute_profiles.yaml prices to reflect your cloud provider.
++2. Run:
++   python scripts/estimate_compute_costs.py --profile mvp_7b_4xA100 --dataset-size medium --steps 50000
++3. Review estimated GPU-hours and approximate cost. This is a conservative planning number — actual runtime depends heavily on batch sizes, gradient accumulation, effective throughput and I/O.
++
++6) Node provisioning examples
++- GKE / EKS / AKS provisioning examples are in scripts/provision_gpu_nodepool.sh (already in repo). Key operator considerations:
++  - Label GPU nodes with openquill/gpu=true and taint with nvidia.com/gpu=present:NoSchedule (so only workloads with tolerations run).
++  - Install NVIDIA device-plugin and GPU drivers on the node image.
++  - Use node pools with homogeneous GPU type (mixing GPU types complicates scheduling).
++
++7) Kubernetes resource sizing examples (per k8s Job manifest guidance)
++- For SFT jobs on A100 nodes:
++  resources:
++    limits:
++      nvidia.com/gpu: 1
++      cpu: "3000m"
++      memory: "48Gi"
++- For PPO/quantization jobs that may use more memory, increase memory to 64+ GiB and request multiple GPUs if your runner image supports multi-GPU training.
++
++8) Best practices & tuning tips
++- Use bf16 on supported GPUs to reduce memory & speed training.
++- For QLoRA/PEFT, use bitsandbytes and 8-bit optimizers when possible (prepare_model_for_kbit_training).
++- When encountering OOM:
++  - reduce per_device_train_batch_size
++  - increase gradient_accumulation_steps
++  - use ZeRO/DeepSpeed stage 2/3 (configs included)
++- For multi-node runs:
++  - ensure network fabric is high bandwidth (NVLink / RoCE recommended for large multi-node training).
++- For long-context native runs:
++  - enable flash-attn / xformers and test memory usage; only enable when your GPUs and drivers match supported builds.
++
++9) Operational guidance for RLHF & PPO pilots
++- Run small conservative PPO pilots first (low PPO epochs, low rollout counts).
++- Store rollouts and HIL logs on PVC for safety reviewers.
++- Use the signoff flow before any publish.
++
++10) Quick checklist before starting a major run
++- License check for base model (scripts/license_check.py)
++- PII scan & remediation (scripts/scan_pii.py)
++- Compute preflight (scripts/gpu_preflight_check.sh)
++- Update compute_profiles.yaml with provider prices (optional)
++- Run estimate: python scripts/estimate_compute_costs.py ...
++- Provision nodepool(s) and mount PVCs
++- Launch training via training/run_sft_pipeline.py or k8s job manifests
++
++11) Example minimal cost numbers (illustrative)
++- 4 × A100 for a medium dataset SFT: estimate 4 GPUs × 72 hours = 288 GPU-hours. At $4/GPU-hour → ~$1,152 (replace with your pricing).
++- PPO pilot: 4 GPUs × 24 hours = 96 GPU-hours.
++- Reward training & quantization are typically small contributors.
++
++Notes & disclaimers
++- All numbers are planning estimates. Real cost/time depends on dataset size, seq length, batch sizes, optimizer, checkpoint frequency, I/O, and hyperparameter choices.
++- Replace example cloud prices in configs/compute_profiles.yaml with your provider's actual pricing to get realistic costs.
++
++If you want, I can:
++- Tune accelerate/deepspeed configs for a specific GPU SKU (tell me GPU type & count).
++- Add a cloud-CLI-based provisioning helper that actually creates nodepools for your cloud provider (GKE/EKS/AKS).
++- Create a cost-reporting tool that captures real GPU-hours from job logs or Kubernetes metrics and compares to estimates.
++
++Which of those would you like next?
++
+--- /dev/null
++++ b/scripts/estimate_compute_costs.py
+@@ -0,0 +1,300 @@
++#!/usr/bin/env python3
++"""
++scripts/estimate_compute_costs.py
++
++Estimate GPU-hours and approximate cost for OpenQuill pipeline runs using profiles in configs/compute_profiles.yaml.
++
++This is a planning tool only — replace example prices with actual provider rates.
++
++Usage:
++  python scripts/estimate_compute_costs.py --profile mvp_7b_4xA100 --dataset-size medium --steps 50000 --price-overrides A100-40GB=4.5,H100-80GB=12
++"""
++from __future__ import annotations
++import argparse
++import yaml
++from pathlib import Path
++import math
++from typing import Dict
++import textwrap
++
++ROOT = Path(__file__).resolve().parents[1]
++PROFILES_PATH = ROOT / "configs" / "compute_profiles.yaml"
++
++def load_profiles(path: Path) -> Dict:
++    if not path.exists():
++        raise FileNotFoundError(path)
++    return yaml.safe_load(path.read_text(encoding="utf-8"))
++
++def parse_price_overrides(s: str) -> Dict[str, float]:
++    out = {}
++    if not s:
++        return out
++    for part in s.split(","):
++        if "=" in part:
++            k,v = part.split("=",1)
++            try:
++                out[k.strip()] = float(v)
++            except Exception:
++                pass
++    return out
++
++def estimate_gpu_hours(profile: dict, dataset_size: str, steps: int) -> Dict[str, float]:
++    """
++    Return a dict with estimated GPU-hours for each pipeline stage.
++    We use profile fields to approximate SFT duration as (days_estimate * 24 * gpus)
++    and other stages as profile values.
++    """
++    gpus = profile.get("gpus", 1)
++    sft_days_map = profile.get("sft_days_estimate", {})
++    days = sft_days_map.get(dataset_size, sft_days_map.get("medium", 3))
++    sft_gpu_hours = days * 24 * gpus
++    reward_gpu_hours = profile.get("reward_training_gpuless", 8)
++    ppo_gpu_hours = profile.get("ppo_pilot_gpu_hours", 24)
++    quant_gpu_hours = profile.get("quant_gpu_hours", 8)
++    redteam_cpu_hours = profile.get("redteam_cpu_hours", 8)
++    return {
++        "sft_gpu_hours": float(sft_gpu_hours),
++        "reward_gpu_hours": float(reward_gpu_hours),
++        "ppo_gpu_hours": float(ppo_gpu_hours),
++        "quant_gpu_hours": float(quant_gpu_hours),
++        "redteam_cpu_hours": float(redteam_cpu_hours)
++    }
++
++def compute_costs(hours_map: Dict[str,float], price_map: Dict[str,float], profile: dict) -> Dict[str,float]:
++    gpu_type = profile.get("gpu_type", "")
++    gpu_price = price_map.get(gpu_type, price_map.get(gpu_type.split("-")[0], None))
++    # fallback attempts
++    if gpu_price is None:
++        # try common keys
++        gpu_price = price_map.get("A100-40GB", 4.0)
++    cpu_price = price_map.get("cpu_hour", 0.05)
++    costs = {}
++    costs["sft_cost"] = hours_map["sft_gpu_hours"] * gpu_price
++    costs["reward_cost"] = hours_map["reward_gpu_hours"] * gpu_price
++    costs["ppo_cost"] = hours_map["ppo_gpu_hours"] * gpu_price
++    costs["quant_cost"] = hours_map["quant_gpu_hours"] * gpu_price
++    costs["redteam_cost"] = hours_map["redteam_cpu_hours"] * cpu_price
++    costs["total_cost"] = sum(costs[k] for k in ["sft_cost","reward_cost","ppo_cost","quant_cost","redteam_cost"])
++    return costs
++
++def pretty_print_report(profile_name: str, profile: dict, dataset_size: str, steps: int, hours_map: Dict[str,float], costs: Dict[str,float], price_map: Dict[str,float]):
++    out = []
++    out.append(f"Compute profile: {profile_name} — {profile.get('name')}")
++    out.append(f"GPU type: {profile.get('gpu_type')}  | GPUs: {profile.get('gpus')}")
++    out.append(f"Dataset size simulated: {dataset_size}; target steps: {steps}")
++    out.append("")
++    out.append("Estimated GPU-hours:")
++    out.append(f"  SFT (QLoRA/PEFT): {hours_map['sft_gpu_hours']:.1f} GPU-hours")
++    out.append(f"  Reward model training: {hours_map['reward_gpu_hours']:.1f} GPU-hours")
++    out.append(f"  PPO pilot: {hours_map['ppo_gpu_hours']:.1f} GPU-hours")
++    out.append(f"  Quantization: {hours_map['quant_gpu_hours']:.1f} GPU-hours")
++    out.append(f"  Red-team (CPU): {hours_map['redteam_cpu_hours']:.1f} CPU-hours")
++    out.append("")
++    out.append("Pricing assumptions (editable in configs/compute_profiles.yaml or --price-overrides):")
++    for k,v in price_map.items():
++        out.append(f"  {k}: ${v:.2f} per hour")
++    out.append("")
++    out.append("Estimated costs:")
++    out.append(f"  SFT cost: ${costs['sft_cost']:.2f}")
++    out.append(f"  Reward cost: ${costs['reward_cost']:.2f}")
++    out.append(f"  PPO cost: ${costs['ppo_cost']:.2f}")
++    out.append(f"  Quant cost: ${costs['quant_cost']:.2f}")
++    out.append(f"  Red-team cost: ${costs['redteam_cost']:.2f}")
++    out.append(f"  Total estimate: ${costs['total_cost']:.2f}")
++    out.append("")
++    out.append("Notes:")
++    out.append(" - These are planning estimates. Real costs depend on throughput, batch size, and implementation details.")
++    out.append(" - Replace example prices with your cloud provider prices for accurate forecasts.")
++    print("\n".join(out))
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--profile", default="mvp_7b_4xA100", help="Profile name from configs/compute_profiles.yaml")
++    p.add_argument("--dataset-size", default="medium", choices=["small","medium","large"])
++    p.add_argument("--steps", type=int, default=50000, help="target max_steps (informational)")
++    p.add_argument("--price-overrides", default="", help="comma separated price overrides, e.g. A100-40GB=4.5,H100-80GB=12")
++    args = p.parse_args()
++
++    cfg = load_profiles(PROFILES_PATH)
++    profiles = cfg.get("profiles", {})
++    profile = profiles.get(args.profile)
++    if not profile:
++        print("Profile not found:", args.profile)
++        print("Available profiles:", ", ".join(profiles.keys()))
++        return
++
++    # base price map
++    price_map = cfg.get("pricing_examples", {})
++    overrides = parse_price_overrides(args.price_overrides)
++    price_map.update(overrides)
++
++    hours_map = estimate_gpu_hours(profile, args.dataset_size, args.steps)
++    costs = compute_costs(hours_map, price_map, profile)
++    pretty_print_report(args.profile, profile, args.dataset_size, args.steps, hours_map, costs, price_map)
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null
++++ b/scripts/gpu_preflight_check.sh
+@@ -0,0 +1,120 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# scripts/gpu_preflight_check.sh
++#
++# Run basic preflight checks on a node or runner to ensure GPU drivers, container runtime, nvidia device plugin,
++# kubectl and other tooling are available before launching SFT / RLHF jobs.
++#
++# Usage: ./scripts/gpu_preflight_check.sh
++
++echo "OpenQuill GPU preflight check"
++OK=0
++
++function check_cmd {
++  if command -v "$1" >/dev/null 2>&1; then
++    echo "OK: $1"
++  else
++    echo "MISSING: $1"
++    OK=1
++  fi
++}
++
++echo "Checking common commands..."
++check_cmd nvidia-smi
++check_cmd docker
++check_cmd kubectl
++check_cmd helm
++check_cmd python
++check_cmd jq
++
++echo
++echo "Checking GPU visibility (nvidia-smi)..."
++if command -v nvidia-smi >/dev/null 2>&1; then
++  nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
++else
++  echo "nvidia-smi not found; ensure NVIDIA drivers are installed"
++fi
++
++echo
++echo "Checking container runtime and NVIDIA runtime support..."
++if docker info >/dev/null 2>&1; then
++  if docker info | grep -i nvidia >/dev/null 2>&1; then
++    echo "Docker configured with NVIDIA runtime"
++  else
++    echo "Docker present. Verify NVIDIA container runtime (nvidia-container-runtime) is installed if running GPU containers."
++  fi
++fi
++
++echo
++echo "Checking Kubernetes node GPU plugin status (if kubectl configured)..."
++if command -v kubectl >/dev/null 2>&1; then
++  if kubectl get daemonset -n kube-system | grep nvidia-device-plugin >/dev/null 2>&1; then
++    echo "nvidia-device-plugin appears installed in cluster"
++  else
++    echo "nvidia-device-plugin not found in cluster; ensure it's installed on GPU nodepool"
++  fi
++fi
++
++echo
++echo "Check Python and ML libs (quick)"
++python - <<PY || true
++import sys
++packages = ["torch", "transformers", "accelerate"]
++for p in packages:
++    try:
++        __import__(p)
++        print("ok:", p)
++    except Exception as e:
++        print("missing:", p, e)
++sys.exit(0)
++PY
++
++if [ $OK -ne 0 ]; then
++  echo
++  echo "Preflight detected missing CLI tools. Please install the missing items before training."
++  exit 2
++fi
++
++echo
++echo "Preflight checks completed. If you plan to run multi-node training, ensure networking and NVLink settings are correct."
++exit 0
++
+-- 
+2.40.1
