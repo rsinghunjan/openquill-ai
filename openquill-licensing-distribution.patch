@@ -1,0 +1,314 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill License Bot <license@example.com>
+Date: 2026-03-29 00:00:00 +0000
+Subject: [PATCH] licensing & distribution helpers: license policy checker, pre-publish wrapper, and docs
+---
+ docs/licensing_distribution.md                        | 203 ++++++++++++++++++++++++++++++
+ scripts/license_policy.py                              | 357 +++++++++++++++++++++++++++++++++++++++++++++++++
+ scripts/prepublish_check_and_finalize.sh               | 113 +++++++++++++++++
+ 3 files changed, 673 insertions(+)
+ create mode 100644 docs/licensing_distribution.md
+ create mode 100755 scripts/license_policy.py
+ create mode 100755 scripts/prepublish_check_and_finalize.sh
+--- /dev/null
++++ b/docs/licensing_distribution.md
+@@ -0,0 +1,203 @@
++# Licensing & Distribution — OpenQuill
++
++This document explains the licensing and distribution policy helpers added to the repo and how to use them.
++They automate checking the base model license before you select a derived license for your OpenQuill model and
++prevent accidental publication of derived weights that would violate the base model license.
++
++Key principles
++- Always verify the base model's license before deriving or publishing new weights.
++- If the base license is permissive (Apache-2.0, MIT, BSD-family), you may apply a permissive derived license such as Apache-2.0.
++- If the base license is restrictive (non-commercial, no-derivatives, or otherwise), do NOT publish derived weights in ways that violate the base license — follow the base model terms or seek legal advice.
++
++What was added
++- scripts/license_policy.py
++  - Query a Hugging Face model card (or inspect a local LICENSE file) and produce a license decision (release/license_decision.json).
++  - Decide whether the requested derived license (default Apache-2.0) is compatible with the base license.
++  - On compatibility: write a model_card fragment and release/license_decision.json documenting provenance and recommended derived license.
++  - On incompatibility: exit non-zero and write release/license_decision.json with details. You can override with --force but that is discouraged.
++
++- scripts/prepublish_check_and_finalize.sh
++  - A small wrapper that runs license_policy.py and, on success, calls the finalizer script to publish artifacts.
++  - Use this wrapper instead of calling the finalizer directly to ensure license checks are performed.
++
++Recommended workflow (operator)
++1. Pick base model (HF id or local snapshot) and confirm compute & data readiness.
++2. Run license policy check:
++   python scripts/license_policy.py --model togethercomputer/RedPajama-INCITE-7B-Instruct --derived-license Apache-2.0
++
++   - If compatible, release/license_decision.json and release/model_card_license.md are created and you may proceed.
++   - If incompatible, read the decision file and consult legal before proceeding. Do not publish if the base prohibits derivation or redistribution.
++
++3. Run the full finalization (this wrapper ensures license check first):
++   ./scripts/prepublish_check_and_finalize.sh --merged_ckpt outputs/sft_run/merged --hf_repo my-org/openquill-llm --hf_token $HF_API_TOKEN --derived_license Apache-2.0
++
++Notes on derived license selection
++- Default recommended derived license: Apache-2.0. This provides permissive terms, patent grant, and clear redistribution rules.
++- If you prefer another license, pass --derived-license to the policy script, but only select a license compatible with the base model and your organization's policies.
++- The license_policy.py script implements conservative heuristics and provides human-readable guidance — it does not replace legal advice.
++
++Files written by the policy script
++- release/license_decision.json — structured decision about base license vs requested derived license.
++- release/model_card_license.md — a small model_card fragment that documents licensing, base model provenance, and derived license choice.
++
++When to consult legal
++- If base model license is absent, unclear, or contains restrictions (e.g., non-commercial, no-derivatives), consult your legal team before publishing derived weights.
++- If you plan to relicense datasets or combine multiple sources with conflicting licenses, consult legal for compatibility analysis.
++
++Automated CI / gating
++- The release gates workflow should be configured to run scripts/license_policy.py (or the prepublish wrapper) as part of the publish preflight. The provided prepublish_check_and_finalize.sh is a convenient local/runner wrapper.
++
++If you want, I can:
++- Add an automatic GitHub Action that runs license_policy.py on any PR that changes training configs or the chosen base model id.
++- Expand license_policy.py to perform a deeper metadata scrape of model card files and dataset license fields.
++
++Next step?
++- "add CI license-check PR" | "integrate into finalizer" | "deepen license heuristics"
+--- /dev/null
++++ b/scripts/license_policy.py
+@@ -0,0 +1,357 @@
++#!/usr/bin/env python3
++"""
++scripts/license_policy.py
++
++Check a base model's license (Hugging Face model id or local LICENSE file) and decide whether a requested
++derived license (default Apache-2.0) is compatible. Produces release/license_decision.json and a model_card fragment.
++
++Usage:
++  python scripts/license_policy.py --model togethercomputer/RedPajama-INCITE-7B-Instruct --derived-license Apache-2.0
++  python scripts/license_policy.py --local-license /path/to/LICENSE --derived-license Apache-2.0
++
++Outputs (on success):
++ - release/license_decision.json
++ - release/model_card_license.md
++
++If incompatible, the script exits non-zero and writes release/license_decision.json with details.
++Use --force to override (NOT recommended without legal review).
++"""
++from __future__ import annotations
++import argparse
++import json
++import requests
++import time
++from pathlib import Path
++from typing import Optional
++
++HF_API = "https://huggingface.co/api/models/"
++
++# Permissive licenses we consider compatible with applying Apache-2.0 to derived artifacts.
++# This is a conservative, opinionated list for guidance. Legal must confirm in edge cases.
++PERMISSIVE_SET = {
++    "apache-2.0",
++    "mit",
++    "bsd-3-clause",
++    "bsd-2-clause",
++    "bsd-2-clause-freebsd",
++    "cc-by-4.0",
++}
++
++def query_hf_model_license(model_id: str) -> Optional[str]:
++    url = HF_API + model_id
++    try:
++        r = requests.get(url, timeout=10)
++        r.raise_for_status()
++        meta = r.json()
++        lic = meta.get("license")
++        if isinstance(lic, dict):
++            return lic.get("id") or lic.get("name")
++        return lic
++    except Exception as e:
++        print("HF API query failed:", e)
++        return None
++
++def read_local_license(path: Path) -> Optional[str]:
++    if not path.exists():
++        return None
++    txt = path.read_text(encoding="utf-8").lower()
++    if "apache" in txt:
++        return "apache-2.0"
++    if "mit license" in txt or "permission is hereby granted" in txt:
++        return "mit"
++    if "bsd" in txt:
++        if "3-clause" in txt:
++            return "bsd-3-clause"
++        return "bsd-2-clause"
++    # unknown
++    return None
++
++def decide_compatibility(base_license: Optional[str], desired_derived: str) -> (bool, str):
++    if base_license is None:
++        return False, "base_license_unknown"
++    bl = base_license.strip().lower()
++    dd = desired_derived.strip().lower()
++    if bl in PERMISSIVE_SET:
++        # permissive base: ok to derive and apply Apache-2.0 (or equal/permissive)
++        return True, f"base_license_{bl}_permissive"
++    # if base is already apache-2.0, ok
++    if bl == "apache-2.0" or "apache" in bl:
++        return True, "base_license_apache"
++    # otherwise conservative: not compatible
++    return False, f"base_license_{bl}_restrictive"
++
++def write_decision(decision_path: Path, payload: dict) -> None:
++    decision_path.parent.mkdir(parents=True, exist_ok=True)
++    decision_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
++    print("Wrote license decision to", decision_path)
++
++def write_model_card_fragment(out_path: Path, base_model: str, base_license: Optional[str], derived_license: str, compatible: bool, note: str):
++    out_path.parent.mkdir(parents=True, exist_ok=True)
++    lines = []
++    lines.append(f"# Model license & provenance\n")
++    lines.append(f"- base_model: {base_model}")
++    lines.append(f"- base_model_license: {base_license or 'unknown'}")
++    lines.append(f"- derived_model_license: {derived_license}")
++    lines.append(f"- compatible: {str(compatible)}")
++    lines.append(f"- note: {note}")
++    lines.append(f"- checked_at: {int(time.time())}")
++    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
++    print("Wrote model_card license fragment to", out_path)
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--model", default="", help="Hugging Face model id (e.g., togethercomputer/RedPajama-INCITE-7B-Instruct)")
++    p.add_argument("--local-license", default="", help="Path to local LICENSE file to inspect as fallback")
++    p.add_argument("--derived-license", default="Apache-2.0", help="Desired derived license (default Apache-2.0)")
++    p.add_argument("--force", action="store_true", help="Force decision even if incompatible (for audits only)")
++    p.add_argument("--out", default="release/license_decision.json", help="Output decision path")
++    p.add_argument("--model_card_out", default="release/model_card_license.md", help="Model card fragment output")
++    args = p.parse_args()
++
++    base_license = None
++    base_model = args.model or "<local>"
++    if args.model:
++        print("Querying HF for model metadata:", args.model)
++        base_license = query_hf_model_license(args.model)
++        print("HF reported license:", base_license)
++    if not base_license and args.local_license:
++        base_license = read_local_license(Path(args.local_license))
++        print("Local license heuristic detected:", base_license)
++
++    compatible, reason = decide_compatibility(base_license, args.derived_license)
++    timestamp = int(time.time())
++    payload = {
++        "base_model": base_model,
++        "base_license": base_license,
++        "derived_license_requested": args.derived_license,
++        "compatible": bool(compatible),
++        "reason": reason,
++        "checked_at": timestamp
++    }
++
++    outp = Path(args.out)
++    if not compatible and not args.force:
++        payload["advice"] = "Base model license is not permissive. Do not publish derived weights without legal review. Use --force to override."
++        write_decision(outp, payload)
++        write_model_card_fragment(Path(args.model_card_out), base_model, base_license, args.derived_license, False, payload["advice"])
++        print("License compatibility check FAILED. See release/license_decision.json and consult legal.")
++        raise SystemExit(4)
++
++    # compatible or forced
++    payload["advice"] = "Compatible or forced. If forced, ensure legal signoff is recorded."
++    write_decision(outp, payload)
++    write_model_card_fragment(Path(args.model_card_out), base_model, base_license, args.derived_license, True, payload["advice"])
++
++    # Also write a short LICENSE template file for the derived artifact (operator must review & include full license text)
++    derived_license_normalized = args.derived_license.strip().lower()
++    license_text_path = Path("release") / "DERIVED_LICENSE.txt"
++    if "apache" in derived_license_normalized:
++        license_header = "Apache License\nVersion 2.0, January 2004\nhttp://www.apache.org/licenses/\n\nSee LICENSE file for full text."
++    elif "mit" in derived_license_normalized:
++        license_header = "MIT License\nSee LICENSE file for full text."
++    else:
++        license_header = f"Derived license: {args.derived_license}. Include full license text here."
++    license_text_path.write_text(license_header + "\n", encoding="utf-8")
++    print("Wrote derived license placeholder to", license_text_path)
++
++    print("License policy check PASSED. You may proceed to publish (ensure legal signoff).")
++    return 0
++
++if __name__ == "__main__":
++    import sys
++    try:
++        rc = main()
++    except SystemExit as e:
++        raise
++    except Exception as e:
++        print("License policy script failed:", e)
++        raise
++
+--- /dev/null
++++ b/scripts/prepublish_check_and_finalize.sh
+@@ -0,0 +1,113 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# scripts/prepublish_check_and_finalize.sh
++#
++# Wrapper that enforces license checks before calling the finalizer.
++# Usage:
++#  ./scripts/prepublish_check_and_finalize.sh --merged_ckpt outputs/sft_run/merged --base_model togethercomputer/RedPajama-INCITE-7B-Instruct --hf_repo my-org/openquill-llm --hf_token $HF_API_TOKEN
++
++ROOT="$(cd "$(dirname "$0")/../" && pwd)"
++
++MERGED_CKPT=""
++BASE_MODEL=""
++DERIVED_LICENSE="Apache-2.0"
++HF_REPO=""
++HF_TOKEN=""
++EXTRA_FINALIZER_ARGS=()
++
++function usage() {
++  cat <<EOF
++Usage: $0 --merged_ckpt <path> --base_model <hf-id> --hf_repo <org/repo> --hf_token <token> [--derived_license Apache-2.0] [--finalizer-args "..."]
++
++This script will:
++ 1) Run license_policy.py to verify base model license and write release/license_decision.json
++ 2) If check passes, call scripts/finalize_and_publish_improved.py with provided args
++EOF
++  exit 1
++}
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --merged_ckpt) MERGED_CKPT="$2"; shift 2;;
++    --base_model) BASE_MODEL="$2"; shift 2;;
++    --derived_license) DERIVED_LICENSE="$2"; shift 2;;
++    --hf_repo) HF_REPO="$2"; shift 2;;
++    --hf_token) HF_TOKEN="$2"; shift 2;;
++    --finalizer-args) EXTRA_FINALIZER_ARGS+=("$2"); shift 2;;
++    --help) usage;;
++    *) echo "Unknown arg $1"; usage;;
++  esac
++done
++
++if [[ -z "$MERGED_CKPT" || -z "$BASE_MODEL" ]]; then
++  usage
++fi
++
++echo "1) Running license policy check for base model: $BASE_MODEL"
++python "$ROOT/scripts/license_policy.py" --model "$BASE_MODEL" --derived-license "$DERIVED_LICENSE"
++
++echo "License check passed. Decision written to release/license_decision.json"
++
++echo "2) Running finalizer to publish artifacts"
++# Build finalizer command with forwarded args
++FINALIZER_CMD=(python "$ROOT/scripts/finalize_and_publish_improved.py" --merged_ckpt "$MERGED_CKPT")
++if [[ -n "$HF_REPO" ]]; then
++  FINALIZER_CMD+=("--hf_repo" "$HF_REPO" "--hf_token" "$HF_TOKEN")
++fi
++for a in "${EXTRA_FINALIZER_ARGS[@]}"; do
++  FINALIZER_CMD+=("$a")
++done
++
++echo "EXEC: ${FINALIZER_CMD[*]}"
++"${FINALIZER_CMD[@]}"
++
++echo "Publish step complete."
++exit 0
++
+--- 
+2.40.1
