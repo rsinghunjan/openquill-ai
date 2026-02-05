@@ -1,0 +1,388 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Release Bot <release@example.com>
+Date: 2026-04-08 00:00:00 +0000
+Subject: [PATCH] robust LoRA checkpoint saver + merge helper, auto-merge watcher, and merged-checkpoint verifier
+---
+ scripts/save_and_merge_lora.py                       | 374 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ scripts/auto_merge_watch.sh                          | 128 ++++++++++++++++++++++++++++
+ scripts/verify_merged_checkpoint.py                  | 212 +++++++++++++++++++++++++++++++
+ 3 files changed, 714 insertions(+)
+ create mode 100755 scripts/save_and_merge_lora.py
+ create mode 100755 scripts/auto_merge_watch.sh
+ create mode 100755 scripts/verify_merged_checkpoint.py
+--- /dev/null
++++ b/scripts/save_and_merge_lora.py
+@@ -0,0 +1,374 @@
++#!/usr/bin/env python3
++"""
++scripts/save_and_merge_lora.py
++
++Robust utility to:
++ - verify LoRA/PEFT artifacts exist in a training output directory
++ - load the base model and the PEFT adapters
++ - merge adapters into the base model safely (memory-conscious where possible)
++ - save merged checkpoint into <out_dir>/merged with tokenizer and metadata
++ - produce a checksum manifest (release/merged_manifest.json) and an index for downstream jobs
++
++Usage:
++  python scripts/save_and_merge_lora.py --lora_dir outputs/sft_out --base_model togethercomputer/RedPajama-INCITE-7B-Instruct --out_dir outputs/sft_out/merged --keep_lora false
++
++Notes:
++ - This script attempts to use peft.PeftModel.merge_and_unload() if available (memory-efficient).
++ - It preserves the original LoRA directory unless --keep_lora false is provided.
++ - Produces release/merged_manifest.json with file checksums and provenance.
++"""
++from __future__ import annotations
++import argparse
++import json
++import os
++import shutil
++import hashlib
++import time
++from pathlib import Path
++from typing import Dict, Any, List
++
++def sha256_of_file(p: Path, chunk_size: int = 8192) -> str:
++    h = hashlib.sha256()
++    with p.open("rb") as f:
++        while True:
++            chunk = f.read(chunk_size)
++            if not chunk:
++                break
++            h.update(chunk)
++    return h.hexdigest()
++
++def gather_files_and_checksums(root: Path) -> List[Dict[str, Any]]:
++    files = []
++    for p in sorted(root.rglob("*")):
++        if p.is_file():
++            rel = p.relative_to(root).as_posix()
++            digest = sha256_of_file(p)
++            files.append({"path": rel, "sha256": digest, "size": p.stat().st_size})
++    return files
++
++def save_manifest(out_path: Path, manifest: Dict[str, Any]) -> None:
++    out_path.parent.mkdir(parents=True, exist_ok=True)
++    out_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
++    print("Wrote manifest to", out_path)
++
++def merge_peft_lora(lora_dir: Path, base_model: str, out_dir: Path, device: str = "cpu"):
++    """
++    Merge LoRA adapters in lora_dir into base_model and write merged model to out_dir.
++    Returns path to merged out_dir.
++    """
++    print(f"Merging LoRA from {lora_dir} into base model {base_model} -> {out_dir}")
++    try:
++        # Import inside function to avoid heavy deps if not used
++        from transformers import AutoModelForCausalLM, AutoTokenizer
++        from peft import PeftModel
++    except Exception as e:
++        raise RuntimeError("Required libs missing (transformers, peft). Install them in your environment.") from e
++
++    # Load base model with low_mem if available
++    print("Loading base model (may allocate significant memory)...")
++    model = AutoModelForCausalLM.from_pretrained(base_model, low_cpu_mem_usage=True)
++    tokenizer = AutoTokenizer.from_pretrained(base_model, use_fast=True)
++
++    # Load PEFT model
++    print("Attempting to load PEFT model from", lora_dir)
++    try:
++        peft_model = PeftModel.from_pretrained(model, lora_dir, is_trainable=False)
++    except Exception as e:
++        raise RuntimeError(f"Failed to load PeftModel from {lora_dir}: {e}") from e
++
++    # Merge adapters
++    print("Merging adapters into base model (this may require additional RAM).")
++    merged_model = None
++    try:
++        # Prefer merge_and_unload if available (PEFT provides this on newer versions)
++        if hasattr(peft_model, "merge_and_unload"):
++            print("Using peft.merge_and_unload()")
++            merged_model = peft_model.merge_and_unload()
++        else:
++            # Fallback: save peft_model as pretrained full model (this writes merged weights)
++            print("merge_and_unload not available. Falling back to save_pretrained on PeftModel (may keep adapters).")
++            tmp_out = out_dir.parent / (out_dir.name + "_tmp_merge")
++            tmp_out.mkdir(parents=True, exist_ok=True)
++            peft_model.save_pretrained(tmp_out)
++            # Try to load as full model
++            merged_model = AutoModelForCausalLM.from_pretrained(tmp_out)
++            # Clean up tmp_out if appropriate
++            # (we keep it for debugging)
++    except Exception as e:
++        raise RuntimeError("Merging failed: " + str(e)) from e
++
++    # Save merged model + tokenizer to out_dir
++    print("Saving merged model to", out_dir)
++    out_dir.mkdir(parents=True, exist_ok=True)
++    merged_model.save_pretrained(out_dir)
++    tokenizer.save_pretrained(out_dir)
++    print("Merged checkpoint saved.")
++    return out_dir
++
++def collect_provenance(lora_dir: Path, base_model: str, merged_dir: Path, extra: Dict[str, Any]) -> Dict[str, Any]:
++    prov = {
++        "base_model": base_model,
++        "lora_dir": str(lora_dir.resolve()),
++        "merged_dir": str(merged_dir.resolve()),
++        "timestamp": int(time.time()),
++        "extra": extra
++    }
++    return prov
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--lora_dir", required=True, help="Directory containing LoRA/PEFT artifacts (training output dir)")
++    p.add_argument("--base_model", required=True, help="Base model HF id or local path used for merging")
++    p.add_argument("--out_dir", required=True, help="Directory to write merged checkpoint (will be created)")
++    p.add_argument("--keep_lora", default="false", help="If false, optionally remove lora_dir after successful merge (default false)")
++    p.add_argument("--manifest_out", default="release/merged_manifest.json", help="Path to write merged manifest with checksums")
++    args = p.parse_args()
++
++    lora_dir = Path(args.lora_dir)
++    if not lora_dir.exists():
++        print("ERROR: lora_dir does not exist:", lora_dir)
++        raise SystemExit(2)
++    out_dir = Path(args.out_dir)
++    manifest_out = Path(args.manifest_out)
++    keep_lora = args.keep_lora.lower() in ("1","true","yes","y")
++
++    # Basic sanity: check for peft config files
++    has_peft = any(p.name.startswith("adapter_config") or p.name == "adapter_model.bin" or p.name.endswith(".pt") or p.name == "pytorch_model.bin" for p in lora_dir.rglob("*"))
++    if not has_peft:
++        print("Warning: lora_dir does not contain obvious PEFT artifacts. Continuing nonetheless.")
++
++    # Merge process
++    try:
++        merged_path = merge_peft_lora(lora_dir, args.base_model, out_dir)
++    except Exception as e:
++        print("Merge failed:", e)
++        raise
++
++    # Compute checksums for merged_dir
++    print("Computing checksums for merged directory...")
++    files = gather_files_and_checksums(out_dir)
++
++    # Optionally compute checksums for LoRA dir (provenance)
++    lora_files = gather_files_and_checksums(lora_dir)
++
++    prov = collect_provenance(lora_dir, args.base_model, out_dir, {"keep_lora": keep_lora})
++    manifest = {
++        "merged_path": str(out_dir.resolve()),
++        "files": files,
++        "lora_files": lora_files,
++        "provenance": prov
++    }
++    save_manifest(manifest_out, manifest)
++
++    # Create a simple release_final_manifest entry fragment for downstream consumption
++    release_fragment = {
++        "merged_checkpoint": str(out_dir.resolve()),
++        "merged_manifest": str(manifest_out.resolve()),
++        "created_at": int(time.time())
++    }
++    release_fragment_path = out_dir.parent / "release_fragment.json"
++    release_fragment_path.write_text(json.dumps(release_fragment, indent=2), encoding="utf-8")
++    print("Wrote release fragment to", release_fragment_path)
++
++    # Optionally remove LoRA dir if requested
++    if not keep_lora:
++        try:
++            print("Removing LoRA dir (per request).")
++            shutil.rmtree(lora_dir)
++            print("Removed", lora_dir)
++        except Exception as e:
++            print("Failed to remove lora_dir:", e)
++
++    print("Done. Merged checkpoint ready at:", out_dir)
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null
++++ b/scripts/auto_merge_watch.sh
+@@ -0,0 +1,128 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# scripts/auto_merge_watch.sh
++
++# Simple watcher that waits for a training job to finish (by detecting a marker file or LoRA checkpoint)
++# and then invokes save_and_merge_lora.py automatically.
++#
++# Usage:
++#   ./scripts/auto_merge_watch.sh --watch_dir outputs/sft_out --base_model togethercomputer/RedPajama-INCITE-7B-Instruct --out_dir outputs/sft_out/merged
++#
++# The script looks for one of:
++#  - a marker file WATCH_DIR/__TRAINING_DONE__ (recommended to be created by training job upon success)
++#  - presence of a peft adapter file like adapter_model.bin or adapter_config.json
++#  - timeout after WAIT_SECONDS
++
++WATCH_DIR=""
++BASE_MODEL=""
++OUT_DIR=""
++WAIT_SECONDS=${WAIT_SECONDS:-36000} # 10 hours default
++POLL_INTERVAL=30
++
++function usage() {
++  cat <<EOF
++Usage: $0 --watch_dir <dir> --base_model <hf-id> --out_dir <dir> [--wait_seconds N]
++EOF
++  exit 1
++}
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --watch_dir) WATCH_DIR="$2"; shift 2;;
++    --base_model) BASE_MODEL="$2"; shift 2;;
++    --out_dir) OUT_DIR="$2"; shift 2;;
++    --wait_seconds) WAIT_SECONDS="$2"; shift 2;;
++    --help) usage;;
++    *) echo "Unknown arg: $1"; usage;;
++  esac
++done
++
++if [[ -z "$WATCH_DIR" || -z "$BASE_MODEL" || -z "$OUT_DIR" ]]; then
++  usage
++fi
++
++WATCH_DIR_ABS="$(cd "$(dirname "$WATCH_DIR")" && pwd)/$(basename "$WATCH_DIR")"
++echo "Watching directory: $WATCH_DIR_ABS for LoRA artifacts or marker; will timeout after $WAIT_SECONDS seconds"
++
++START=$(date +%s)
++while true; do
++  NOW=$(date +%s)
++  ELAPSED=$((NOW-START))
++  if [[ $ELAPSED -gt $WAIT_SECONDS ]]; then
++    echo "Timeout reached ($ELAPSED s). Exiting watcher."
++    exit 2
++  fi
++
++  # check marker
++  if [[ -f "$WATCH_DIR_ABS/__TRAINING_DONE__" ]]; then
++    echo "Training done marker found."
++    break
++  fi
++
++  # detect common peft/LoRA artifact files
++  if ls "$WATCH_DIR_ABS"/adapter_model.* >/dev/null 2>&1 || ls "$WATCH_DIR_ABS"/*adapter_config* >/dev/null 2>&1 || ls "$WATCH_DIR_ABS"/*adapter_state* >/dev/null 2>&1; then
++    echo "Detected LoRA artifacts in $WATCH_DIR_ABS."
++    break
++  fi
++
++  echo "No artifacts yet. Sleeping ${POLL_INTERVAL}s..."
++  sleep "$POLL_INTERVAL"
++done
++
++echo "Invoking merge script..."
++python scripts/save_and_merge_lora.py --lora_dir "$WATCH_DIR_ABS" --base_model "$BASE_MODEL" --out_dir "$OUT_DIR" --keep_lora true
++
++echo "Auto-merge completed."
++exit 0
++
+--- /dev/null
++++ b/scripts/verify_merged_checkpoint.py
+@@ -0,0 +1,212 @@
++#!/usr/bin/env python3
++"""
++scripts/verify_merged_checkpoint.py
++
++Verify a merged checkpoint directory looks valid:
++ - required files (pytorch_model.bin / config.json / tokenizer files)
++ - compare files against merged manifest (release/merged_manifest.json) if provided
++ - report missing files and mismatches
++
++Usage:
++  python scripts/verify_merged_checkpoint.py --merged_dir outputs/sft_out/merged --manifest release/merged_manifest.json
++"""
++from __future__ import annotations
++import argparse
++import json
++from pathlib import Path
++from typing import Dict, Any
++import sys
++
++REQUIRED_FILES = ["config.json", "tokenizer.json", "tokenizer_config.json", "pytorch_model.bin"]
++
++def load_manifest(path: Path) -> Dict[str, Any]:
++    if not path.exists():
++        return {}
++    return json.loads(path.read_text(encoding="utf-8"))
++
++def check_required_files(merged_dir: Path) -> Dict[str, Any]:
++    res = {"present": [], "missing": []}
++    for name in REQUIRED_FILES:
++        p = merged_dir / name
++        if p.exists():
++            res["present"].append(name)
++        else:
++            # try other common names
++            alt = False
++            for q in merged_dir.rglob("*pytorch*"):
++                alt = True
++                res["present"].append(q.name)
++                break
++            if not alt:
++                res["missing"].append(name)
++    return res
++
++def compare_with_manifest(merged_dir: Path, manifest: Dict[str, Any]) -> Dict[str, Any]:
++    res = {"checked": [], "mismatches": [], "not_listed": []}
++    if not manifest:
++        return res
++    expected_files = {f["path"]: f for f in manifest.get("files", [])}
++    for p in merged_dir.rglob("*"):
++        if not p.is_file():
++            continue
++        rel = p.relative_to(merged_dir).as_posix()
++        expected = expected_files.get(rel)
++        if not expected:
++            res["not_listed"].append(rel)
++            continue
++        # compute sha
++        import hashlib
++        h = hashlib.sha256(p.read_bytes()).hexdigest()
++        if h != expected.get("sha256"):
++            res["mismatches"].append({"path": rel, "expected": expected.get("sha256"), "actual": h})
++        else:
++            res["checked"].append(rel)
++    return res
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--merged_dir", required=True)
++    p.add_argument("--manifest", default="release/merged_manifest.json")
++    p.add_argument("--out", default="release/verify_merged_report.json")
++    args = p.parse_args()
++
++    merged_dir = Path(args.merged_dir)
++    if not merged_dir.exists():
++        print("Merged dir not found:", merged_dir)
++        raise SystemExit(2)
++
++    manifest = load_manifest(Path(args.manifest))
++
++    report = {"merged_dir": str(merged_dir.resolve()), "manifest_used": str(args.manifest), "results": {}}
++
++    req = check_required_files(merged_dir)
++    report["results"]["required_files"] = req
++
++    comp = compare_with_manifest(merged_dir, manifest)
++    report["results"]["manifest_compare"] = comp
++
++    Path(args.out).write_text(json.dumps(report, indent=2), encoding="utf-8")
++    print("Wrote verification report to", args.out)
++
++    # decide exit code: fail if required missing or manifest mismatches exist
++    if req["missing"]:
++        print("Missing required files:", req["missing"])
++        sys.exit(3)
++    if comp["mismatches"]:
++        print("Manifest mismatches detected:", comp["mismatches"])
++        sys.exit(4)
++    print("Merged checkpoint verification PASSED")
++    sys.exit(0)
++
++if __name__ == "__main__":
++    main()
++
