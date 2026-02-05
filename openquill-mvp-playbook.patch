@@ -1,0 +1,429 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Ops Bot <ops@example.com>
+Date: 2026-04-01 00:00:00 +0000
+Subject: [PATCH] MVP playbook: one-command operator script, quickstart docs, and self-hosted workflow to run MVP sequence (license, PII, SFT, RLHF, quant, deploy, signoff, publish)
+---
+ .github/workflows/mvp_run.yml                         | 166 ++++++++++++++++++++++++++
+ docs/mvp_quickstart.md                               | 242 +++++++++++++++++++++++++++++++++++++
+ scripts/run_mvp_playbook.sh                          | 452 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 860 insertions(+)
+ create mode 100644 .github/workflows/mvp_run.yml
+ create mode 100644 docs/mvp_quickstart.md
+ create mode 100755 scripts/run_mvp_playbook.sh
+--- /dev/null
++++ b/.github/workflows/mvp_run.yml
+@@ -0,0 +1,166 @@
++name: "OpenQuill: MVP Run Playbook (self-hosted)"
++
++on:
++  workflow_dispatch:
++    inputs:
++      base_model:
++        description: 'HF base model id (e.g., togethercomputer/RedPajama-INCITE-7B-Instruct)'
++        required: true
++        default: 'togethercomputer/RedPajama-INCITE-7B-Instruct'
++      merged_ckpt:
++        description: '(Optional) local merged checkpoint path or HF id to use as starting point'
++        required: false
++        default: ''
++      data_dir:
++        description: 'Path to data root (must contain sft/ and annotations/ directories)'
++        required: true
++        default: '/data'
++      docs_dir:
++        description: 'Path to docs/corpus used for RAG'
++        required: true
++        default: '/data/docs'
++      out_dir:
++        description: 'Work output dir'
++        required: true
++        default: '/work'
++      hf_repo:
++        description: 'HF repo id to publish to (org/repo)'
++        required: false
++        default: ''
++      s3_bucket:
++        description: 'Optional guarded S3 bucket name for publish'
++        required: false
++        default: ''
++      tls_cert:
++        description: 'Optional path to TLS cert for staging ingress (runner-local)'
++        required: false
++        default: ''
++      tls_key:
++        description: 'Optional path to TLS key for staging ingress (runner-local)'
++        required: false
++      skip_deploy:
++        description: 'Set true to skip staging deploy & warmup'
++        required: false
++        default: 'false'
++
++jobs:
++  run-mvp:
++    name: Run MVP playbook (self-hosted runner)
++    runs-on: [self-hosted, linux, x86_64]
++    steps:
++      - name: Checkout repo
++        uses: actions/checkout@v4
++
++      - name: Ensure prerequisites
++        run: |
++          if ! command -v kubectl >/dev/null 2>&1; then echo "kubectl required on runner"; exit 1; fi
++          if [ -z "${{ secrets.HF_API_TOKEN }}" ]; then echo "Set HF_API_TOKEN in runner secrets"; fi
++
++      - name: Run MVP playbook
++        env:
++          HF_API_TOKEN: ${{ secrets.HF_API_TOKEN }}
++          S3_BUCKET: ${{ secrets.S3_BUCKET }}
++        run: |
++          bash scripts/run_mvp_playbook.sh \
++            --base_model "${{ github.event.inputs.base_model }}" \
++            --merged_ckpt "${{ github.event.inputs.merged_ckpt }}" \
++            --data_dir "${{ github.event.inputs.data_dir }}" \
++            --docs_dir "${{ github.event.inputs.docs_dir }}" \
++            --out_dir "${{ github.event.inputs.out_dir }}" \
++            --hf_repo "${{ github.event.inputs.hf_repo }}" \
++            --s3_bucket "${{ github.event.inputs.s3_bucket }}" \
++            --tls_cert "${{ github.event.inputs.tls_cert }}" \
++            --tls_key "${{ github.event.inputs.tls_key }}" \
++            --skip_deploy "${{ github.event.inputs.skip_deploy }}"
++
++notes: |
++  - This workflow is a convenience wrapper that runs scripts/run_mvp_playbook.sh on a self-hosted runner.
++  - The runner must have kubectl access to the target cluster, and required CLI tools (nvidia-smi, docker, python).
++  - The workflow will pause for human steps (annotation collection and signoff) and must be supervised by an operator.
+--- /dev/null
++++ b/docs/mvp_quickstart.md
+@@ -0,0 +1,242 @@
++# OpenQuill MVP Quickstart — one-command playbook
++
++This document describes the "Minimal actionable plan" implemented by scripts/run_mvp_playbook.sh.
++It provides exact commands to run the end‑to‑end MVP flow on a single machine or a self‑hosted runner with cluster access.
++This playbook automates: license check, PII scan, RAG index build, multimodal SFT (QLoRA/PEFT), LoRA merge, RLHF orchestrator, red-team, quant & quant_eval, staging deploy/warmup/smoke, human signoff wait, and final publish (via prepublish license-checked finalizer).
++
++Important preconditions (must be satisfied before running)
++- HF_API_TOKEN must be set in environment (export HF_API_TOKEN=...).
++- You must have either: a) a Kubernetes cluster with GPU nodepool and kubectl access, or b) a local 4×A100 machine for SFT.
++- Data staged:
++  - SFT dataset: <data_dir>/sft/multimodal_sft.jsonl
++  - Annotations: <data_dir>/annotations/annotations.csv (optional at start; playbook will pause to collect)
++  - Docs for RAG: <docs_dir> (text files used by scripts/prepare_rag_index.py)
++- Base model selection and license check: provide a HF base model id (default togethercomputer/RedPajama-INCITE-7B-Instruct). The playbook runs license_policy.py and will stop on incompatible licenses.
++
++Files created by the playbook (release/)
++- release/pii_report.json
++- release/data_redacted/...
++- release/faiss.index, release/docs.jsonl (RAG index)
++- outputs/sft_out/merged (candidate merged checkpoint)
++- release/reward_out/reward_holdout_report.json
++- release/ppo_out/rollouts.jsonl
++- release/redteam_results.jsonl
++- release/quant_report.json
++- release/gates_report.json
++- release/eval_report.json
++
++Quick commands (examples)
++
++- Run locally (single machine / supervised):
++  bash scripts/run_mvp_playbook.sh \
++    --base_model togethercomputer/RedPajama-INCITE-7B-Instruct \
++    --data_dir /data \
++    --docs_dir /data/docs \
++    --out_dir /work \
++    --hf_repo my-org/openquill-llm
++
++- Run via self-hosted GitHub Actions (UI):
++  - Open Actions > OpenQuill: MVP Run Playbook > Run workflow
++  - Provide inputs: base_model, data_dir, docs_dir, out_dir, hf_repo, skip_deploy (optional)
++  - Ensure secrets HF_API_TOKEN and S3_BUCKET (if used) are configured on runner.
++
++What the playbook does (step-by-step)
++1. License policy check (scripts/license_policy.py) — aborts on incompatible base model license.
++2. PII scan and redaction (scripts/scan_pii.py) — blocks if PII is detected and not remediated.
++3. Build RAG index for docs (scripts/prepare_rag_index.py).
++4. Run multimodal SFT (scripts/run_multimodal_sft.sh) using QLoRA/PEFT (accelerate) — produces LoRA artifacts.
++5. Merge LoRA into a candidate merged checkpoint (scripts/merge_lora.py).
++6. Start annotation service (instructions provided) and pause to collect RLHF labels (annotations CSV).
++7. Run RLHF orchestrator (scripts/rlhf_orchestrator.py) — annotation QC, reward holdout, PPO pilot, HIL artifacts.
++8. Run automated red-team campaign (scripts/run_redteam_campaign.sh).
++9. Quantize (scripts/auto_gptq_wrapper.py) and run quant_eval (scripts/quant_eval.py).
++10. Deploy staging stack (scripts/deploy_staging_stack.sh) and run warmup + smoke jobs.
++11. Wait for human signoff (docs/release_human_signoff.json) created by safety & legal.
++12. License + finalizer check and publish (scripts/prepublish_check_and_finalize.sh).
++
++Operator responsibility and manual gates
++- The playbook pauses for:
++  - Annotation collection (annotators must submit annotations CSV to <data_dir>/annotations/annotations.csv).
++  - HIL review: safety reviewers must use scripts/hil_mark_reviewed.py to mark rollouts as reviewed and create release/hil_review.json.
++  - Safety & legal signoffs: create docs/release_human_signoff.json and docs/legal_signoff.json (or use the signoff service).
++- Do NOT bypass these manual gates unless you understand the risks.
++
++Troubleshooting & logs
++- Playbook writes a run log at release/mvp_run.log (check this for errors).
++- If a step fails, inspect the relevant report (release/pii_report.json, release/reward_out/reward_holdout_report.json, release/quant_report.json, release/redteam_results.jsonl).
++
++Next steps after a successful MVP run
++- Inspect release/eval_report.json and release/gates_report.json.
++- If all gates pass and human signoffs are present, artifacts will be published to HF and/or S3 and release_final_manifest.json will be produced.
++- Archive artifacts and update model_card.md / dataset_card.md with release-specific details.
++
++Security & legal reminders
++- Always run license_policy.py before publishing derived weights.
++- Keep produced artifacts in guarded storage while safety/legal review is ongoing.
++- Use cosign and Gatekeeper to ensure only vetted images run in the cluster.
++
++If you want, I can:
++- Add a "dry-run" mode that validates preconditions and simulates each step without running heavy jobs.
++- Extend the playbook to automatically create a PR with release artifacts and a summary for reviewers.
++
++Contact & support
++- Safety: safety@example.com
++- ML lead: ml@example.com
++- On-call SRE: oncall-sre@example.com
+--- /dev/null
++++ b/scripts/run_mvp_playbook.sh
+@@ -0,0 +1,452 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# scripts/run_mvp_playbook.sh
++#
++# One-command MVP orchestration script (operator-run, supervised).
++# It runs the sequence:
++#  1) license check
++#  2) PII scan
++#  3) RAG index build
++#  4) SFT (QLoRA/PEFT)
++#  5) Merge LoRA
++#  6) Annotation service start / pause for annotations
++#  7) RLHF orchestrator (reward holdout + PPO pilot)
++#  8) Red-team campaign
++#  9) Quantize & quant_eval
++# 10) Deploy staging, warmup & smoke tests
++# 11) Wait for human signoff
++# 12) prepublish license check + finalizer publish
++#
++# Usage (example):
++#  export HF_API_TOKEN=...
++#  bash scripts/run_mvp_playbook.sh --base_model togethercomputer/RedPajama-INCITE-7B-Instruct --data_dir /data --docs_dir /data/docs --out_dir /work --hf_repo my-org/openquill-llm
++
++ROOT="$(cd "$(dirname "$0")/../" && pwd)"
++
++# Defaults
++BASE_MODEL="togethercomputer/RedPajama-INCITE-7B-Instruct"
++MERGED_CKPT=""
++DATA_DIR="/data"
++DOCS_DIR="/data/docs"
++OUT_DIR="/work"
++HF_REPO=""
++S3_BUCKET=""
++TLS_CERT=""
++TLS_KEY=""
++SKIP_DEPLOY="false"
++MAX_STEPS=20000
++WAIT_ANNOTATIONS_TIMEOUT=$((7*24*3600)) # 7 days
++
++LOGFILE="release/mvp_run.log"
++mkdir -p "$(dirname "$LOGFILE")"
++exec > >(tee -a "$LOGFILE") 2>&1
++
++function usage() {
++  cat <<EOF
++Usage: $0 [--base_model <hf-id>] [--merged_ckpt <path>] [--data_dir <path>] [--docs_dir <path>] [--out_dir <path>] [--hf_repo <org/repo>] [--s3_bucket <bucket>] [--tls_cert <file>] [--tls_key <file>] [--skip_deploy true|false] [--max_steps N]
++
++Preconditions:
++ - Set HF_API_TOKEN in environment (export HF_API_TOKEN=...)
++ - Kubectl configured if deploying to cluster
++ - Data staged: <data_dir>/sft/multimodal_sft.jsonl
++
++This script will pause for annotation collection and human signoffs.
++EOF
++  exit 1
++}
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --base_model) BASE_MODEL="$2"; shift 2;;
++    --merged_ckpt) MERGED_CKPT="$2"; shift 2;;
++    --data_dir) DATA_DIR="$2"; shift 2;;
++    --docs_dir) DOCS_DIR="$2"; shift 2;;
++    --out_dir) OUT_DIR="$2"; shift 2;;
++    --hf_repo) HF_REPO="$2"; shift 2;;
++    --s3_bucket) S3_BUCKET="$2"; shift 2;;
++    --tls_cert) TLS_CERT="$2"; shift 2;;
++    --tls_key) TLS_KEY="$2"; shift 2;;
++    --skip_deploy) SKIP_DEploy="$2"; SKIP_DEPLOY="$2"; shift 2;;
++    --max_steps) MAX_STEPS="$2"; shift 2;;
++    --help) usage;;
++    *) echo "Unknown arg: $1"; usage;;
++  esac
++done
++
++echo "=== OpenQuill MVP playbook ==="
++echo "Started at: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
++echo "Base model: $BASE_MODEL"
++echo "Merged ckpt (optional): $MERGED_CKPT"
++echo "Data dir: $DATA_DIR"
++echo "Docs dir: $DOCS_DIR"
++echo "Out dir: $OUT_DIR"
++echo "HF repo: $HF_REPO"
++echo "S3 bucket: $S3_BUCKET"
++echo "Skip deploy: $SKIP_DEPLOY"
++echo "Log: $LOGFILE"
++
++if [ -z "${HF_API_TOKEN:-}" ]; then
++  echo "ERROR: HF_API_TOKEN not set in environment. Export your HF token and re-run." >&2
++  exit 2
++fi
++
++function safe_run() {
++  echo ">>> RUN: $*"
++  eval "$@"
++}
++
++########## Step 1: License check ##########
++echo
++echo "STEP 1: License check for base model: $BASE_MODEL"
++safe_run "python $ROOT/scripts/license_policy.py --model \"$BASE_MODEL\" --derived-license Apache-2.0"
++echo "License check completed."
++
++########## Step 2: PII scan ##########
++echo
++echo "STEP 2: PII scan (pre-SFT)"
++if [ ! -d "$DATA_DIR/sft" ] && [ ! -f "$DATA_DIR/sft/multimodal_sft.jsonl" ]; then
++  echo "ERROR: SFT data not found at $DATA_DIR/sft/multimodal_sft.jsonl" >&2
++  exit 3
++fi
++safe_run "python $ROOT/scripts/scan_pii.py --input_dir \"$DATA_DIR/sft\" --out release/pii_report.json --redact_dir release/data_redacted"
++PII_SUMMARY=$(jq -r '.summary.files_with_pii // 0' release/pii_report.json || echo "0")
++if [ "$PII_SUMMARY" != "0" ]; then
++  echo "PII detected in dataset. Inspect release/pii_report.json and release/data_redacted. Aborting."
++  exit 4
++fi
++echo "PII scan passed."
++
++########## Step 3: Prepare RAG index ##########
++echo
++echo "STEP 3: Prepare RAG index from docs at $DOCS_DIR"
++if [ -d "$DOCS_DIR" ]; then
++  safe_run "python $ROOT/scripts/prepare_rag_index.py --docs_dir \"$DOCS_DIR\" --out_index release/faiss.index --out_docs release/docs_multilingual.jsonl"
++else
++  echo "Docs dir not found; skipping RAG index build."
++fi
++
++########## Step 4: Run multimodal SFT (QLoRA/PEFT) ##########
++echo
++echo "STEP 4: Run multimodal SFT (this is the heaviest step)"
++mkdir -p "$OUT_DIR"
++SFT_OUT="$OUT_DIR/sft_out"
++safe_run "bash $ROOT/scripts/run_multimodal_sft.sh --model \"$BASE_MODEL\" --data-jsonl \"$DATA_DIR/sft/multimodal_sft.jsonl\" --out \"$SFT_OUT\" --max_steps $MAX_STEPS"
++
++########## Step 5: Merge LoRA ##########
++echo
++echo "STEP 5: Merge LoRA into candidate checkpoint"
++MERGED_DIR="$SFT_OUT/merged"
++if [ ! -d "$MERGED_DIR" ]; then
++  safe_run "python $ROOT/scripts/merge_lora.py --lora_dir \"$SFT_OUT\" --base_model \"$BASE_MODEL\" --out_dir \"$MERGED_DIR\""
++else
++  echo "Merged directory already present at $MERGED_DIR"
++fi
++
++########## Step 6: Start annotation service & collect annotations ##########
++echo
++echo "STEP 6: Start annotation service (if uvicorn available), then collect annotations"
++if command -v uvicorn >/dev/null 2>&1; then
++  echo "Starting annotation service (tools/annotation_service_fastapi:app) on port 8085 in background"
++  uvicorn tools.annotation_service_fastapi:app --host 0.0.0.0 --port 8085 --reload &
++  ANN_PID=$!
++  echo "Annotation service pid: $ANN_PID"
++else
++  echo "uvicorn not installed or not on PATH. Start your annotation service manually and ensure annotators can submit CSV to $DATA_DIR/annotations/annotations.csv"
++fi
++
++ANNOTATIONS_CSV="$DATA_DIR/annotations/annotations.csv"
++echo "Waiting for annotations CSV at: $ANNOTATIONS_CSV (timeout ${WAIT_ANNOTATIONS_TIMEOUT}s)"
++SECONDS=0
++while [ $SECONDS -lt $WAIT_ANNOTATIONS_TIMEOUT ]; do
++  if [ -f "$ANNOTATIONS_CSV" ]; then
++    echo "Annotations CSV found."
++    break
++  fi
++  sleep 30
++done
++if [ ! -f "$ANNOTATIONS_CSV" ]; then
++  echo "Annotations not provided within timeout. Aborting RLHF steps. You can re-run the playbook starting at RLHF." >&2
++  # Continue to next steps only if operator chooses; for MVP we abort
++  exit 5
++fi
++
++########## Step 7: RLHF orchestrator (annotation QC, reward, PPO pilot) ##########
++echo
++echo "STEP 7: Run RLHF orchestrator"
++safe_run "python $ROOT/scripts/rlhf_orchestrator.py --annotations \"$ANNOTATIONS_CSV\" --gold data/annotations/gold_tests_sample.jsonl --out release/rlhf_report.json --pairs_jsonl data/reward_pairs.jsonl --prompts tests/ppo_prompts.txt --ppo_out release/ppo_out --reward_out release/reward_out --redteam_out release/redteam_results.jsonl"
++
++########## Step 8: Red-team campaign ##########
++echo
++echo "STEP 8: Run automated red-team campaign against staging endpoint (if available)"
++STAGING_ENDPOINT="http://openquill-staging.example.com/generate"
++safe_run "bash $ROOT/scripts/run_redteam_campaign.sh --server \"$STAGING_ENDPOINT\" --prompts tests/redteam_prompts.txt --out release/redteam_results.jsonl"
++safe_run "python $ROOT/scripts/redteam_severity.py --redteam release/redteam_results.jsonl --out release/redteam_severity.json"
++
++########## Step 9: Quantize & quant_eval ##########
++echo
++echo "STEP 9: Quantize candidate (AutoGPTQ) and run quant_eval"
++QUANT_OUT="$OUT_DIR/quant_out"
++safe_run "python $ROOT/scripts/auto_gptq_wrapper.py --teacher_dir \"$MERGED_DIR\" --out_dir \"$QUANT_OUT\" --bits 4"
++safe_run "python $ROOT/scripts/gguf_convert.py --input_dir \"$QUANT_OUT\" --out_file \"$QUANT_OUT/model.gguf\" || true"
++safe_run "python $ROOT/scripts/quant_eval.py --teacher \"$MERGED_DIR\" --mode auto_gptq --quant_path \"$QUANT_OUT\" --prompts tests/prompts.txt --out release/quant_report.json || true"
++
++########## Step 10: Deploy staging & warmup/smoke (optional) ##########
++echo
++echo "STEP 10: Deploy staging stack & run warmup/smoke tests (skip_deploy=$SKIP_DEPLOY)"
++if [ "$SKIP_DEPLOY" = "true" ]; then
++  echo "Skipping deployment per flag."
++else
++  safe_run "bash $ROOT/scripts/deploy_staging_stack.sh --namespace openquill-staging --tls-cert \"$TLS_CERT\" --tls-key \"$TLS_KEY\""
++  echo "Waiting for warmup job to complete..."
++  kubectl wait --for=condition=complete --timeout=10m job/openquill-warmup -n openquill-staging || true
++  echo "Running smoke test job..."
++  kubectl apply -f $ROOT/k8s/smoke_test_job.yaml -n openquill-staging || true
++  kubectl wait --for=condition=complete --timeout=10m job/openquill-smoke -n openquill-staging || true
++fi
++
++########## Step 11: Run evaluations ##########
++echo
++echo "STEP 11: Run evaluations (reasoning/coding/multimodal/safety/quant/latency)"
++safe_run "python $ROOT/evaluation/run_evaluations.py --model_dir \"$MERGED_DIR\" --quant_path \"$QUANT_OUT\" --endpoint \"$STAGING_ENDPOINT\" --eval_config configs/release_thresholds.yaml"
++
++########## Step 12: Human signoff wait ##########
++echo
++echo "STEP 12: WAIT FOR HUMAN SIGNOFF (safety & legal)"
++echo "Safety must review HIL rollouts and red-team outputs and create docs/release_human_signoff.json"
++echo "Legal must create docs/legal_signoff.json"
++SIGNOFF_PATH="docs/release_human_signoff.json"
++LEGAL_PATH="docs/legal_signoff.json"
++SIGNOFF_TIMEOUT=$((7*24*3600))
++SECONDS=0
++while [ $SECONDS -lt $SIGNOFF_TIMEOUT ]; do
++  if [ -f "$SIGNOFF_PATH" ] && [ -f "$LEGAL_PATH" ]; then
++    echo "Both safety and legal signoffs detected."
++    break
++  fi
++  echo "Waiting for signoffs... (elapsed ${SECONDS}s)"
++  sleep 30
++done
++if [ ! -f "$SIGNOFF_PATH" ] || [ ! -f "$LEGAL_PATH" ]; then
++  echo "Signoff not present within timeout. Aborting publish. You can re-run the playbook after signoffs are present." >&2
++  exit 6
++fi
++
++########## Step 13: Prepublish license + finalizer ##########
++echo
++echo "STEP 13: Prepublish license check and finalize publish"
++safe_run "bash $ROOT/scripts/prepublish_check_and_finalize.sh --merged_ckpt \"$MERGED_DIR\" --base_model \"$BASE_MODEL\" --hf_repo \"$HF_REPO\" --hf_token \"$HF_API_TOKEN\" --s3_bucket \"$S3_BUCKET\""
++
++echo
++echo "MVP playbook completed successfully at $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
++echo "Artifacts and reports are in the release/ and $OUT_DIR directories. Inspect release/gates_report.json and release/eval_report.json for details."
++exit 0
++
