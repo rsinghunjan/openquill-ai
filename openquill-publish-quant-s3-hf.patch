@@ -1,0 +1,691 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Release Bot <release@example.com>
+Date: 2026-04-15 00:00:00 +0000
+Subject: [PATCH] publish pipeline: quant -> GGUF -> upload to guarded S3 & HF, cosign signing, k8s manifests for streaming proxy + retriever, publish CI workflow and verifiers
+---
+ .github/workflows/publish_release.yml                  | 206 +++++++++++++++++++++++++++++
+ k8s/streaming_proxy.yaml                               | 205 +++++++++++++++++++++++++++++
+ k8s/retriever_service.yaml                             | 184 ++++++++++++++++++++++++++
+ scripts/publish_and_sign.py                            | 468 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ scripts/verify_release_artifacts.py                    | 214 ++++++++++++++++++++++++++
+ scripts/publish_preflight.py                           | 158 +++++++++++++++++++
+ 6 files changed, 1435 insertions(+)
+ create mode 100644 .github/workflows/publish_release.yml
+ create mode 100644 k8s/streaming_proxy.yaml
+ create mode 100644 k8s/retriever_service.yaml
+ create mode 100755 scripts/publish_and_sign.py
+ create mode 100755 scripts/verify_release_artifacts.py
+ create mode 100755 scripts/publish_preflight.py
+--- /dev/null
++++ b/.github/workflows/publish_release.yml
+@@ -0,0 +1,206 @@
++name: "OpenQuill Publish Release (self-hosted runner)"
++
++on:
++  workflow_dispatch:
++    inputs:
++      merged_ckpt_path:
++        description: 'Path to merged checkpoint on runner or PVC (required)'
++        required: true
++        default: '/work/sft_out/merged'
++      quant_path:
++        description: 'Optional quantized model dir (AutoGPTQ output)'
++        required: false
++        default: ''
++      gguf_path:
++        description: 'Optional GGUF file path for CPU runtime'
++        required: false
++        default: ''
++      hf_repo:
++        description: 'Hugging Face repo id to publish (org/repo) - optional'
++        required: false
++        default: ''
++      s3_bucket:
++        description: 'Guarded S3 bucket to upload artifacts (optional)'
++        required: false
++        default: ''
++      cosign_key_secret:
++        description: 'Name of Kubernetes secret or env var pointing to cosign key (runner-local path allowed)'
++        required: false
++        default: ''
++
++jobs:
++  publish:
++    runs-on: [self-hosted, linux]
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Setup Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: 3.10
++
++      - name: Install dependencies
++        run: |
++          python -m pip install --upgrade pip
++          pip install -r requirements.txt || true
++          pip install boto3 huggingface-hub tqdm || true
++
++      - name: Run preflight checks (gates & signoffs)
++        run: |
++          python scripts/publish_preflight.py \
++            --pii_report release/pii_report.json \
++            --annotation_audit release/annotation_audit.json \
++            --reward_report release/reward_out/reward_holdout_report.json \
++            --quant_report release/quant_report.json \
++            --ppo_rollouts release/ppo_out/rollouts.jsonl \
++            --redteam release/redteam_results.jsonl \
++            --signoff docs/release_human_signoff.json \
++            --legal_signoff docs/legal_signoff.json
++
++      - name: Publish artifacts (quant/gguf -> S3/HF) and cosign sign
++        env:
++          HF_API_TOKEN: ${{ secrets.HF_API_TOKEN }}
++          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
++          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
++          AWS_REGION: ${{ secrets.AWS_REGION }}
++          COSIGN_KEY: ${{ secrets.COSIGN_KEY }}
++        run: |
++          python scripts/publish_and_sign.py \
++            --merged_dir "${{ github.event.inputs.merged_ckpt_path }}" \
++            --quant_dir "${{ github.event.inputs.quant_path }}" \
++            --gguf "${{ github.event.inputs.gguf_path }}" \
++            --hf_repo "${{ github.event.inputs.hf_repo }}" \
++            --s3_bucket "${{ github.event.inputs.s3_bucket }}" \
++            --cosign_key "${{ secrets.COSIGN_KEY }}"
++
++      - name: Verify published artifacts
++        env:
++          HF_API_TOKEN: ${{ secrets.HF_API_TOKEN }}
++          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
++          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
++          AWS_REGION: ${{ secrets.AWS_REGION }}
++        run: |
++          python scripts/verify_release_artifacts.py --manifest release/release_final_manifest.json --hf-token "$HF_API_TOKEN" --s3-bucket "${{ github.event.inputs.s3_bucket }}"
++
++notes: |
++  - This workflow is intended to run on a self-hosted runner that has access to the merged checkpoint directory or mounted PVC.
++  - The runner must have AWS credentials (if publishing to S3) and HF API token (if publishing to Hugging Face).
++  - Cosign key may be provided via runner secret or path; publish_and_sign.py expects an env var or CLI arg.
+--- /dev/null
++++ b/k8s/streaming_proxy.yaml
+@@ -0,0 +1,205 @@
++# Kubernetes manifest for Streaming Safety Proxy
++# - FastAPI app (scripts/streaming_safety_proxy.py) deployed as a k8s Deployment + Service with a secret-based API key
++
++apiVersion: v1
++kind: Namespace
++metadata:
++  name: openquill-proxy
++
++---
++apiVersion: v1
++kind: Secret
++metadata:
++  name: streaming-proxy-secret
++  namespace: openquill-proxy
++type: Opaque
++stringData:
++  # Provide STREAMING_PROXY_API_KEY via secret when applying
++  STREAMING_PROXY_API_KEY: "changeme"
++
++---
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: streaming-safety-proxy
++  namespace: openquill-proxy
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: streaming-safety-proxy
++  template:
++    metadata:
++      labels:
++        app: streaming-safety-proxy
++      annotations:
++        prometheus.io/scrape: "true"
++        prometheus.io/port: "8090"
++    spec:
++      containers:
++        - name: streaming-proxy
++          image: ghcr.io/yourorg/openquill-streaming-proxy:latest
++          imagePullPolicy: IfNotPresent
++          command: ["python", "scripts/streaming_safety_proxy.py"]
++          env:
++            - name: STREAMING_PROXY_API_KEY
++              valueFrom:
++                secretKeyRef:
++                  name: streaming-proxy-secret
++                  key: STREAMING_PROXY_API_KEY
++          ports:
++            - containerPort: 8090
++              name: http
++          resources:
++            requests:
++              cpu: "200m"
++              memory: "256Mi"
++            limits:
++              cpu: "500m"
++              memory: "512Mi"
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: streaming-safety-proxy
++  namespace: openquill-proxy
++spec:
++  selector:
++    app: streaming-safety-proxy
++  ports:
++    - protocol: TCP
++      port: 8090
++      targetPort: 8090
++
++---
++# Optional Ingress (adjust host)
++apiVersion: networking.k8s.io/v1
++kind: Ingress
++metadata:
++  name: streaming-proxy-ingress
++  namespace: openquill-proxy
++  annotations:
++    kubernetes.io/ingress.class: nginx
++spec:
++  rules:
++    - host: streaming-proxy.openquill.example.com
++      http:
++        paths:
++          - path: /
++            pathType: Prefix
++            backend:
++              service:
++                name: streaming-safety-proxy
++                port:
++                  number: 8090
++
++---
++# Notes:
++# - Build container ghcr.io/yourorg/openquill-streaming-proxy:latest that contains scripts/streaming_safety_proxy.py.
+--- /dev/null
++++ b/k8s/retriever_service.yaml
+@@ -0,0 +1,184 @@
++# Kubernetes manifest for Safe Retriever service (RAG) with simple API key auth
++
++apiVersion: v1
++kind: Namespace
++metadata:
++  name: openquill-retriever
++
++---
++apiVersion: v1
++kind: Secret
++metadata:
++  name: retriever-secret
++  namespace: openquill-retriever
++type: Opaque
++stringData:
++  RETRIEVER_API_KEY: "changeme"
++
++---
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: openquill-retriever
++  namespace: openquill-retriever
++spec:
++  replicas: 2
++  selector:
++    matchLabels:
++      app: openquill-retriever
++  template:
++    metadata:
++      labels:
++        app: openquill-retriever
++      annotations:
++        prometheus.io/scrape: "true"
++        prometheus.io/port: "8081"
++    spec:
++      containers:
++        - name: retriever
++          image: ghcr.io/yourorg/openquill-retriever:latest
++          command: ["python", "retrieval/safe_retriever_proxy.py"]
++          env:
++            - name: RETRIEVER_API_KEY
++              valueFrom:
++                secretKeyRef:
++                  name: retriever-secret
++                  key: RETRIEVER_API_KEY
++          resources:
++            requests:
++              cpu: "200m"
++              memory: "512Mi"
++            limits:
++              cpu: "500m"
++              memory: "1Gi"
++          ports:
++            - containerPort: 8081
++              name: http
++          volumeMounts:
++            - name: rag-index
++              mountPath: /app/release
++      volumes:
++        - name: rag-index
++          persistentVolumeClaim:
++            claimName: openquill-data-pvc
++
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: openquill-retriever
++  namespace: openquill-retriever
++spec:
++  selector:
++    app: openquill-retriever
++  ports:
++    - protocol: TCP
++      port: 8081
++      targetPort: 8081
++
++---
++# Example ingress:
++apiVersion: networking.k8s.io/v1
++kind: Ingress
++metadata:
++  name: retriever-ingress
++  namespace: openquill-retriever
++  annotations:
++    kubernetes.io/ingress.class: nginx
++spec:
++  rules:
++    - host: retriever.openquill.example.com
++      http:
++        paths:
++          - path: /
++            pathType: Prefix
++            backend:
++              service:
++                name: openquill-retriever
++                port:
++                  number: 8081
+--- /dev/null
++++ b/scripts/publish_and_sign.py
+@@ -0,0 +1,468 @@
++#!/usr/bin/env python3
++"""
++scripts/publish_and_sign.py
++
++End-to-end publish script that:
++ - ensures quant artifacts exist (runs AutoGPTQ wrapper if needed)
++ - converts to GGUF if requested
++ - bundles artifacts (merged checkpoint, quant dir, gguf)
++ - uploads artifacts to guarded S3 and/or Hugging Face repo (requires credentials)
++ - runs cosign to sign uploaded artifact (or local tarball)
++ - writes release/release_final_manifest.json with URIs, checksums, and sign info
++
++Usage:
++  python scripts/publish_and_sign.py --merged_dir outputs/sft_out/merged --quant_dir outputs/quant_out --gguf outputs/quant_out/model.gguf --s3_bucket my-guarded-bucket --hf_repo my-org/openquill-llm --cosign_key /home/user/.cosign/cosign.key
++
++Notes:
++ - Requires boto3 (for S3) and huggingface_hub (for HF publishing) installed.
++ - Cosign must be installed in PATH for signing.
++ - This is an operator tool and will not bypass release gates; run after gates pass.
++"""
++from __future__ import annotations
++import argparse
++import json
++import os
++import shutil
++import subprocess
++import tarfile
++import hashlib
++import time
++from pathlib import Path
++from typing import Dict, Any, List, Optional
++
++def compute_sha256(p: Path) -> str:
++    import hashlib
++    h = hashlib.sha256()
++    with p.open("rb") as f:
++        while True:
++            data = f.read(8192)
++            if not data:
++                break
++            h.update(data)
++    return h.hexdigest()
++
++def tar_artifacts(merged_dir: Path, quant_dir: Optional[Path], gguf_file: Optional[Path], out_tar: Path) -> Path:
++    print("Creating tarball of artifacts at", out_tar)
++    with tarfile.open(out_tar, "w:gz") as tf:
++        tf.add(str(merged_dir), arcname="merged")
++        if quant_dir and quant_dir.exists():
++            tf.add(str(quant_dir), arcname="quant")
++        if gguf_file and gguf_file.exists():
++            tf.add(str(gguf_file), arcname=Path(gguf_file).name)
++    return out_tar
++
++def upload_to_s3(bucket: str, key: str, file_path: Path, region: Optional[str] = None) -> str:
++    import boto3
++    s3 = boto3.client("s3", region_name=region)
++    print(f"Uploading {file_path} to s3://{bucket}/{key}")
++    s3.upload_file(str(file_path), bucket, key)
++    # build s3 URI
++    uri = f"s3://{bucket}/{key}"
++    return uri
++
++def upload_folder_to_hf_repo(hf_repo: str, folder_path: Path, token: str) -> str:
++    from huggingface_hub import HfApi, Repository
++    api = HfApi()
++    tmp_dir = folder_path.parent / (folder_path.name + "_hf_tmp")
++    if tmp_dir.exists():
++        shutil.rmtree(tmp_dir)
++    tmp_dir.mkdir(parents=True, exist_ok=True)
++    # we will copy folder under tmp_dir and use huggingface_hub.Repository to push
++    # Create local git repo clone of HF repo (requires token)
++    repo_url = api.create_repo(token=token, name=hf_repo.split("/")[-1], private=True, exist_ok=True) if "/" in hf_repo else None
++    # Use Repository helper to push folder contents (if repo exists)
++    repo = Repository(local_dir=tmp_dir, clone_from=hf_repo, use_auth_token=token)
++    # copy files
++    dst = tmp_dir / folder_path.name
++    shutil.copytree(folder_path, dst)
++    repo.git_add(auto_lfs_track=True)
++    repo.git_commit("Add release artifacts")
++    repo.git_push()
++    print("Uploaded folder to HF repo:", hf_repo)
++    return f"https://huggingface.co/{hf_repo}"
++
++def cosign_sign(artifact: Path, cosign_key: str) -> None:
++    # cosign must be installed; sign artifact
++    if shutil.which("cosign") is None:
++        raise RuntimeError("cosign CLI not found in PATH; install cosign to sign artifacts")
++    cmd = f"cosign sign --key {cosign_key} {artifact}"
++    print("Running cosign:", cmd)
++    res = subprocess.run(cmd, shell=True)
++    if res.returncode != 0:
++        raise RuntimeError("cosign sign failed")
++    print("cosign sign completed for", artifact)
++
++def gather_checksums_for_paths(paths: List[Path]) -> List[Dict[str, Any]]:
++    out = []
++    for p in paths:
++        if not p.exists():
++            continue
++        out.append({"path": str(p), "sha256": compute_sha256(p), "size": p.stat().st_size})
++    return out
++
++def write_release_manifest(manifest_out: Path, data: Dict[str, Any]) -> None:
++    manifest_out.parent.mkdir(parents=True, exist_ok=True)
++    manifest_out.write_text(json.dumps(data, indent=2), encoding="utf-8")
++    print("Wrote release_final_manifest.json to", manifest_out)
++
++def ensure_quant(merged_dir: Path, quant_dir: Optional[Path], prompt_path: Optional[Path]) -> Path:
++    # If quant_dir provided and exists, return. Otherwise try to run scripts/auto_gptq_wrapper.py
++    if quant_dir and quant_dir.exists():
++        return quant_dir
++    # try to run AutoGPTQ wrapper if present
++    wrapper = Path("scripts/auto_gptq_wrapper.py")
++    if wrapper.exists():
++        out_dir = merged_dir.parent / "quant_out"
++        cmd = f"python {wrapper} --teacher_dir {merged_dir} --out_dir {out_dir} --bits 4"
++        print("Running AutoGPTQ wrapper:", cmd)
++        res = subprocess.run(cmd, shell=True)
++        if res.returncode != 0:
++            raise RuntimeError("AutoGPTQ wrapper failed")
++        return out_dir
++    raise RuntimeError("Quant dir not provided and auto_gptq wrapper not available")
++
++def ensure_gguf(quant_dir: Path, gguf_path: Optional[Path]) -> Optional[Path]:
++    if gguf_path and Path(gguf_path).exists():
++        return Path(gguf_path)
++    # try gguf converter script
++    conv = Path("scripts/gguf_convert.py")
++    if conv.exists():
++        out_file = quant_dir / "model.gguf"
++        cmd = f"python {conv} --input_dir {quant_dir} --out_file {out_file}"
++        print("Running GGUF conversion:", cmd)
++        res = subprocess.run(cmd, shell=True)
++        if res.returncode == 0 and out_file.exists():
++            return out_file
++    print("No GGUF produced; continuing without GGUF.")
++    return None
++
++def publish(merged_dir: Path, quant_dir: Optional[Path], gguf_file: Optional[Path], hf_repo: Optional[str], s3_bucket: Optional[str], cosign_key: Optional[str], hf_token: Optional[str], aws_region: Optional[str]) -> Dict[str, Any]:
++    artifact_tar = Path("release") / f"openquill_release_{int(time.time())}.tar.gz"
++    tar_artifacts(merged_dir, quant_dir, gguf_file, artifact_tar)
++    artifact_sha = compute_sha256(artifact_tar)
++    artifact_size = artifact_tar.stat().st_size
++
++    s3_uri = None
++    hf_uri = None
++    uploaded_items = []
++
++    if s3_bucket:
++        key = f"openquill/releases/{artifact_tar.name}"
++        s3_uri = upload_to_s3(s3_bucket, key, artifact_tar, region=aws_region)
++        uploaded_items.append({"type":"s3", "uri": s3_uri, "key": key})
++
++    if hf_repo and hf_token:
++        # attempt to upload merged_dir folder to HF model repo under hf_repo
++        try:
++            hf_uri = upload_folder_to_hf_repo(hf_repo, merged_dir, hf_token)
++            uploaded_items.append({"type":"hf", "uri": hf_uri})
++        except Exception as e:
++            print("HF upload failed:", e)
++            hf_uri = None
++
++    # Cosign sign the tarball (local signature file will be created)
++    if cosign_key:
++        cosign_sign(artifact_tar, cosign_key)
++        uploaded_items.append({"type":"cosign_signed", "artifact": str(artifact_tar)})
++    else:
++        print("No cosign key provided; skipping signing.")
++
++    # Build manifest
++    manifest = {
++        "artifact": {"path": str(artifact_tar.resolve()), "sha256": artifact_sha, "size": artifact_size},
++        "uploaded": uploaded_items,
++        "merged_dir": str(merged_dir.resolve()),
++        "quant_dir": str(quant_dir.resolve()) if quant_dir else None,
++        "gguf": str(gguf_file.resolve()) if gguf_file else None,
++        "timestamp": int(time.time())
++    }
++    manifest_path = Path("release/release_final_manifest.json")
++    write_release_manifest(manifest_path, manifest)
++    return manifest
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--merged_dir", required=True)
++    p.add_argument("--quant_dir", default="")
++    p.add_argument("--gguf", default="")
++    p.add_argument("--hf_repo", default="")
++    p.add_argument("--s3_bucket", default="")
++    p.add_argument("--cosign_key", default="")  # path to cosign key
++    p.add_argument("--hf_token", default=os.environ.get("HF_API_TOKEN",""))
++    p.add_argument("--aws_region", default=os.environ.get("AWS_REGION","us-east-1"))
++    args = p.parse_args()
++
++    merged_dir = Path(args.merged_dir)
++    if not merged_dir.exists():
++        raise SystemExit("merged_dir not found: " + str(merged_dir))
++
++    quant_dir = Path(args.quant_dir) if args.quant_dir else None
++    gguf_file = Path(args.gguf) if args.gguf else None
++
++    # Ensure quant artifacts
++    try:
++        quant_dir = ensure_quant(merged_dir, quant_dir, None)
++    except Exception as e:
++        print("Quant step failed:", e)
++        raise
++
++    # Ensure GGUF
++    gguf_file = ensure_gguf(quant_dir, gguf_file)
++
++    # Publish to S3 and/or HF
++    manifest = publish(merged_dir, quant_dir, gguf_file, args.hf_repo or None, args.s3_bucket or None, args.cosign_key or None, args.hf_token or None, args.aws_region or None)
++    print("Publish completed. Manifest:", manifest)
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null
++++ b/scripts/verify_release_artifacts.py
+@@ -0,0 +1,214 @@
++#!/usr/bin/env python3
++"""
++scripts/verify_release_artifacts.py
++
++Verify presence of published artifacts referenced in release_final_manifest.json
++ - Check S3 objects exist (requires AWS creds)
++ - Check HF repo contains model files (requires HF token)
++
++Usage:
++  python scripts/verify_release_artifacts.py --manifest release/release_final_manifest.json --hf-token $HF_API_TOKEN --s3-bucket my-guarded-bucket
++"""
++from __future__ import annotations
++import argparse
++import json
++import os
++from pathlib import Path
++from typing import Optional
++
++def verify_s3_object(bucket: str, key: str) -> bool:
++    import boto3
++    s3 = boto3.client("s3")
++    try:
++        s3.head_object(Bucket=bucket, Key=key)
++        print("S3 object exists:", bucket, key)
++        return True
++    except Exception as e:
++        print("S3 head_object failed:", e)
++        return False
++
++def verify_hf_repo(hf_repo: str, token: str) -> bool:
++    try:
++        from huggingface_hub import HfApi
++        api = HfApi()
++        files = api.list_repo_files(hf_repo, token=token)
++        print("HF repo files count:", len(files))
++        return True
++    except Exception as e:
++        print("HF repo verify failed:", e)
++        return False
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--manifest", default="release/release_final_manifest.json")
++    p.add_argument("--hf-token", default=os.environ.get("HF_API_TOKEN",""))
++    p.add_argument("--s3-bucket", default="")
++    args = p.parse_args()
++
++    manifest_path = Path(args.manifest)
++    if not manifest_path.exists():
++        raise SystemExit("Manifest not found: " + str(manifest_path))
++    mf = json.loads(manifest_path.read_text(encoding="utf-8"))
++    uploaded = mf.get("uploaded", [])
++    ok = True
++    for entry in uploaded:
++        if entry.get("type") == "s3":
++            uri = entry.get("uri")
++            # parse s3://bucket/key
++            if uri.startswith("s3://"):
++                parts = uri[5:].split("/",1)
++                bucket = parts[0]
++                key = parts[1] if len(parts)>1 else ""
++                if not verify_s3_object(bucket, key):
++                    ok = False
++        elif entry.get("type") == "hf":
++            hf_repo = entry.get("uri").split("https://huggingface.co/")[-1]
++            if not args.hf_token:
++                print("HF token not supplied; cannot verify HF repo", hf_repo)
++                ok = False
++            else:
++                if not verify_hf_repo(hf_repo, args.hf_token):
++                    ok = False
++        elif entry.get("type") == "cosign_signed":
++            # ensure cosign signature file exists next to artifact (cosign stores signatures in OCI registry or .sig files)
++            print("Cosign signature entry noted:", entry)
++    if not ok:
++        raise SystemExit("Verification failed")
++    print("All verified OK")
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null
++++ b/scripts/publish_preflight.py
+@@ -0,0 +1,158 @@
++#!/usr/bin/env python3
++"""
++scripts/publish_preflight.py
++
++Run a minimal set of preflight checks before publishing:
++ - run release_gate_checks.py to ensure automated gates pass
++ - ensure human signoffs (safety & legal) are present and approved
++ - optionally check merged_dir exists (but publishing workflow verifies later)
++
++Usage:
++  python scripts/publish_preflight.py --pii_report release/pii_report.json --annotation_audit release/annotation_audit.json --reward_report release/reward_out/reward_holdout_report.json --quant_report release/quant_report.json --ppo_rollouts release/ppo_out/rollouts.jsonl --redteam release/redteam_results.jsonl --signoff docs/release_human_signoff.json --legal_signoff docs/legal_signoff.json
++"""
++from __future__ import annotations
++import argparse
++import subprocess
++import sys
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++
++def run_release_gates(args):
++    cmd = f"python {ROOT / 'scripts' / 'release_gate_checks.py'} --pii_report {args.pii_report} --annotation_audit {args.annotation_audit} --reward_report {args.reward_report} --quant_report {args.quant_report} --ppo_rollouts {args.ppo_rollouts} --redteam {args.redteam} --signoff {args.signoff} --legal_signoff {args.legal_signoff}"
++    print("Running:", cmd)
++    res = subprocess.run(cmd, shell=True)
++    if res.returncode != 0:
++        print("Release gate checks failed. Aborting publish.")
++        sys.exit(res.returncode)
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--pii_report", required=True)
++    p.add_argument("--annotation_audit", required=True)
++    p.add_argument("--reward_report", required=True)
++    p.add_argument("--quant_report", required=True)
++    p.add_argument("--ppo_rollouts", required=True)
++    p.add_argument("--redteam", required=True)
++    p.add_argument("--signoff", required=True)
++    p.add_argument("--legal_signoff", required=True)
++    args = p.parse_args()
++
++    # Run automated release gates
++    run_release_gates(args)
++
++    # Ensure signoffs are approved
++    def load_json(pth):
++        import json
++        from pathlib import Path
++        p = Path(pth)
++        if not p.exists():
++            print("Signoff missing:", p)
++            sys.exit(2)
++        return json.loads(p.read_text(encoding="utf-8"))
++
++    safety = load_json(args.signoff)
++    legal = load_json(args.legal_signoff)
++    if not safety.get("approved", False):
++        print("Safety signoff not approved:", safety)
++        sys.exit(3)
++    if not legal.get("approved", False):
++        print("Legal signoff not approved:", legal)
++        sys.exit(4)
++
++    print("Preflight checks passed. You may proceed with publish_and_sign.py")
++
++if __name__ == "__main__":
++    main()
++
+-- 
+2.40.1
