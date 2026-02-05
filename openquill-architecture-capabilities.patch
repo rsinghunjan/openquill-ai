@@ -1,0 +1,622 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Arch Bot <arch@example.com>
+Date: 2026-03-16 00:00:00 +0000
+Subject: [PATCH] architecture & capabilities: vision encoder, q-former conditioning helpers, multilingual RAG, retriever tool controller, long-context enablement notes, training adapter, and design doc
+---
+ docs/architecture_design.md                           | 312 ++++++++++++++++++++++++++++++
+ vision/clip_encoder.py                                | 200 +++++++++++++++
+ models/qformer_conditioning.py                        | 254 +++++++++++++++++++++++
+ training/multimodal_training_adapter.py               | 314 +++++++++++++++++++++++++++++
+ retrieval/multilingual_rag.py                         | 276 +++++++++++++++++++++++++++++
+ tool_controller/retriever_tool_controller.py          | 178 ++++++++++++++++++
+ scripts/enable_long_context.sh                        | 102 +++++++++
+ 7 files changed, 1636 insertions(+)
+ create mode 100644 docs/architecture_design.md
+ create mode 100644 vision/clip_encoder.py
+ create mode 100644 models/qformer_conditioning.py
+ create mode 100644 training/multimodal_training_adapter.py
+ create mode 100644 retrieval/multilingual_rag.py
+ create mode 100644 tool_controller/retriever_tool_controller.py
+ create mode 100755 scripts/enable_long_context.sh
+--- /dev/null
++++ b/docs/architecture_design.md
+@@ -0,0 +1,312 @@
++# OpenQuill — Architecture & Capabilities Design (Multimodal, Long-Context, Safety-First)
++
++This document describes the architecture and key components that implement the design you requested:
++multimodal inputs, long context (RAG + optional native long windows), realtime safe retrieval, efficiency via QLoRA/PEFT + quantization, multilingual retrieval, and safety-first deployment + governance.
++
++High-level components
++- Vision encoder (frozen): CLIP / ViT used to produce image patch embeddings.
++- Q‑Former adapter (BLIP‑2 style): small cross-attention module that converts image tokens to a small set of query tokens (learned).
++- LM conditioning: Q‑Former outputs are projected to the LM embedding space (or represented as auxiliary embeddings) and prepended/injected into the LM input stream. We train Q‑Former + LoRA adapters while keeping the big vision encoder frozen.
++- SFT & PEFT training: QLoRA (8-bit) + LoRA adapters for cheap SFT on the 7B class base. Merge LoRA into candidate checkpoint for evaluation/publishing.
++- RLHF & safety pipeline: annotation service, reward model (holdout), conservative PPO pilot, HIL queue, red-team, PII scanning and dataset licensing checks.
++- Long-context: RAG index (FAISS or Milvus) for retrieval-augmented generation. Optional native long-context path (FlashAttention + xformers / sliding windows) for on-device extended context.
++- Real-time data access: Streaming safety proxy (whitelist, rate limiting, provenance) → retriever → tool controller pattern. Avoid direct arbitrary web access.
++- Quantization: AutoGPTQ wrapper producing 4/8-bit quant variants; optional GGUF conversion for local runtimes.
++- Serving: vLLM/TGI multi-GPU for production; a lightweight multimodal dev server provided for staging.
++- Multilingual: multilingual embeddings and multilingual SFT dataset + evaluation.
++
++How multimodal conditioning works (MVP)
++1. Vision encoder (frozen) extracts patch/region embeddings: shape (B, N, vision_dim).
++2. Q‑Former adapter takes these (B, N, vision_dim) and produces (B, Q, hidden_dim) learned query tokens.
++3. Project Q‑Former outputs into the LM token embedding space (or feed as auxiliary embeddings via custom forward).
++4. Prepend or interleave these embeddings with the token embeddings and run the LM forward pass (the repo contains conditioning helper and example glue).
++5. Train only Q‑Former + LoRA adapter parameters (and optionally a small projection) using multimodal SFT data.
++
++RAG vs native long context
++- RAG (recommended MVP):
++  - Chunk documents, index with FAISS or Milvus. Retrieve top-k relevant chunks, attach them (with provenance) to the prompt before generation.
++  - Advantages: cheap, auditable provenance, safe (retriever controls source).
++- Native long context (optional):
++  - Use FlashAttention, xformers and tuned transformer implementations to increase context windows (8k, 16k, 32k).
++  - Advantages: single-pass long context, lower retrieval latency for some workloads.
++  - Caveats: larger memory footprint, potential for more hallucinations if context not curated.
++
++Real-time data design
++- Provide a Streaming Safety Proxy that only allows calls to whitelisted external APIs (rate-limited, proto-logged, cached).
++- Prefer retrieval-first: treat external data sources as retriever-backed documents. Use the retrieval tool controller to fetch and attach sanitized results to prompts.
++- Log all external requests (provenance for audit and incident response).
++
++Training recipe (concise)
++- Input formats:
++  - Text-only SFT items: JSONL with instruction/input/output
++  - Multimodal SFT items: JSONL with "image" (path or URI), "instruction", "input", "output"
++- Preprocessing gates:
++  - Deduplication, license tagging, PII scan & redaction (block SFT until remediated).
++- SFT:
++  - Use QLoRA/PEFT (LoRA r=8..32) with bf16 on 4×A100 (defaults included). Train Q‑Former + LoRA adapters only.
++  - Save LoRA adapters; produce merged checkpoint with merge_lora helper.
++- RLHF:
++  - Collect annotator pairs with gold tests, run annotation QC, train reward model with holdout, evaluate ROC-AUC.
++  - Run conservative PPO pilot (PPO_shaped) and export rollouts for HIL.
++
++Safety & governance (required)
++- Automate gating (PII scan, annotation QC, reward AUC, quant_eval).
++- Human gates: safety & legal signoff via signoff service or release_human_signoff.json.
++- Red-team campaigns must run on staging and be reviewed.
++- Keep release artifacts in guarded S3 or private HF repo and cosign-signed.
++
++Multilingual strategy
++- Use multilingual embedding model for retrieval (e.g., LaBSE or sentence-transformers multilingual models).
++- Include multilingual SFT + MLPerf-like evaluation subsets.
++
++Serving & ops
++- Staging manifest and warmup/smoke jobs included in repo. Use Gatekeeper + cosign for image and artifact policy enforcement.
++- For production inference use vLLM/TGI with GPU pooling and autoscaling; provide GGUF/ggml options for self-hosted CPU inference.
++
++Evaluation & acceptance
++- Provide benchmarks for reasoning, coding and multimodal tasks. Acceptance thresholds must be set by your org (suggestions included).
++
++Next steps & artifacts included in repo
++- Vision encoder loader & feature extractor
++- Q‑Former adapter scaffold + conditioning helpers
++- Multilingual RAG wrapper & index builder
++- Retriever tool controller for retrieval-first prompts
++- Long-context enablement notes & install script for FlashAttention/xformers
++- Training adapter scaffold for joint Q‑Former + LoRA SFT
++- Safety-first design and gating hooks
++
++If you want, I will:
++- Produce a tuned training manifest for your exact GPU SKU and dataset size.
++- Expand Q‑Former into a full BLIP-2 cross-attention implementation (more advanced).
++- Add a lightweight HIL web UI that lets reviewers inspect rollouts and create signoff.
++
++Choose next action: "tune configs" | "expand qformer" | "create HIL UI" | "generate runbook script" — I will generate the patch.
++
+--- /dev/null
++++ b/vision/clip_encoder.py
+@@ -0,0 +1,200 @@
++"""
++vision/clip_encoder.py
++
++Small helper to load a CLIP / ViT image encoder and extract patch or pooled embeddings.
++This code prefers transformers' CLIPImageModel + CLIPProcessor but falls back to torchvision if not available.
++
++Usage:
++  from vision.clip_encoder import load_vision_encoder, image_to_embeddings
++  model, proc = load_vision_encoder("openai/clip-vit-base-patch32", device="cuda")
++  emb = image_to_embeddings(model, proc, "data/images/1.jpg", device="cuda")
++"""
++from __future__ import annotations
++from pathlib import Path
++from typing import Tuple, Optional
++import torch
++
++def load_vision_encoder(name: str = "openai/clip-vit-base-patch32", device: str = "cpu"):
++    """
++    Load CLIP image model + processor. Returns (model, processor).
++    Processor may be None if fallback used.
++    """
++    try:
++        from transformers import CLIPImageModel, CLIPProcessor
++        model = CLIPImageModel.from_pretrained(name).to(device)
++        proc = CLIPProcessor.from_pretrained(name)
++        return model, proc
++    except Exception as e:
++        # Fallback to torchvision/resnet
++        try:
++            import torchvision.transforms as transforms
++            from torchvision.models import resnet50
++            model = resnet50(pretrained=True).to(device)
++            proc = None
++            return model, proc
++        except Exception:
++            raise RuntimeError("No vision encoder available (install transformers or torchvision).") from e
++
++def image_to_embeddings(model, processor, image_path: str, device: str = "cpu", return_pooled: bool = True):
++    """
++    Convert image to embeddings.
++    - If processor is provided (CLIP), returns CLIP image features (1, dim)
++    - If processor is None and model is torchvision, returns last-layer pooled features.
++    """
++    from PIL import Image
++    img = Image.open(image_path).convert("RGB")
++    if processor is not None:
++        inputs = processor(images=img, return_tensors="pt")
++        pixel_values = inputs["pixel_values"].to(device)
++        with torch.no_grad():
++            feats = model.get_image_features(pixel_values)  # (1, dim)
++        return feats  # torch tensor
++    else:
++        # manual transform pipeline
++        import torchvision.transforms as transforms
++        transf = transforms.Compose([
++            transforms.Resize((224,224)),
++            transforms.ToTensor(),
++            transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
++        ])
++        t = transf(img).unsqueeze(0).to(device)
++        with torch.no_grad():
++            out = model(t)
++            # try to pool spatial dims if present
++            if out.ndim == 4:
++                out = out.mean(dim=[2,3])
++        return out
++
++def images_to_patch_embeddings(model, processor, image_paths: list[str], device: str = "cpu"):
++    """
++    Extract per-image patch/region embeddings if the vision encoder supports per-patch features.
++    For CLIP ViT, you can access intermediate outputs; here we attempt the simplest route: use get_image_features.
++    """
++    embs = []
++    for p in image_paths:
++        e = image_to_embeddings(model, processor, p, device=device)
++        embs.append(e)
++    return torch.cat(embs, dim=0)
++
++if __name__ == "__main__":
++    # quick smoke test (requires internet for model download or local cache)
++    m,p = load_vision_encoder(device="cpu")
++    emb = image_to_embeddings(m, p, __file__, device="cpu")
++    print("Embedding shape:", emb.shape)
+--- /dev/null
++++ b/models/qformer_conditioning.py
+@@ -0,0 +1,254 @@
++"""
++models/qformer_conditioning.py
++
++Helpers to project Q-Former query tokens into LM embedding space and build conditioned inputs.
++This file provides utilities that make it easier to wire Q-Former outputs into existing HF LMs
++without requiring a full model reimplementation. It produces a structure that a custom model
++forward can accept (input_ids + q_token_embeddings).
++
++Note: integrating q_token_embeddings requires modifying the LM forward to accept an auxiliary
++embedding tensor or to patch the embedding layer. The repo's training scaffolds demonstrate
++how to combine them in the Trainer.
++"""
++from __future__ import annotations
++import torch
++import torch.nn as nn
++from typing import Optional
++
++class QFormerToLMProjector(nn.Module):
++    """
++    Project Q-Former outputs (Q x Hq) into LM embedding dim (D)
++    so they can be concatenated with token embeddings.
++    """
++    def __init__(self, qformer_hidden_dim: int, lm_embedding_dim: int):
++        super().__init__()
++        self.proj = nn.Linear(qformer_hidden_dim, lm_embedding_dim)
++        # Optional small adapter
++        self.ln = nn.LayerNorm(lm_embedding_dim)
++
++    def forward(self, q_tokens: torch.Tensor) -> torch.Tensor:
++        # q_tokens: (B, Q, Hq) -> returns (B, Q, D)
++        x = self.proj(q_tokens)
++        x = self.ln(x)
++        return x
++
++def build_inputs_with_qtokens(tokenizer, prompt: str, q_token_embeddings: Optional[torch.Tensor], device="cpu", max_length: int = 2048):
++    """
++    Convenience to create input_ids attention masks, and a placeholder q_token_embeddings tensor.
++    Returns a dict with:
++      - input_ids (torch.LongTensor)
++      - attention_mask (torch.LongTensor)
++      - q_token_embeddings (torch.FloatTensor or None)  # (B, Q, D)
++
++    Note: the Trainer / model must be adapted to accept q_token_embeddings.
++    """
++    inputs = tokenizer(prompt, truncation=True, padding="longest", max_length=max_length, return_tensors="pt")
++    if q_token_embeddings is not None:
++        # ensure on device
++        q_token_embeddings = q_token_embeddings.to(device)
++    # move input tensors to device later in training loop
++    return {
++        "input_ids": inputs["input_ids"],
++        "attention_mask": inputs["attention_mask"],
++        "q_token_embeddings": q_token_embeddings
++    }
++
++def inject_qtoken_embeddings_into_embedding_matrix(lm_model, input_ids: torch.LongTensor, q_token_embeddings: torch.Tensor):
++    """
++    Example helper that shows how to concatenate q_token_embeddings with token embeddings
++    and run a forward pass. This requires low-level access to model embeddings and generate logic.
++
++    This is a demonstration; production code should implement a cleaner interface in the model class.
++    """
++    # token embeddings
++    embed = lm_model.get_input_embeddings()  # nn.Embedding
++    token_embs = embed(input_ids)  # (B, T, D)
++    # q_token_embeddings: (B, Q, D)
++    # Build combined embeddings sequence: [Qtokens] + [tokens]
++    combined = torch.cat([q_token_embeddings, token_embs], dim=1)  # (B, Q+T, D)
++    # attention mask must be expanded accordingly by caller
++    # to run the LM forward, we need to bypass the model's internal embedding lookup.
++    # For autoregressive models, one approach is to patch lm_model.forward to accept 'inputs_embeds'
++    outputs = lm_model(inputs_embeds=combined)
++    return outputs
++
++if __name__ == "__main__":
++    # quick smoke test
++    from models.q_former_adapter import QFormerAdapterConfig, QFormerAdapter
++    from transformers import AutoTokenizer, AutoModelForCausalLM
++    cfg = QFormerAdapterConfig()
++    qf = QFormerAdapter(cfg)
++    fake_vis = torch.randn(1, 49, cfg.vision_dim)
++    qtok = qf(fake_vis)  # (1, Q, H)
++    projector = QFormerToLMProjector(cfg.hidden_dim, 1024)
++    proj = projector(qtok)
++    print("Projected qtoken shape:", proj.shape)
+--- /dev/null
++++ b/training/multimodal_training_adapter.py
+@@ -0,0 +1,314 @@
++#!/usr/bin/env python3
++"""
++training/multimodal_training_adapter.py
++
++Training scaffold to jointly train Q‑Former adapter + LoRA adapters on multimodal SFT data.
++This script demonstrates how to:
++ - load a frozen vision encoder (CLIP)
++ - load / instantiate Q‑Former adapter
++ - project Q‑Former outputs into LM embedding space
++ - attach q_token_embeddings to training batches (requires Trainer to feed inputs_embeds)
++
++This is an example that complements scripts/run_multimodal_sft.sh; use it when you need explicit control.
++"""
++from __future__ import annotations
++import argparse
++from pathlib import Path
++import torch
++from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer
++from training.multimodal_dataset import MultimodalSFTDataset, multimodal_collate
++from models.q_former_adapter import QFormerAdapter, QFormerAdapterConfig
++from models.qformer_conditioning import QFormerToLMProjector
++from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
++
++class MultimodalTrainer(Trainer):
++    """
++    Minimal Trainer override that forwards q_token_embeddings into model forward by passing inputs_embeds.
++    Expects the dataset collate to return 'q_token_embeddings' per batch (or None).
++    """
++    def compute_loss(self, model, inputs, return_outputs=False):
++        # inputs: input_ids, attention_mask, labels, images(optional), q_token_embeddings
++        q_emb = inputs.pop("q_token_embeddings", None)
++        images = inputs.pop("images", None)
++        # If q_emb is present, obtain inputs_embeds by projecting token ids
++        if q_emb is not None:
++            # get token embeddings for input_ids
++            embed = model.get_input_embeddings()
++            token_embs = embed(inputs["input_ids"])
++            # concatenate q_emb (B,Q,D) + token_embs (B,T,D)
++            inputs_embeds = torch.cat([q_emb, token_embs], dim=1)
++            # patch attention_mask to account for q tokens
++            q_mask = torch.ones(q_emb.size()[:2], dtype=inputs["attention_mask"].dtype, device=inputs["attention_mask"].device)
++            attention_mask = torch.cat([q_mask, inputs["attention_mask"]], dim=1)
++            outputs = model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=inputs.get("labels"))
++        else:
++            outputs = model(**inputs)
++        loss = outputs.loss
++        return (loss, outputs) if return_outputs else loss
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--model", default="togethercomputer/RedPajama-INCITE-7B-Instruct")
++    parser.add_argument("--data_jsonl", default="data/multimodal_sft.jsonl")
++    parser.add_argument("--out", default="outputs/multimodal_sft_adapter")
++    parser.add_argument("--per_device_train_batch_size", type=int, default=4)
++    parser.add_argument("--max_steps", type=int, default=20000)
++    args = parser.parse_args()
++
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
++    if tokenizer.pad_token_id is None:
++        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
++
++    dataset = MultimodalSFTDataset(args.data_jsonl, tokenizer, image_size=224, max_length=2048)
++
++    # Vision encoder (frozen)
++    from vision.clip_encoder import load_vision_encoder
++    vis_model, vis_processor = load_vision_encoder(device=device)
++    vis_model.eval()
++    for p in vis_model.parameters():
++        p.requires_grad = False
++
++    # Q-Former adapter
++    qcfg = QFormerAdapterConfig()
++    qf = QFormerAdapter(qcfg).to(device)
++
++    # Projector from qf hidden dim -> LM embedding dim
++    # Discover LM embedding dim by instantiating model embeddings
++    base_model = AutoModelForCausalLM.from_pretrained(args.model, low_cpu_mem_usage=True)
++    lm_emb_dim = base_model.get_input_embeddings().embedding_dim
++    projector = QFormerToLMProjector(qcfg.hidden_dim, lm_emb_dim).to(device)
++
++    # Apply LoRA to base model (PEFT)
++    base_model = prepare_model_for_kbit_training(base_model)
++    lora_cfg = LoraConfig(r=8, lora_alpha=32, target_modules=["q_proj","k_proj","v_proj","o_proj"], lora_dropout=0.05, bias="none", task_type="CAUSAL_LM")
++    model = get_peft_model(base_model, lora_cfg)
++    model.to(device)
++
++    # Training args
++    training_args = TrainingArguments(
++        output_dir=args.out,
++        overwrite_output_dir=True,
++        per_device_train_batch_size=args.per_device_train_batch_size,
++        gradient_accumulation_steps=8,
++        max_steps=args.max_steps,
++        bf16=torch.cuda.is_available(),
++        fp16=False,
++        logging_steps=50,
++        save_steps=1000,
++    )
++
++    # Data collate: produce q_token_embeddings on-the-fly
++    def collate_with_qtokens(batch):
++        # reuse multimodal_collate to get tokens and images
++        coll = multimodal_collate(batch, tokenizer, max_length=2048, device=device)
++        images = coll.pop("images", None)
++        if images is not None:
++            # pass images through frozen vision encoder to get image features (B,N,vision_dim)
++            with torch.no_grad():
++                # use CLIP feature pipeline when available
++                try:
++                    # The CLIP model we used earlier returns pooled features; if you need patch features,
++                    # modify vision.clip_encoder to return intermediate patch outputs.
++                    img_feats = vis_model.get_image_features(images)
++                except Exception:
++                    img_feats = vis_model(images)
++            # run qformer
++            q_tokens = qf(img_feats)  # (B,Q,H)
++            # project to LM embedding dim
++            q_proj = projector(q_tokens)  # (B,Q,D)
++            coll["q_token_embeddings"] = q_proj
++        else:
++            coll["q_token_embeddings"] = None
++        return coll
++
++    trainer = MultimodalTrainer(model=model, args=training_args, train_dataset=dataset, data_collator=collate_with_qtokens)
++    trainer.train()
++    trainer.save_model(args.out)
++    tokenizer.save_pretrained(args.out)
++    # save q-former and projector
++    torch.save(qf.state_dict(), Path(args.out) / "q_former.pt")
++    torch.save(projector.state_dict(), Path(args.out) / "q_proj.pt")
++    print("Training complete. Artifacts in", args.out)
++
++if __name__ == "__main__":
++    main()
++
+--- /dev/null
++++ b/retrieval/multilingual_rag.py
+@@ -0,0 +1,276 @@
++"""
++retrieval/multilingual_rag.py
++
++Multilingual RAG wrapper supporting FAISS (local) or Milvus (optional).
++Selects an embedding model appropriate for multilingual retrieval (LaBSE, multilingual-MiniLM).
++"""
++from __future__ import annotations
++from pathlib import Path
++from typing import List, Tuple, Optional
++import json
++import numpy as np
++try:
++    import faiss
++except Exception:
++    faiss = None
++
++from sentence_transformers import SentenceTransformer
++
++DEFAULT_MULTILINGUAL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"  # good multilingual encoder
++DEFAULT_MONO = "sentence-transformers/all-MiniLM-L6-v2"
++
++class MultilingualRAG:
++    def __init__(self, embed_model: Optional[str] = None, index_path: str = "release/faiss_multilingual.index", docs_path: str = "release/docs_multilingual.jsonl"):
++        self.embed_model_name = embed_model or DEFAULT_MULTILINGUAL
++        self.model = SentenceTransformer(self.embed_model_name)
++        self.index_path = Path(index_path)
++        self.docs_path = Path(docs_path)
++        self.index = None
++        self.docs = []
++
++    def build(self, chunks: List[str], metas: List[dict]):
++        embs = self.model.encode(chunks, show_progress_bar=True, convert_to_numpy=True)
++        if faiss is None:
++            raise RuntimeError("faiss not installed. Install faiss-cpu or faiss-gpu.")
++        dim = embs.shape[1]
++        index = faiss.IndexFlatIP(dim)
++        faiss.normalize_L2(embs)
++        index.add(embs)
++        faiss.write_index(index, str(self.index_path))
++        with open(self.docs_path, "w", encoding="utf-8") as f:
++            for m in metas:
++                f.write(json.dumps(m, ensure_ascii=False) + "\n")
++        print("Wrote multilingual index and docs")
++
++    def load(self):
++        if not self.index_path.exists():
++            raise FileNotFoundError(self.index_path)
++        if faiss is None:
++            raise RuntimeError("faiss not installed.")
++        self.index = faiss.read_index(str(self.index_path))
++        self.docs = [json.loads(l) for l in self.docs_path.read_text(encoding="utf-8").splitlines() if l.strip()]
++
++    def retrieve(self, query: str, k: int = 5) -> List[Tuple[dict, float]]:
++        if self.index is None:
++            self.load()
++        q_emb = self.model.encode([query], convert_to_numpy=True)
++        faiss.normalize_L2(q_emb)
++        D, I = self.index.search(q_emb, k)
++        results = []
++        for idx, score in zip(I[0], D[0]):
++            if idx < 0 or idx >= len(self.docs):
++                continue
++            results.append((self.docs[idx], float(score)))
++        return results
++
++    def add_documents(self, docs: List[str], metas: List[dict]):
++        """
++        Append documents to an existing index in memory and write out index+docs.
++        Note: For large corpora prefer incremental indexes or a vector DB.
++        """
++        embs = self.model.encode(docs, convert_to_numpy=True)
++        if self.index is None:
++            dim = embs.shape[1]
++            if faiss is None:
++                raise RuntimeError("faiss not installed")
++            self.index = faiss.IndexFlatIP(dim)
++            self.docs = []
++        faiss.normalize_L2(embs)
++        self.index.add(embs)
++        self.docs.extend(metas)
++        faiss.write_index(self.index, str(self.index_path))
++        with open(self.docs_path, "a", encoding="utf-8") as f:
++            for m in metas:
++                f.write(json.dumps(m, ensure_ascii=False) + "\n")
++
++if __name__ == "__main__":
++    # quick demo
++    chunks = ["This document is in English about deployment.", "Ceci est un document en français."]
++    metas = [{"text":chunks[0], "source":"en.txt"},{"text":chunks[1],"source":"fr.txt"}]
++    r = MultilingualRAG()
++    r.build(chunks, metas)
++    print(r.retrieve("How to deploy OpenQuill?", k=2))
++    print(r.retrieve("Comment déployer OpenQuill?", k=2))
++
+--- /dev/null
++++ b/tool_controller/retriever_tool_controller.py
+@@ -0,0 +1,178 @@
++"""
++tool_controller/retriever_tool_controller.py
++
++Small "retrieval-first" tool controller:
++ - Accepts user prompt
++ - Uses a SafeRetriever / RAG to retrieve top-k chunks
++ - Builds an augmented prompt with provenance header + retrieved chunks
++ - Returns augmented prompt and provenance metadata for logging
++
++This keeps external calls auditable and places retrieval before generation.
++"""
++from __future__ import annotations
++from typing import Tuple, List, Dict
++from retrieval.safe_retriever_proxy import SafeRetriever
++from retrieval.multilingual_rag import MultilingualRAG
++
++def build_augmented_prompt(prompt: str, retriever: SafeRetriever, k: int = 3, client_id: str = "user"):
++    """
++    Query retriever and compose an augmented prompt. Returns (augmented_prompt, provenance).
++    provenance includes sources and scores.
++    """
++    results, prov = retriever.retrieve(prompt, k=k, client_id=client_id)
++    # Compose retrieved texts into a provenance block
++    retrieved_texts = []
++    sources = []
++    for (doc, score) in results:
++        text = doc.get("text") or doc.get("content") or ""
++        src = doc.get("source") or "unknown"
++        retrieved_texts.append(f"Source: {src}\n{str(text)}\n---")
++        sources.append({"source": src, "score": float(score)})
++    if retrieved_texts:
++        retrieval_block = "\n".join(retrieved_texts)
++        augmented = f"Retrieved evidence (top {k}):\n{retrieval_block}\nUser prompt:\n{prompt}"
++    else:
++        augmented = prompt
++    provenance = {"sources": sources}
++    return augmented, provenance
++
++if __name__ == "__main__":
++    # demo usage with SimpleRAG wrapped by SafeRetriever
++    from retrieval.rag_retriever import SimpleRAG
++    r = SimpleRAG()
++    chunks = ["Doc about deployment","Another doc about datasets"]
++    metas = [{"text":c,"source":f"doc{i}"} for i,c in enumerate(chunks)]
++    r.build(chunks, metas)
++    from retrieval.safe_retriever_proxy import SafeRetriever
++    s = SafeRetriever(r)
++    aug, prov = build_augmented_prompt("How to deploy?", s)
++    print("Augmented prompt:\n", aug)
++    print("Provenance:", prov)
++
+--- /dev/null
++++ b/scripts/enable_long_context.sh
+@@ -0,0 +1,102 @@
++#!/usr/bin/env bash
++set -euo pipefail
++#
++# scripts/enable_long_context.sh
++#
++# Helper script & notes to enable native long-context (FlashAttention/xformers) on your environment.
++# This script performs checks and prints recommended install commands.
++#
++echo "Checking for FlashAttention and xformers support..."
++if python -c "import torch, sys; print(torch.__version__)" >/dev/null 2>&1; then
++  echo "PyTorch present."
++else
++  echo "PyTorch not found. Install appropriate CUDA build (see https://pytorch.org)."
++fi
++
++python - <<PY
++import importlib, sys
++def check(pkg):
++    try:
++        importlib.import_module(pkg)
++        print(pkg, "OK")
++    except Exception as e:
++        print(pkg, "MISSING:", e)
++check("flash_attn")
++check("xformers")
++check("einops")
++check("transformers")
++PY
++
++echo
++echo "If flash_attn or xformers are missing, follow these suggestions (choose the one that fits your CUDA/toolchain):"
++echo
++echo "1) FlashAttention (pip wheels available for many CUDA versions):"
++echo "   pip install flash-attn --extra-index-url https://download.pytorch.org/whl/cu118"
++echo
++echo "2) xFormers (may require building from source or using prebuilt wheels):"
++echo "   pip install xformers"
++echo
++echo "3) Install optimized transformer libs and enable in your accelerate/deepspeed configs:"
++echo "   - Use configs that enable 'use_flash_attention' or 'use_xformers' flags in your training runtime"
++echo
++echo "Notes:"
++echo " - Native long-context (32k) also requires model architecture support (rotary embeddings, long-form attention variants)."
++echo " - Start with RAG for long-context; enable native long windows only after testing with FlashAttention and memory profiling."
++exit 0
++
+-- 
+2.40.1
