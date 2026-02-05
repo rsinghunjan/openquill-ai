@@ -1,0 +1,241 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenQuill Models Bot <models@example.com>
+Date: 2026-03-15 00:00:00 +0000
+Subject: [PATCH] add recommended base models list, docs and helper to choose & license-check base models
+---
+ configs/base_models.yaml                              |  40 ++++++++++
+ docs/recommended_base_models.md                       | 182 +++++++++++++++++++++++++++++++
+ scripts/pick_base_model.py                             | 232 +++++++++++++++++++++++++++++++++++++
+ 3 files changed, 454 insertions(+)
+ create mode 100644 configs/base_models.yaml
+ create mode 100644 docs/recommended_base_models.md
+ create mode 100755 scripts/pick_base_model.py
+--- /dev/null
++++ b/configs/base_models.yaml
+@@ -0,0 +1,40 @@
++# Base model recommendations for OpenQuill
++# Edit with care — used by scripts/pick_base_model.py
++models:
++  - id: "togethercomputer/RedPajama-INCITE-7B-Instruct"
++    display_name: "RedPajama INCITE 7B Instruct"
++    params: 7_000_000_000
++    recommended_for:
++      - "MVP"
++      - "multimodal SFT"
++    license_note: "Open weights (check HF model card for exact license). Good instruction baseline and community adoption."
++    notes: "Strong default for multimodal + instruction tuning; good balance of capability and cost."
++
++  - id: "mistralai/mistral-7b"
++    display_name: "Mistral 7B"
++    params: 7_000_000_000
++    recommended_for:
++      - "Alternative"
++      - "high-efficiency"
++    license_note: "Often permissive, but verify license on HF before deriving/publishing."
++    notes: "Very performant for its size; verify downstream redistribution permissions."
++
++  - id: "facebook/opt-1.3b"
++    display_name: "OPT 1.3B (example efficiency)"
++    params: 1_300_000_000
++    recommended_for:
++      - "efficiency"
++    license_note: "Open-weight; smaller footprint for constrained inference and fast prototyping."
++    notes: "Lower capability but much cheaper to run; useful for edge or testing."
++
++  - id: "EleutherAI/gpt-neox-20b"
++    display_name: "GPT-NeoX 20B (example larger)"
++    params: 20_000_000_000
++    recommended_for:
++      - "high-capability (if resources available)"
++    license_note: "Large model; requires large resources and license review."
++    notes: "Include only if you plan full-scale training and have cluster resources."
++
+--- /dev/null
++++ b/docs/recommended_base_models.md
+@@ -0,0 +1,182 @@
++# Recommended base models for OpenQuill
++
++This document lists recommended open‑weight base models and explains when to use each.
++It also explains how to verify license compatibility before deriving and publishing weights.
++
++Summary recommendations (MVP defaults)
++- Primary (recommended MVP):
++  - togethercomputer/RedPajama-INCITE-7B-Instruct
++  - Why: open weights, strong instruction baseline, good capability per compute cost for a 7B solution.
++  - Use case: multimodal + instruction tuning, SFT + RLHF prototype, efficient inference after quantization.
++
++- Alternative (high-efficiency / capability):
++  - mistralai/mistral-7b
++  - Why: excellent efficiency and strong performance for its size.
++  - Caveat: verify license terms on Hugging Face model card before redistribution.
++
++- Efficiency options (smaller / faster):
++  - OPT / GPT-NeoX / distilled community models (e.g., OPT 1.3B)
++  - Why: lower resource needs for development, edge, or constrained inference.
++  - Caveat: capability will be lower; use for testing or serving low-cost variants.
++
++Why license checks matter
++- Derived models inherit obligations from the base model license. If the base model prohibits redistribution
++  or restricts commercial use, you must not publish derived weights in violation of that license.
++- Always run a license check and obtain legal approval before publishing a derived model.
++
++Files added
++- configs/base_models.yaml — curated list of recommended base models, quick metadata.
++- scripts/pick_base_model.py — helper CLI to list recommendations and run a license check for a selected HF model (uses scripts/license_check.py).
++
++Quick commands
++- List recommended models:
++  python scripts/pick_base_model.py --list
++
++- Recommend a model for MVP:
++  python scripts/pick_base_model.py --recommend mvp
++
++- Check license for a specific HF model id:
++  python scripts/pick_base_model.py --model togethercomputer/RedPajama-INCITE-7B-Instruct --check-license
++
++How to use
++1. Pick the base model id you want to start from (defaults above are good MVP starting points).
++2. Run the license check:
++   python scripts/pick_base_model.py --model <HF_ID> --check-license
++   This calls scripts/license_check.py and prints guidance.
++3. If license is compatible with your desired downstream license (e.g., Apache-2.0), proceed to prepare data and training.
++
++Example workflow (MVP)
++1. Confirm license:
++   python scripts/pick_base_model.py --model togethercomputer/RedPajama-INCITE-7B-Instruct --check-license
++2. Prepare datasets and run PII scan:
++   python scripts/scan_pii.py --input_dir data/sft --out release/pii_report.json --redact_dir release/data_redacted
++3. Run multimodal SFT (QLoRA/PEFT):
++   ./scripts/run_multimodal_sft.sh --model togethercomputer/RedPajama-INCITE-7B-Instruct --data-jsonl data/multimodal_sft.jsonl --out outputs/multimodal_sft --max_steps 20000
++4. Merge LoRA:
++   python scripts/merge_lora.py --lora_dir outputs/multimodal_sft --base_model togethercomputer/RedPajama-INCITE-7B-Instruct --out_dir outputs/multimodal_sft/merged
++
++Legal checklist before publishing
++- Confirm base model license allows your planned redistribution:
++  - If permissive (Apache-2.0, MIT, BSD variants) you can typically apply Apache-2.0 to derived artifacts (confirm with legal).
++  - If restrictive (non-commercial, no-derivatives), do not publish derived weights publicly.
++- Keep dataset provenance and dataset_card with release artifacts.
++- Obtain explicit legal signoff recorded in release docs (docs/release_human_signoff.json).
++
++If you want, I can:
++- Run an automated license check for a list of HF ids (provide the ids) and summarize compatibility guidance.
++- Add a small GitHub Action that automatically runs license_check.py on any HF id you pass (useful during PRs).
++
++Next step
++- If you accept the default recommendation, run:
++  python scripts/pick_base_model.py --recommend mvp --check-license
++
++If you want me to generate an automated PR that runs license checks in CI for a list of candidate bases, say "generate CI license-check PR" and provide the HF ids.
++
+--- /dev/null
++++ b/scripts/pick_base_model.py
+@@ -0,0 +1,232 @@
++#!/usr/bin/env python3
++"""
++scripts/pick_base_model.py
++
++Helper to list recommended base models and perform license checks via scripts/license_check.py.
++This is a convenience wrapper for operators to choose a base model and run the included license checker.
++
++Usage:
++  python scripts/pick_base_model.py --list
++  python scripts/pick_base_model.py --recommend mvp
++  python scripts/pick_base_model.py --model togethercomputer/RedPajama-INCITE-7B-Instruct --check-license
++"""
++from __future__ import annotations
++import argparse
++import yaml
++import shutil
++import subprocess
++import sys
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++BASE_MODELS_PATH = ROOT / "configs" / "base_models.yaml"
++
++def load_models():
++    if not BASE_MODELS_PATH.exists():
++        raise FileNotFoundError(BASE_MODELS_PATH)
++    with open(BASE_MODELS_PATH, "r", encoding="utf-8") as f:
++        cfg = yaml.safe_load(f)
++    return cfg.get("models", [])
++
++def list_models(models):
++    print("Recommended base models:")
++    for m in models:
++        print(f"- id: {m['id']}")
++        print(f"  name: {m.get('display_name','')}")
++        print(f"  params: {m.get('params')}")
++        print(f"  recommended_for: {', '.join(m.get('recommended_for',[]))}")
++        print(f"  license_note: {m.get('license_note')}")
++        print(f"  notes: {m.get('notes')}")
++        print()
++
++def recommend(models, kind="mvp"):
++    kind = kind.lower()
++    candidates = []
++    for m in models:
++        recs = [r.lower() for r in m.get("recommended_for", [])]
++        if kind == "mvp" and "mvp" in recs:
++            candidates.append(m)
++        elif kind == "efficiency" and ("efficiency" in recs or "efficiency" in m.get("notes","").lower()):
++            candidates.append(m)
++        elif kind == "all":
++            candidates.append(m)
++    if not candidates:
++        print("No candidates found for", kind)
++        return
++    print(f"Recommended candidates for '{kind}':")
++    for c in candidates:
++        print(f"- {c['id']} ({c.get('display_name')}) — {c.get('notes')}")
++
++def run_license_check(model_id: str):
++    # call the existing scripts/license_check.py as a subprocess for isolated behavior
++    script = ROOT / "scripts" / "license_check.py"
++    if not script.exists():
++        print("license_check.py not found — cannot run license check")
++        return 2
++    cmd = [sys.executable, str(script), "--model", model_id]
++    print("Running license check:", " ".join(cmd))
++    res = subprocess.run(cmd)
++    return res.returncode
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--list", action="store_true")
++    p.add_argument("--recommend", default="", help="mvp|efficiency|all")
++    p.add_argument("--model", default="", help="HF model id to inspect")
++    p.add_argument("--check-license", action="store_true", help="Run license_check.py for the chosen model")
++    args = p.parse_args()
++
++    models = load_models()
++    if args.list:
++        list_models(models)
++        return
++    if args.recommend:
++        recommend(models, args.recommend)
++        return
++    if args.model:
++        # print model entry if present
++        entry = next((m for m in models if m["id"] == args.model), None)
++        if entry:
++            print("Model entry:")
++            print(yaml.dump(entry, sort_keys=False))
++        else:
++            print("Model id not present in configs/base_models.yaml — displaying basic info only.")
++            print("Model id:", args.model)
++        if args.check_license:
++            rc = run_license_check(args.model)
++            if rc != 0:
++                print("License check returned non-zero exit code:", rc)
++            else:
++                print("License check completed — review output above.")
++        return
++    # default help
++    p.print_help()
++
++if __name__ == "__main__":
++    main()
++
+-- 
+2.40.1
